@@ -72,6 +72,7 @@ python server.py --port 8010 [--max-seq 159744]
 |---|---|
 | `QE_MODEL_DIR` / `QE_CACHE_DIR` | モデルと変換済み重みの場所 (`qe/paths.py`) |
 | `QE_LARGE_PREFILL=0` / `QE_LARGE_T` | 大きい T の prefill を使わない (T=32 の旧経路) / 1 チャンクの最大行数 (既定 1024) |
+| `QE_MULTI_CONV=0` / `QE_MAX_CONVS` | 複数の会話を保持しない / 保持する会話数の上限 (既定 8、ホストに 1 会話約 180MB) |
 | `QE_SNAPSHOT=0` | 会話の再利用用の状態スナップショットを取らない |
 | `QE_GQA_ATTN=0` | 自作の GQA アテンションを使わず、ttnn の SDPA に戻す |
 | `QE_CHUNKED_PREFILL=0` | (GQA を切ったとき) prefill で chunked SDPA を使わない |
@@ -83,7 +84,8 @@ python server.py --port 8010 [--max-seq 159744]
 - 全部 bfp4 の perplexity は bf16 比で日本語 +5%、英語 +7% (llama.cpp の IQ3_XXS 並み、Q4_0 は +2〜3%)。
   実務的なタスクでの品質は未評価。
 - 会話の続きは再利用します (前回のプロンプト + 返答、またはアシスタントのターン開始位置の状態スナップショットから差分だけ prefill)。
-  状態は 1 本だけなので、複数の会話を交互に流すと毎回最初から prefill になります。
+  複数の会話 (本体とサブエージェントなど) は KV のブロックを分けて保持し、リクエストごとに切り替えます (約 0.1 秒)。
+  KV の合計は最大文脈ぶん (159,744 トークン) で、足りなくなると最後に使ったのが最も古い会話から捨てます。
 - 短い文脈では、GQA カーネルの固定費 (約 0.1ms/層) のぶん、ttnn の SDPA より 1 ステップ 1ms ほど遅くなります。
 - デバイスが固まった場合は `tt-smi -r 0` を 2 回、15 秒ほど待つと戻ることが多いです。
 
@@ -96,6 +98,7 @@ python server.py --port 8010 [--max-seq 159744]
 | `qe/ops.py` | DRAM シャーディングの bfp4/bfp8 行列積、重みの変換とキャッシュ |
 | `qe/gdn.py`、`qe/gdn_kernel.py` | Gated DeltaNet 層と融合カーネルの起動 |
 | `qe/attn.py`、`qe/gqa_attn.py`、`qe/kv_kernel.py` | attention 層、GQA split-K アテンション、KV 書き込み |
+| `qe/kvpager.py` | KV ブロックのプールとページ表 (複数の会話) |
 | `qe/prefill.py`、`qe/conv_kernel.py`、`qe/page_copy.py` | 大きい T の prefill、因果 conv カーネル、ページコピー |
 | `kernels/*.cpp` | 自作カーネル (generic_op で起動) |
 | `server.py` | OpenAI 互換サーバー |

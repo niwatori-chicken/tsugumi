@@ -24,12 +24,13 @@ try:
     g = dev.compute_with_storage_grid_size()
     ck = ttnn.WormholeComputeKernelConfig(math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=False)
     for T in (4, 32):
+        ptg = ttnn.from_torch(torch.arange(nb, dtype=torch.int32).view(1, nb), dtype=ttnn.int32, device=dev)
         posd = ttnn.from_torch(torch.arange(P0, P0 + T, dtype=torch.int32), dtype=ttnn.int32, device=dev)
         q = ttnn.from_torch(torch.randn(1, T, NH, HD), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=dev)
         qg = ttnn.from_torch(torch.randn(1, NH, T, HD) if T == 32 else torch.randn(1, T, NH, HD), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=dev)
         for fid in (ttnn.MathFidelity.HiFi4, ttnn.MathFidelity.HiFi2):
-            A = GQAAttention(dev, T, fidelity=fid)
-            print(f"T={T} P0={P0} gqa {fid}: {tm(lambda: A(qg, kc, vc, posd)):.2f} ms", flush=True)
+            A = GQAAttention(dev, T, fidelity=fid, nblocks=nb)
+            print(f"T={T} P0={P0} gqa {fid}: {tm(lambda: A(qg, kc, vc, posd, ptg)):.2f} ms", flush=True)
         pt = ttnn.from_torch(torch.arange(nb, dtype=torch.int32).repeat(T, 1), dtype=ttnn.int32, device=dev)
         cfg = ttnn.SDPAProgramConfig(compute_with_storage_grid_size=(g.x, g.y), exp_approx_mode=False, q_chunk_size=0, k_chunk_size=0)
         f = lambda: ttnn.transformer.paged_scaled_dot_product_attention_decode(q, kc, vc, page_table_tensor=pt, cur_pos_tensor=posd, scale=1/16, program_config=cfg, compute_kernel_config=ck)

@@ -9,19 +9,93 @@ EOS_DEFAULT = (248046, 248044)
 IM_START = 248045
 
 
+class Conversation:
+    """One conversation's slot: its KV blocks (in the shared pool), the tokens in its state, the GDN state saved
+    when it was switched out, and the snapshot at the start of its last assistant turn."""
+
+    def __init__(self):
+        self.blocks = []
+        self.processed = []
+        self.state = None  # host GDN state at len(processed); None while active (the state is on the device)
+        self.snap = None  # (tokens, host state)
+        self.last_used = 0
+
+    def reuse(self, ids):
+        """(reusable prefix length, how) for prompt ids."""
+        n = len(self.processed)
+        if n and len(ids) > n and ids[:n] == self.processed:
+            return n, "exact"
+        if self.snap is not None and len(ids) > len(self.snap[0]) and ids[: len(self.snap[0])] == self.snap[0]:
+            return len(self.snap[0]), "snapshot"
+        return 0, "none"
+
+
 class Generator:
-    def __init__(self, eng, eos=EOS_DEFAULT, im_start=IM_START):
+    """Several conversations share the KV pool (one page table switched per request) when the engine has the
+    large-T prefill (needed for state save/restore); otherwise a single conversation."""
+
+    def __init__(self, eng, eos=EOS_DEFAULT, im_start=IM_START, max_convs=None):
         self.eng = eng
         self.eos = set(eos)
         self.im_start = im_start
-        self.processed = []  # tokens whose effect is in the main model state (positions 0..len-1)
-        self.snap = None  # (tokens, host state) saved just before the last <|im_start|> of the previous prompt
         self.k = eng.T_dec - 1
+        self.multi = getattr(eng, "large", None) is not None and os.environ.get("QE_MULTI_CONV", "1") == "1"
+        self.max_convs = max_convs or int(os.environ.get("QE_MAX_CONVS", "8"))
+        self.convs = []
+        self.cur = None
+        self.tick = 0
+        eng.pager.on_full = self._evict
+        self._new_conv()
+
+    # the active conversation's fields
+    @property
+    def processed(self):
+        return self.cur.processed
+
+    @processed.setter
+    def processed(self, v):
+        self.cur.processed = v
+
+    @property
+    def snap(self):
+        return self.cur.snap
+
+    @snap.setter
+    def snap(self, v):
+        self.cur.snap = v
+
+    def _new_conv(self):
+        c = Conversation()
+        self.convs.append(c)
+        self.cur = c
+        self.eng.pager.activate(c.blocks)
+        self.eng.reset_spec()
+        while len(self.convs) > self.max_convs:  # host memory: drop the least recently used
+            self._drop(min((x for x in self.convs if x is not c), key=lambda x: x.last_used))
+        return c
+
+    def _drop(self, c):
+        self.eng.pager.release(c.blocks)
+        self.convs.remove(c)
+
+    def _evict(self):
+        """KV pool full: free the least recently used other conversation."""
+        others = [x for x in self.convs if x is not self.cur]
+        if not others:
+            return False
+        self._drop(min(others, key=lambda x: x.last_used))
+        return True
+
+    def _switch_out(self):
+        c = self.cur
+        if c.processed:
+            c.state = self.eng.large.save_state()
 
     def reset(self):
-        self.eng.reset_spec()
-        self.processed = []
-        self.snap = None
+        """Forget every conversation."""
+        for c in list(self.convs):
+            self._drop(c)
+        self._new_conv()
 
     def _prefill(self, ids):
         """Bring the state to `ids` (all prompt tokens processed). Returns (next token, MTP draft, rows of last
@@ -31,19 +105,40 @@ class Generator:
         (2) it extends the snapshot taken before the last <|im_start|> of the previous prompt, i.e. the start of
         the previous assistant turn. (2) covers templates that rewrite the assistant turn (thinking blocks are
         dropped from history) and clients that re-encode or edit the reply. The GDN state cannot be rewound, so
-        every prompt is prefilled in two parts with a snapshot in between."""
+        every prompt is prefilled in two parts with a snapshot in between.
+        With several conversations, the one with the longest reusable prefix is switched in (its page table and
+        saved GDN state); no match starts a new conversation (the others keep their KV until evicted)."""
         eng = self.eng
-        n_old = len(self.processed)
-        how = "none"
-        if n_old and len(ids) > n_old and ids[:n_old] == self.processed:
-            start, how = n_old, "exact"
-        elif self.snap is not None and len(ids) > len(self.snap[0]) and ids[: len(self.snap[0])] == self.snap[0]:
-            eng.large.restore_state(self.snap[1])
-            start, how = len(self.snap[0]), "snapshot"
-        else:
-            self.reset()
-            start = 0
         t0 = time.perf_counter()
+        cands = [self.cur] + [c for c in self.convs if c is not self.cur] if self.multi else [self.cur]
+        best, (start, how) = self.cur, (0, "none")
+        for c in cands:
+            r = c.reuse(ids)
+            if r[0] > start:
+                best, (start, how) = c, r
+        switched = False
+        if best is not self.cur:  # another conversation: swap its KV pages and GDN state in
+            self._switch_out()
+            self.cur = best
+            eng.pager.activate(best.blocks)
+            if how == "exact":
+                eng.large.restore_state(best.state)
+            switched = True
+        if how == "snapshot":
+            eng.large.restore_state(self.cur.snap[1])
+        elif how == "none":
+            if self.multi and self.cur.processed:  # keep the current conversation, start a new one
+                self._switch_out()
+                self._new_conv()
+                switched = True
+            else:
+                self.cur.snap = None
+                self.cur.processed = []
+                eng.reset_spec()
+        self.cur.state = None
+        self.tick += 1
+        self.cur.last_used = self.tick
+        t_switch = time.perf_counter() - t0
         k = len(ids) - 1 - ids[::-1].index(self.im_start) if self.im_start in ids else -1
         can_snap = getattr(eng, "large", None) is not None and os.environ.get("QE_SNAPSHOT", "1") == "1"
         if can_snap and k > start:
@@ -56,7 +151,8 @@ class Generator:
             t_snap = 0.0
             nxt, pos, draft = eng.prefill(ids[start:], start=start, with_mtp=True)
         info = dict(reused=start, reuse=how, prefilled=len(ids) - start, t_prefill=time.perf_counter() - t0,
-                    t_snapshot=t_snap)
+                    t_snapshot=t_snap, switched=switched, t_switch=t_switch, convs=len(self.convs),
+                    kv_blocks=eng.pager.used())
         self.processed = list(ids)
         return nxt, draft, eng._mtp_last_rows, info
 

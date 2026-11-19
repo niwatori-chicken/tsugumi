@@ -85,7 +85,7 @@ class MLPDecode:
 class SpecShared:
     """Per-step device inputs shared by all layers in T-row mode (fixed addresses for trace)."""
 
-    def __init__(self, dev, T, HD, max_seq, block_size=64):
+    def __init__(self, dev, T, HD, max_seq, pager, block_size=64):
         self.T = T
         bf = lambda t: ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=dev)
         self.m_hist = bf(torch.zeros(1, 1, 32, 64))
@@ -95,17 +95,15 @@ class SpecShared:
         self.idx = GDNFusedKernel.make_idx(dev, 0)
         self.cur_pos = ttnn.from_torch(torch.zeros(T, dtype=torch.int32), dtype=ttnn.int32, device=dev)
         nb = max_seq // block_size
-        self.page_table = ttnn.from_torch(torch.arange(nb, dtype=torch.int32).repeat(T, 1), dtype=ttnn.int32,
-                                          device=dev)
-        self.page_table_1 = ttnn.from_torch(torch.arange(nb, dtype=torch.int32).view(1, nb), dtype=ttnn.int32,
-                                            device=dev)
+        self.page_table = pager.table_T(T)  # shared with every mode; rewritten by the pager
+        self.page_table_1 = pager.pt1
         self.cur_pos_rows = [ttnn.from_torch(torch.zeros(1, dtype=torch.int32), dtype=ttnn.int32, device=dev)
                              for _ in range(T)]
         self.gqa = None
         if os.environ.get("QE_GQA_ATTN", "1") == "1":
             from .gqa_attn import GQAAttention
 
-            self.gqa = GQAAttention(dev, T, HD=HD, block_size=block_size)
+            self.gqa = GQAAttention(dev, T, HD=HD, block_size=block_size, nblocks=nb)
         self.cos = bf(torch.ones(1, T, 1, HD))
         self.sin = bf(torch.zeros(1, T, 1, HD))
         self.sel_ck = ttnn.WormholeComputeKernelConfig(math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False,
@@ -431,7 +429,10 @@ class Qwen35Engine:
     # ---------------- T-row mode (chunked prefill / speculative verify) ----------------
     def init_spec(self, T, mtp=False):
         self.T_dec = T
-        self.sh_by = {T: SpecShared(self.dev, T, self.HD, self.max_seq)}
+        from .kvpager import KVPager
+
+        self.pager = KVPager(self.dev, self.max_seq // 64)
+        self.sh_by = {T: SpecShared(self.dev, T, self.HD, self.max_seq, self.pager)}
         self.spec_traces, self.spec_outs = {}, {}
         self._last_snap_all = True
         self.use_T(T)
@@ -456,7 +457,7 @@ class Qwen35Engine:
     def init_prefill(self, TP=32):
         """Add a TP-row mode for prompt prefill (GDN kernel writes only the final state)."""
         self.T_pre = TP
-        self.sh_by[TP] = SpecShared(self.dev, TP, self.HD, self.max_seq)
+        self.sh_by[TP] = SpecShared(self.dev, TP, self.HD, self.max_seq, self.pager)
         for L in self.layers:
             if L["type"] == "linear_attention":
                 L["mix"].init_spec(TP, snap_all=False)
@@ -496,6 +497,7 @@ class Qwen35Engine:
 
     def _set_positions(self, pos):
         T, sh = self.T, self.sh
+        self.pager.ensure(pos + T)  # rows pos..pos+T-1 write KV
         h = lambda t, dt=ttnn.bfloat16, lay=ttnn.TILE_LAYOUT: ttnn.from_torch(t, dtype=dt, layout=lay)
         ttnn.copy_host_to_device_tensor(h(torch.arange(pos, pos + T, dtype=torch.int32), ttnn.int32,
                                           ttnn.ROW_MAJOR_LAYOUT), sh.cur_pos)

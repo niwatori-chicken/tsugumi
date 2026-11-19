@@ -1,10 +1,11 @@
-// Write T token rows of K and V into a paged bf16 cache [blocks, NKV, BS, HD] (identity page table).
+// Write T token rows of K and V into a paged bf16 cache [blocks, NKV, BS, HD]; logical block b -> physical PT[b].
 // One core per (kv head h, column tile c); it walks the T rows in order and does a read-modify-write
 // of the cache tile, so rows of one step that share a tile never race.
 //   src  : [1, T, NKV(pad 32), HD] bf16 TILE (tile (t, c) holds heads in rows, HD/32 column tiles)
 //   POS  : int32 row-major [T] positions
-// CT: 0 T, 1 NKV, 2 HDT (HD/32), 3 BS (block size, multiple of 32), 4 pos_bytes, then accessors Ksrc, Vsrc, Kc, Vc, POS
-// RT: 0..4 addrs, 5 h, 6 c
+//   PT   : int32 row-major [1, nblocks] page table (one page)
+// CT: 0 T, 1 NKV, 2 HDT (HD/32), 3 BS (block size, multiple of 32), 4 pos_bytes, 5 PT bytes, then accessors Ksrc, Vsrc, Kc, Vc, POS, PT
+// RT: 0..5 addrs, 6 h, 7 c
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -13,6 +14,7 @@
 #include "api/tensor/noc_traits.h"
 
 constexpr uint32_t c_SCR = 0;  // 3 tiles: [pos][src][dst]
+constexpr uint32_t c_PT = 1;   // page table
 
 FORCE_INLINE uint32_t elem_off(uint32_t r, uint32_t c) {
     return ((r >> 4) * 2 + (c >> 4)) * 256 + (r & 15) * 16 + (c & 15);
@@ -24,18 +26,21 @@ void kernel_main() {
     constexpr uint32_t HDT = get_compile_time_arg_val(2);
     constexpr uint32_t BS = get_compile_time_arg_val(3);
     constexpr uint32_t POSB = get_compile_time_arg_val(4);
-    constexpr auto aKs = TensorAccessorArgs<5>();
+    constexpr uint32_t PTB = get_compile_time_arg_val(5);
+    constexpr auto aKs = TensorAccessorArgs<6>();
     constexpr auto aVs = TensorAccessorArgs<aKs.next_compile_time_args_offset()>();
     constexpr auto aKc = TensorAccessorArgs<aVs.next_compile_time_args_offset()>();
     constexpr auto aVc = TensorAccessorArgs<aKc.next_compile_time_args_offset()>();
     constexpr auto aP = TensorAccessorArgs<aVc.next_compile_time_args_offset()>();
+    constexpr auto aPT = TensorAccessorArgs<aP.next_compile_time_args_offset()>();
     const auto sKs = TensorAccessor(aKs, get_arg_val<uint32_t>(0));
     const auto sVs = TensorAccessor(aVs, get_arg_val<uint32_t>(1));
     const auto sKc = TensorAccessor(aKc, get_arg_val<uint32_t>(2));
     const auto sVc = TensorAccessor(aVc, get_arg_val<uint32_t>(3));
     const auto sP = TensorAccessor(aP, get_arg_val<uint32_t>(4));
-    const uint32_t h = get_arg_val<uint32_t>(5);
-    const uint32_t c = get_arg_val<uint32_t>(6);
+    const auto sPT = TensorAccessor(aPT, get_arg_val<uint32_t>(5));
+    const uint32_t h = get_arg_val<uint32_t>(6);
+    const uint32_t c = get_arg_val<uint32_t>(7);
 
     constexpr uint32_t TB = 2048;  // bf16 tile bytes
     Noc noc;
@@ -43,7 +48,11 @@ void kernel_main() {
     scr.reserve_back(3);
     const uint32_t base = scr.get_write_ptr();
     noc.async_read(sP, scr, POSB, {.page_id = 0}, {.offset_bytes = 0});
+    CircularBuffer cpt(c_PT);
+    cpt.reserve_back(1);
+    noc.async_read(sPT, cpt, PTB, {.page_id = 0}, {.offset_bytes = 0});
     noc.async_read_barrier();
+    volatile tt_l1_ptr int32_t* PT = reinterpret_cast<volatile tt_l1_ptr int32_t*>(cpt.get_write_ptr());
     volatile tt_l1_ptr int32_t* pos = reinterpret_cast<volatile tt_l1_ptr int32_t*>(base);
     int32_t P[T];
     for (uint32_t t = 0; t < T; ++t) {
@@ -56,7 +65,7 @@ void kernel_main() {
         int32_t cur = -1;
         for (uint32_t t = 0; t < T; ++t) {
             const uint32_t p = (uint32_t)P[t];
-            const uint32_t b = p / BS, r = p % BS;
+            const uint32_t b = (uint32_t)PT[p / BS], r = p % BS;
             const int32_t tile_id = (int32_t)(((b * NKV + h) * (BS / 32) + r / 32) * HDT + c);
             if (tile_id != cur) {
                 if (cur >= 0) {

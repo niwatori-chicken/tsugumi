@@ -5,17 +5,17 @@
 //   Q   : pre-scaled by 1/sqrt(HD).  QMODE 0: [1, T, NH(pad 32), HD] bf16 TILE (page t*HDT + d), gathered here;
 //         QMODE 1 (T == 32): [1, NH, 32, HD] (page h*HDT + d), row tile h' of the group = head g*GH + h'
 //   SC  : bf16 tile, ones in row 0 of each face (reduce scaler);  CF : 2 fp32 tiles (-1e30, 0)
-//   Kc/Vc : [blocks, NKV, BS, HD] bf16 TILE, identity page table
+//   Kc/Vc : [blocks, NKV, BS, HD] bf16 TILE;  PT : int32 row-major [1, nblocks] page table (logical -> physical block)
 //   POS : int32 [T] (positions of the T rows; only POS[0] is used, rows are consecutive)
-// CT: 0 T, 1 RT, 2 CT, 3 S, 4 BS, 5 NKV, 6 POSB, 7 GH, 8 HDT, 9 QMODE, then accessors Q, Kc, Vc, POS, SC, CF
-// RT: 0..5 addrs, 6 g, 7 s
+// CT: 0 T, 1 RT, 2 CT, 3 S, 4 BS, 5 NKV, 6 POSB, 7 GH, 8 HDT, 9 QMODE, 10 PTB, then accessors Q, Kc, Vc, POS, SC, CF, PT
+// RT: 0..6 addrs, 7 g, 8 s
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
 #include "api/dataflow/circular_buffer.h"
 #include "api/tensor/noc_traits.h"
 
-constexpr uint32_t c_Q = 0, c_K = 1, c_V = 2, c_MASK = 3, c_SC = 4, c_INFO = 5, c_CONST = 19, c_SCR = 20;
+constexpr uint32_t c_Q = 0, c_K = 1, c_V = 2, c_MASK = 3, c_SC = 4, c_INFO = 5, c_CONST = 19, c_SCR = 20, c_PT = 21;
 
 FORCE_INLINE uint32_t elem_off(uint32_t r, uint32_t c) {
     return ((r >> 4) * 2 + (c >> 4)) * 256 + (r & 15) * 16 + (c & 15);
@@ -32,20 +32,23 @@ void kernel_main() {
     constexpr uint32_t GH = get_compile_time_arg_val(7);
     constexpr uint32_t HDT = get_compile_time_arg_val(8);
     constexpr uint32_t QMODE = get_compile_time_arg_val(9);
-    constexpr auto aQ = TensorAccessorArgs<10>();
+    constexpr uint32_t PTB = get_compile_time_arg_val(10);
+    constexpr auto aQ = TensorAccessorArgs<11>();
     constexpr auto aK = TensorAccessorArgs<aQ.next_compile_time_args_offset()>();
     constexpr auto aV = TensorAccessorArgs<aK.next_compile_time_args_offset()>();
     constexpr auto aP = TensorAccessorArgs<aV.next_compile_time_args_offset()>();
     constexpr auto aSC = TensorAccessorArgs<aP.next_compile_time_args_offset()>();
     constexpr auto aCF = TensorAccessorArgs<aSC.next_compile_time_args_offset()>();
+    constexpr auto aPT = TensorAccessorArgs<aCF.next_compile_time_args_offset()>();
     const auto sQ = TensorAccessor(aQ, get_arg_val<uint32_t>(0));
     const auto sK = TensorAccessor(aK, get_arg_val<uint32_t>(1));
     const auto sV = TensorAccessor(aV, get_arg_val<uint32_t>(2));
     const auto sP = TensorAccessor(aP, get_arg_val<uint32_t>(3));
     const auto sSC = TensorAccessor(aSC, get_arg_val<uint32_t>(4));
     const auto sCF = TensorAccessor(aCF, get_arg_val<uint32_t>(5));
-    const uint32_t g = get_arg_val<uint32_t>(6);
-    const uint32_t s = get_arg_val<uint32_t>(7);
+    const auto sPT = TensorAccessor(aPT, get_arg_val<uint32_t>(6));
+    const uint32_t g = get_arg_val<uint32_t>(7);
+    const uint32_t s = get_arg_val<uint32_t>(8);
 
     constexpr uint32_t TB = 2048;  // bf16 tile bytes
     constexpr uint32_t C = CT * 32;
@@ -124,13 +127,17 @@ void kernel_main() {
     if (active) cq.push_back(RT * HDT);
 
     // ---- K/V chunks (+ causal mask tiles for chunks reaching past P0) ----
-    CircularBuffer ck(c_K), cv(c_V), cm(c_MASK);
+    CircularBuffer ck(c_K), cv(c_V), cm(c_MASK), cpt(c_PT);
+    cpt.reserve_back(1);
+    noc.async_read(sPT, cpt, PTB, {.page_id = 0}, {.offset_bytes = 0});
+    noc.async_read_barrier();
+    volatile tt_l1_ptr int32_t* PT = reinterpret_cast<volatile tt_l1_ptr int32_t*>(cpt.get_write_ptr());
     for (uint32_t c = c0; c < c1; ++c) {
         const uint32_t base = c * C;
         ck.reserve_back(CT * HDT);
         for (uint32_t j = 0; j < CT; ++j) {
             const uint32_t p = base + j * 32;
-            const uint32_t b = p / BS, rt = (p % BS) / 32;
+            const uint32_t b = (uint32_t)PT[p / BS], rt = (p % BS) / 32;
             const uint32_t t0 = ((b * NKV + g) * (BS / 32) + rt) * HDT;
             for (uint32_t d = 0; d < HDT; ++d) {
                 noc.async_read(sK, ck, TB, {.page_id = t0 + d}, {.offset_bytes = (j * HDT + d) * TB});
@@ -159,7 +166,7 @@ void kernel_main() {
         cv.reserve_back(CT * HDT);
         for (uint32_t j = 0; j < CT; ++j) {
             const uint32_t p = base + j * 32;
-            const uint32_t b = p / BS, rt = (p % BS) / 32;
+            const uint32_t b = (uint32_t)PT[p / BS], rt = (p % BS) / 32;
             const uint32_t t0 = ((b * NKV + g) * (BS / 32) + rt) * HDT;
             for (uint32_t d = 0; d < HDT; ++d) {
                 noc.async_read(sV, cv, TB, {.page_id = t0 + d}, {.offset_bytes = (j * HDT + d) * TB});

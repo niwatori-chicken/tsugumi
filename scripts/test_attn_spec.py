@@ -29,7 +29,11 @@ def main():
         at = AttnDecode(dev, sd, "model.language_model.layers.3.self_attn.", tc, 1024, wdtype=ttnn.bfloat4_b,
                         cache_prefix=f"{CACHE}/L3.attn")
         at.init_spec(T, chunked=len(sys.argv) > 3 and sys.argv[3] == "chunked")
-        sh = SpecShared(dev, T, 256, 1024)
+        from qe.kvpager import KVPager
+        import random
+        pager = KVPager(dev, 1024 // 64)
+        random.Random(0).shuffle(pager.free)  # non-identity logical -> physical blocks
+        sh = SpecShared(dev, T, 256, 1024, pager)
         torch.manual_seed(0)
         xs = torch.randn(N, 5120)
         eng = Qwen35Engine.__new__(Qwen35Engine)
@@ -49,6 +53,7 @@ def main():
             o = at.forward_decode(ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=dev), cp1, cos1, sin1)
             ref.append(ttnn.to_torch(o)[0, 0, 0, :5120].float())
         for c0 in range(0, N, T):
+            pager.ensure(c0 + T)
             x = torch.zeros(1, 1, 32, 5120)
             x[0, 0, :T] = xs[c0:c0 + T]
             cs = [Qwen35Engine._rope_rows(eng, c0 + i) for i in range(T)]

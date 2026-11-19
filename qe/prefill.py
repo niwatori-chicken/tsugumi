@@ -388,9 +388,10 @@ class LargePrefill:
         cos = up(torch.cat([c for c, _ in cs], dim=2))  # [1,1,T,HD]
         sin = up(torch.cat([s_ for _, s_ in cs], dim=2))
         nb = T // self.BS
-        pt_chunk = ttnn.from_torch(torch.arange(pos // self.BS, pos // self.BS + nb, dtype=torch.int32).view(1, nb),
-                                   dtype=ttnn.int32, device=dev)
-        pt_full = e.sh_by[e.T_dec].page_table_1
+        e.pager.ensure(pos + T)  # padded rows write KV too
+        blk = e.pager.blocks[pos // self.BS: pos // self.BS + nb]
+        pt_chunk = ttnn.from_torch(torch.tensor(blk, dtype=torch.int32).view(1, nb), dtype=ttnn.int32, device=dev)
+        pt_full = e.pager.pt1
         sdpa_cfg = self._sdpa_cfg(T, pos)
         ttnn.copy_host_to_device_tensor(ttnn.from_torch(torch.tensor([pos], dtype=torch.int32), dtype=ttnn.int32),
                                         self.start_t)

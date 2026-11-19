@@ -32,10 +32,11 @@
 | `test_gdn_kernel.py` | GDN の再帰カーネル (自作) を torch fp32 と比較 |
 | `test_gdn_fused.py T [steps]` | 融合 GDN カーネル (conv 以降) を torch と比較 |
 | `test_attn_spec.py T N [chunked]` | attention 層: T=1 の逐次デコードと T 行のページ KV 経路を比較 (層 3 の実重み) |
-| `test_gqa.py` | GQA split-K アテンション (自作) を torch と比較 |
+| `test_gqa.py [max_seq]` | GQA split-K アテンション (自作) を torch と比較 (物理ブロックをシャッフルしたページ表で) |
 | `test_attn_large.py [T] [N]` | 大きい T の attention を torch fp32 と比較。<br>q/k (RoPE 後) と K キャッシュは要素ごとにも比較 |
 | `test_conv.py` | 因果 conv カーネル (大きい T の prefill 用) を torch fp64 と比較 |
 | `test_prefill_large.py [N] [t_max] [max_new]` | 大きい T の prefill と T=32 の経路を比較 (次トークン、MTP 下書き、続きの生成、速度) |
+| `test_multiconv.py` | 複数の会話を交互に流しても単独と出力が一致すること、切り替え時間、KV が足りないときの追い出し |
 | `test_reuse.py [--off]` | 会話の再利用: 3 ターン (thinking オフ/オン) の再利用の種類、応答開始までの時間、最初からとの出力比較 |
 | `test_prefill_cache.py` | トレース取得後に、開始位置・長さがばらばらの prefill とデコードを繰り返しても、プログラムキャッシュが増えないこと (増えるとハングの原因になる) |
 | `prefill_agree.py OUT.pt [テキスト]` | prefill 中の位置ごとの argmax を保存する (prefill 経路どうしの比較用) |

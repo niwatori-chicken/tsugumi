@@ -85,7 +85,7 @@ class AttnDecode:
             self.vp = ttnn.from_torch(torch.zeros(nb, NKV, block_size, HD), dtype=ttnn.bfloat16,
                                       layout=ttnn.TILE_LAYOUT, device=self.dev)
             self.kvw_T = {}
-        self.kvw_T[T] = KVWriteKernel(self.dev, T, NKV, HD, block_size)
+        self.kvw_T[T] = KVWriteKernel(self.dev, T, NKV, HD, block_size, nb)
         # one user per paged_update_cache call: users of one step share KV tiles, and the op does a
         # read-modify-write of whole tiles per user core, so concurrent users in one tile clobber each other.
         self.kv_shard_1 = ttnn.create_sharded_memory_config(
@@ -132,7 +132,7 @@ class AttnDecode:
                                                          page_table=sh.page_table_1)
                     ttnn.deallocate(r)
         else:
-            self.kvw_T[T](k, v, self.kp, self.vp, sh.cur_pos)
+            self.kvw_T[T](k, v, self.kp, self.vp, sh.cur_pos, sh.page_table_1)
         ttnn.deallocate(k)
         ttnn.deallocate(v)
         if gqa is not None:
@@ -140,7 +140,7 @@ class AttnDecode:
                 q = ttnn.permute(q, (0, 2, 1, 3), memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [1, NH, 32, HD]
             else:
                 q = ttnn.to_memory_config(q, ttnn.DRAM_MEMORY_CONFIG)
-            o = gqa(q, self.kp, self.vp, sh.cur_pos)  # [1, 1, 32, NH*HD], rows >= T zero
+            o = gqa(q, self.kp, self.vp, sh.cur_pos, sh.page_table_1)  # [1, 1, 32, NH*HD], rows >= T zero
             ttnn.deallocate(q)
             o = ttnn.multiply(o, ttnn.sigmoid(gate, memory_config=_L1), memory_config=_L1)
             ttnn.deallocate(gate)

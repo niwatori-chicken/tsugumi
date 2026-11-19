@@ -1,4 +1,5 @@
-"""GQAAttention vs torch reference.  python scripts/test_gqa.py"""
+"""GQAAttention vs torch reference, with a shuffled page table (logical block b at physical perm[b]).
+  python scripts/test_gqa.py [max_seq] [splits]"""
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import sys, time, torch, ttnn
@@ -21,12 +22,17 @@ try:
     nb = maxseq // BS
     torch.manual_seed(0)
     K = torch.randn(maxseq, NKV, HD); V = torch.randn(maxseq, NKV, HD)
-    pg = lambda X: X.view(nb, BS, NKV, HD).permute(0, 2, 1, 3).contiguous()
+    perm = torch.randperm(nb)  # logical block b lives in physical block perm[b]
+    def pg(X):
+        L = X.view(nb, BS, NKV, HD).permute(0, 2, 1, 3).contiguous()
+        P = torch.empty_like(L); P[perm] = L
+        return P
+    ptd = ttnn.from_torch(perm.to(torch.int32).view(1, nb), dtype=ttnn.int32, device=dev)
     kc = ttnn.from_torch(pg(K), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=dev)
     vc = ttnn.from_torch(pg(V), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=dev)
     Kb, Vb = K.bfloat16().float(), V.bfloat16().float()
     for T in (4, 32):
-        A = GQAAttention(dev, T, splits=int(sys.argv[2]) if len(sys.argv) > 2 else None)
+        A = GQAAttention(dev, T, splits=int(sys.argv[2]) if len(sys.argv) > 2 else None, nblocks=nb)
         posd = ttnn.from_torch(torch.zeros(T, dtype=torch.int32), dtype=ttnn.int32, device=dev)
         for P0 in ([0, 5, 37, 1000, 4093, 8000, 16000] if T == 4 else [0, 32, 1024, 4064, 16352]):
             if P0 + T > maxseq: continue
@@ -35,7 +41,7 @@ try:
             if T == 32: qs = qs.permute(0, 2, 1, 3).contiguous()
             qd = ttnn.from_torch(qs, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=dev)
             ttnn.copy_host_to_device_tensor(ttnn.from_torch(torch.arange(P0, P0 + T, dtype=torch.int32), dtype=ttnn.int32), posd)
-            o = A(qd, kc, vc, posd)
+            o = A(qd, kc, vc, posd, ptd)
             got = ttnn.to_torch(o).float()[0, 0, :T].view(T, NH, HD)
             r = ref(q.bfloat16().float(), Kb, Vb, P0, T)
             pad = ttnn.to_torch(o).float()[0, 0, T:].abs().max().item() if T < 32 else 0

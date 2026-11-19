@@ -6,7 +6,7 @@ re-reads the whole KV cache.
 
   q   : normed + roped and pre-scaled by 1/sqrt(HD), bf16 TILE DRAM. T < 32: [1, T, NH, HD];
         T == 32: [1, NH, 32, HD] (heads permuted to dim 1)
-  kc/vc : [blocks, NKV, BS, HD] bf16 TILE paged caches (identity page table)
+  kc/vc : [blocks, NKV, BS, HD] bf16 TILE paged caches;  pt : int32 row-major [1, nblocks] page table
   pos : int32 [T] row positions (consecutive; POS[0] = first row)
 Returns [1, 1, 32, NH*HD] bf16 (rows >= T zero) — rows = tokens, ready for the gate and o_proj.
 """
@@ -30,7 +30,7 @@ def _cores(coords):
 
 class GQAAttention:
     def __init__(self, dev, T, NH=24, NKV=4, HD=256, block_size=64, chunk_tiles=2, splits=None,
-                 fidelity=ttnn.MathFidelity.HiFi4):
+                 fidelity=ttnn.MathFidelity.HiFi4, nblocks=4096):
         assert T == 32 or (16 % T == 0 and T >= 2)
         self.dev, self.T, self.NH, self.NKV, self.HD, self.BS = dev, T, NH, NKV, HD, block_size
         self.GH = NH // NKV
@@ -43,6 +43,7 @@ class GQAAttention:
         self.S = splits or ncore // NKV
         self.qmode = 1 if T == 32 else 0
         self.posb = ((T * 4 + 31) // 32) * 32
+        self.ptb = ((nblocks * 4 + 31) // 32) * 32  # page table bytes (one row-major page)
         # main: core n -> (g, s)
         self.m_coords = [(n % grid.x, n // grid.x) for n in range(NKV * self.S)]
         self.m_assign = [(n % NKV, n // NKV) for n in range(NKV * self.S)]
@@ -67,6 +68,8 @@ class GQAAttention:
             _cbd(mc, 18, RT, f32),  # final l
             _cbd(mc, 19, 2, f32),  # consts
             _cbd(mc, 20, HDT, bf),  # reader scratch
+            ttnn.CBDescriptor(total_size=self.ptb, core_ranges=mc, format_descriptors=[  # page table
+                ttnn.CBFormatDescriptor(buffer_index=21, data_format=ttnn.uint32, page_size=self.ptb)]),
         ]
         self.m_ccfg = self._ccfg(fidelity)
         # combine: core -> (g, r, dg), DT value tiles each
@@ -104,14 +107,14 @@ class GQAAttention:
         c.math_approx_mode = False
         return c
 
-    def __call__(self, q, kc, vc, pos):
+    def __call__(self, q, kc, vc, pos, pt):
         T, RT, CT, HDT, S, NKV = self.T, self.RT, self.CT, self.HDT, self.S, self.NKV
         K = lambda src, ct, rt, cfg, cores: ttnn.KernelDescriptor(
             kernel_source=os.path.join(KDIR, src), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores, compile_time_args=ct, runtime_args=rt, config=cfg)
         # ---- main ----
-        ins = [q, kc, vc, pos, self.sc, self.cf]
-        r_ct = [T, RT, CT, S, self.BS, NKV, self.posb, self.GH, HDT, self.qmode]
+        ins = [q, kc, vc, pos, self.sc, self.cf, pt]
+        r_ct = [T, RT, CT, S, self.BS, NKV, self.posb, self.GH, HDT, self.qmode, self.ptb]
         for t in ins:
             r_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
         addrs = [t.buffer_address() for t in ins]
@@ -126,7 +129,7 @@ class GQAAttention:
             K("gqa_attn_writer.cpp", w_ct, w_rt, ttnn.WriterConfigDescriptor(), mc),
             K("gqa_attn_compute.cpp", [RT, CT, HDT], c_rt, self.m_ccfg, mc),
         ], cbs=self.m_cbs)
-        ttnn.generic_op(ins + [self.part], prog)
+        ttnn.generic_op(ins + [self.part], prog)  # (pt last in ins: matches the reader's accessor order)
         # ---- combine ----
         cc = _cores(self.c_coords)
         cr_ct = [RT, HDT, NKV, S, self.DT, T, CT * 32, self.posb] + \
