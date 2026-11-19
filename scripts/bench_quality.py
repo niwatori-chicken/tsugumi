@@ -103,6 +103,9 @@ def score(task, it, text):
         return float(bool(m) and m.group(0) == it["gold"]), {}
     if task in ("jsquad", "jemhop"):
         pred = text.strip().split("\n")[0]
+        if it["gold"] in ("YES", "NO"):  # zero-shot answers come in Japanese
+            p0 = norm(pred)
+            pred = "YES" if p0.startswith("はい") else "NO" if p0.startswith("いいえ") else pred
         return char_f1(pred, it["gold"]), {"em": float(norm(pred) == norm(it["gold"]))}
     if task == "mgsm":
         tail = text.split("答え")[-1] if "答え" in text else text
