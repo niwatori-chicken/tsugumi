@@ -1,0 +1,8 @@
+__pycache__/
+generated/
+*.tensorbin
+quantstudy_model-*.txt
+# one-off experiments kept out of the repo
+cmpbench.py
+argbench.py
+normbench.py
