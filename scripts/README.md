@@ -57,6 +57,13 @@
 | `memprobe.py MAX_SEQ` | サーバー構成で読み込んだときの DRAM 使用量 |
 | `quantstudy.py` | 重みの量子化誤差 (bfp4/bfp8 などの TT 形式、CPU) |
 
+## 品質ベンチマーク (todo 2)
+
+| スクリプト | 内容 |
+|---|---|
+| `bench_quality.py TASK OUT.jsonl [--n N] [--prec ..] [--set k=v ..] [--cache ..] [--think]` | jcqa / jsquad / jemhop / mgsm / humaneval / gpqa を貪欲法・ゼロショットで解かせて採点。<br>途中から再開できる。データは `/mnt/HDD/eval/bench` |
+| `run_quality.sh [variant ..]` | 量子化の設定 (bfp4 / attn8 / mixed) ごとに全タスクを流す夜間用。<br>`GPQA=1` で GPQA Diamond (thinking オン)。HumanEval+ は EvalPlus (別の venv) で採点 |
+
 ## perplexity
 
 | スクリプト | 内容 |
