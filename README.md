@@ -8,9 +8,9 @@
 |---|---|
 | デコード (コード生成、貪欲法) | **47 tok/s** |
 | デコード (日本語の説明文 / 英語の物語) | 32 / 28 tok/s |
-| prefill (短〜中程度のプロンプト) | 約 300 tok/s |
-| 最大文脈 | **163,840 トークン** (KV 用に DRAM 残り 10GB 強) |
-| 12.4 万トークンのプロンプト | prefill 466 秒 (265 tok/s)、デコード 34 tok/s、needle テスト正解 |
+| prefill (数千トークンのプロンプト) | **約 1,500〜2,000 tok/s** (4,000 トークンで応答開始まで約 2 秒) |
+| 最大文脈 | **159,744 トークン** (KV 用に DRAM 残り約 10GB) |
+| 12.4 万トークンのプロンプト | prefill 130 秒 (957 tok/s)、デコード 34 tok/s、needle テスト正解 |
 
 - 投機的デコードの出力は、通常の貪欲法 (1 トークンずつ) の出力と一致します (コードのプロンプトで確認)。
 - 短いプロンプトでは最初のトークンまで約 0.6 秒です。
@@ -34,6 +34,9 @@
   まとめて計算 (online softmax)。部分結果を別の op で合成する。区間とチャンク数は実行時に位置から決まるのでトレース可能。
   12.4 万トークンの文脈で 4 行の検証が 1 層 1.7ms (DRAM 帯域の下限 1.27ms 付近)。
   ttnn の decode SDPA に T 行を「T ユーザー」として渡す方式 (5.6ms) や chunked SDPA (32 行で 15ms) の置き換え。
+- **大きい T の prefill** (`qe/prefill.py`): プロンプトは最大 1024 行ずつ、`minimal_matmul` (同じ bfp4 重み)、
+  チャンク並列の GDN (`ttnn.transformer.chunk_gated_delta_rule`)、自作の因果 conv カーネル (`kernels/conv_*.cpp`)、
+  chunked SDPA で流す。終わったら GDN の状態と conv 履歴を T 行モードの形式に戻して、そのままデコードに入る。
 - **KV 書き込みカーネル** (`kernels/kv_write.cpp`): T 行の K/V をページ KV に競合なく書く。
 - 残差ストリームは 40 コアの幅方向シャードで持ち、RMSNorm もシャード版 (89µs → 6.5µs)。argmax はデバイス上で行う。
 
@@ -54,7 +57,7 @@ export QE_MODEL_DIR=/path/to/Qwen3.8-27B             # HF 形式のモデル
 export QE_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みのキャッシュ (初回に作られる、約 8 分)
 
 # OpenAI 互換サーバー (127.0.0.1:8010)
-python server.py --port 8010 [--max-seq 163840]
+python server.py --port 8010 [--max-seq 159744]
 
 # 1 プロンプトで速度と位置ごとの採択率を見る
 python run_mtp.py --prompt "Pythonでフィボナッチ数列を返す関数を書いてください。"
@@ -71,6 +74,7 @@ python run_mtp.py --prompt "Pythonでフィボナッチ数列を返す関数を�
 | 変数 | 意味 |
 |---|---|
 | `QE_MODEL_DIR` / `QE_CACHE_DIR` | モデルと変換済み重みの場所 (`qe/paths.py`) |
+| `QE_LARGE_PREFILL=0` / `QE_LARGE_T` | 大きい T の prefill を使わない (T=32 の旧経路) / 1 チャンクの最大行数 (既定 1024) |
 | `QE_GQA_ATTN=0` | 自作の GQA アテンションを使わず、ttnn の SDPA に戻す |
 | `QE_CHUNKED_PREFILL=0` | (GQA を切ったとき) prefill で chunked SDPA を使わない |
 | `QE_FUSED_GDN=0` | GDN 融合カーネルを使わず、元の op の並びで動かす |
@@ -78,8 +82,8 @@ python run_mtp.py --prompt "Pythonでフィボナッチ数列を返す関数を�
 ## 制限
 
 - **貪欲法のみ**。temperature などは受け取りますが無視します (投機的サンプリングは未実装)。
-- **品質は未評価**です。重みを全部 bfp4 にしたときの劣化 (perplexity) をまだ測っていません。
-  bfp4 の量子化誤差は llama.cpp の Q4_0 の約 1.4 倍でした (`quantstudy.py`)。
+- 全部 bfp4 の perplexity は bf16 比で日本語 +5%、英語 +7% (llama.cpp の IQ3_XXS 並み、Q4_0 は +2〜3%)。
+  `eval_ppl.py` / `ref_ppl.py` / `compare_ppl.py` で計測。実務的なタスクでの品質は未評価。
 - 会話の続きの再利用 (前回の KV/状態を使い回す仕組み) はあるものの、チャットテンプレートの差で 2 ターン目に一致せず、
   実際には毎回全体を prefill しています。
 - 短い文脈では、GQA カーネルの固定費 (約 0.1ms/層) のぶん、ttnn の SDPA より 1 ステップ 1ms ほど遅くなります。
@@ -94,12 +98,14 @@ python run_mtp.py --prompt "Pythonでフィボナッチ数列を返す関数を�
 | `qe/ops.py` | DRAM シャーディングの bfp4/bfp8 行列積、重みの変換とキャッシュ |
 | `qe/gdn.py`、`qe/gdn_kernel.py` | Gated DeltaNet 層と融合カーネルの起動 |
 | `qe/attn.py`、`qe/gqa_attn.py`、`qe/kv_kernel.py` | attention 層、GQA split-K アテンション、KV 書き込み |
+| `qe/prefill.py`、`qe/conv_kernel.py`、`qe/page_copy.py` | 大きい T の prefill、因果 conv カーネル、ページコピー |
 | `kernels/*.cpp` | 自作カーネル (generic_op で起動) |
 | `server.py` | OpenAI 互換サーバー |
 | `run_mtp.py`、`run_spec_test.py`、`run_gen.py` | 生成と速度の確認 (MTP / T 行 / T=1) |
 | `cmp_hf.py` | 先頭 N 層を HF (CPU fp32) と比較 |
 | `test_*.py` | カーネルと層の単体テスト |
-| `bench_*.py`、`mmbench.py`、`sdpabench.py`、`memprobe.py`、`longctx.py`、`prefill_agree.py`、`quantstudy.py` | 計測 |
+| `bench_*.py`、`mmbench.py`、`mmlarge.py`、`sdpabench.py`、`memprobe.py`、`longctx.py`、`prefill_agree.py`、`quantstudy.py` | 計測 |
+| `eval_ppl.py`、`ref_ppl.py`、`compare_ppl.py` | perplexity (エンジン / CPU の bf16 基準 / 比較) |
 
 ## ライセンス
 
