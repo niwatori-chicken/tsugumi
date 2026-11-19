@@ -19,6 +19,7 @@ try:
     eng = Qwen35Engine(dev, qe_paths.MODEL, Precision("bfp4"), f"{qe_paths.CACHE}/bfp4", max_seq=16384, log=lambda *a: None)
     eng.init_spec(4, mtp=True); eng.init_prefill(32); eng.init_large_prefill(1024); eng.capture_all()
     gen = Generator(eng)
+    base = dev.num_program_cache_entries()
 
     def run(ids, max_new):
         st = {}; out = []; t0 = time.perf_counter(); t1 = None
@@ -42,7 +43,7 @@ try:
             out, ttft, st = run(ids, 400 if th else 120)
             ans = reply_text(out, th)
             print(f"[think={th} turn {j + 1}] prompt {len(ids)}  reuse={st['reuse']} reused={st['reused']}  "
-                  f"ttft {ttft:.2f}s  snapshot {st['t_snapshot'] * 1e3:.0f}ms  -> {ans[:60]!r}", flush=True)
+                  f"ttft {ttft:.2f}s  snapshot {st['t_snapshot'] * 1e3:.0f}ms  cache +{dev.num_program_cache_entries() - base}  -> {ans[:60]!r}", flush=True)
             if j == 2:  # same prompt from scratch
                 gen.reset()
                 out2, ttft2, st2 = run(ids, 400 if th else 120)

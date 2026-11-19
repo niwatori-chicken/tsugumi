@@ -75,6 +75,9 @@ class LargePrefill:
         self.convk = CausalConvKernel(self.dev, self.qkv_dim)
         self.timing = {}
         self.keep = None  # list: keep each chunk's final-normed hidden (eval)
+        # SDPA chunk start as a device tensor: one program for every start position (an int start compiles a new
+        # program per position, i.e. after the trace capture on every new conversation turn)
+        self.start_t = ttnn.from_torch(torch.zeros(1, dtype=torch.int32), dtype=ttnn.int32, device=self.dev)
 
     # ---------------- helpers ----------------
     def _cgdr_consts(self, c=32):
@@ -120,12 +123,12 @@ class LargePrefill:
             self._shift_by_T[T] = ttnn.from_torch(S, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.dev)
         return self._shift_by_T[T]
 
-    def _row_select(self, x, rows):
-        """[1,1,32,W] whose row i = x[rows[i]] (x: [1,1,R,W] TILE)."""
+    def _row_select(self, x, rows, at=0):
+        """[1,1,32,W] whose row at+i = x[rows[i]] (other rows 0; x: [1,1,R,W] TILE)."""
         R = x.shape[-2]
         M = torch.zeros(1, 1, 32, R)
         for i, r in enumerate(rows):
-            M[0, 0, i, r] = 1.0
+            M[0, 0, at + i, r] = 1.0
         Mt = ttnn.from_torch(M, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.dev)
         y = ttnn.matmul(Mt, x, memory_config=DRAM, compute_kernel_config=self.sel_ck)
         ttnn.deallocate(Mt)
@@ -241,7 +244,7 @@ class LargePrefill:
         ttnn.deallocate(k)
         ttnn.deallocate(v)
         o = ttnn.transformer.chunked_scaled_dot_product_attention(
-            q, A.kp, A.vp, pt_full, chunk_start_idx=pos, scale=A.scale, program_config=sdpa_cfg,
+            q, A.kp, A.vp, pt_full, chunk_start_idx_tensor=self.start_t, scale=A.scale, program_config=sdpa_cfg,
             compute_kernel_config=self.sdpa_ck, memory_config=DRAM)
         ttnn.deallocate(q)
         o = ttnn.experimental.nlp_concat_heads(o, memory_config=DRAM)  # [1,1,T,NH*HD]
@@ -322,12 +325,20 @@ class LargePrefill:
         device buffers on their first run for a shape (e.g. chunk_gated_delta_rule); if that happens after a
         trace capture, a later trace replay can overwrite them and the next prefill hangs."""
         e = self.eng
+        mtp = e.mtp is not None
         T = self.t_min
         while T <= self.t_max:
             for n in (T, T - 1):
                 e.reset_spec()
-                self.run([0] * n, start=0, with_mtp=e.mtp is not None)
+                self.run([0] * n, start=0, with_mtp=mtp)
+                # resumed after the T-row mode at a start that is 64 (not 128) aligned: the 64-chunk SDPA config,
+                # the previous-hidden pick for MTP, and the T-row state hand-off
+                e.reset_spec()
+                e.prefill_spec([0] * 64, start=0, with_mtp=mtp)
+                self.run([0] * n, start=64, with_mtp=mtp)
             T *= 2
+        e.reset_spec()  # a prompt spanning two chunks (the previous chunk's last rows feed the next chunk's MTP)
+        self.run([0] * (self.t_max + self.t_min), start=0, with_mtp=mtp)
         e.reset_spec()
 
     # ---------------- snapshots (conversation reuse) ----------------
@@ -381,6 +392,8 @@ class LargePrefill:
                                    dtype=ttnn.int32, device=dev)
         pt_full = e.sh_by[e.T_dec].page_table_1
         sdpa_cfg = self._sdpa_cfg(T, pos)
+        ttnn.copy_host_to_device_tensor(ttnn.from_torch(torch.tensor([pos], dtype=torch.int32), dtype=ttnn.int32),
+                                        self.start_t)
         for i, L in enumerate(e.layers):
             h = self._norm(x, L["in_norm"])
             if L["type"] == "linear_attention":
@@ -472,10 +485,8 @@ class LargePrefill:
                                        device=self.dev)
             if start > 0 and getattr(e, "last_spec", None) is not None and e._a_prev > 0:
                 # main hidden of the last row processed by the T-row mode
-                last = self._row_select(e.last_spec[2], [e._a_prev - 1])
-                prev_hid = ttnn.pad(ttnn.slice(last, (0, 0, 0, 0), (1, 1, 1, e.H), memory_config=DRAM),
-                                    [(0, 0), (0, 0), (31, 0), (0, 0)], 0.0)
-                ttnn.deallocate(last)
+                ttnn.deallocate(prev_hid)
+                prev_hid = self._row_select(e.last_spec[2], [e._a_prev - 1], at=31)
         pos, p = start, 0
         hid = None
         while p < len(ids):
