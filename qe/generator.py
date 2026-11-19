@@ -2,37 +2,61 @@
 
 Greedy (temperature 0) is exact: the output equals plain greedy decoding of the engine.
 """
+import os
 import time
 
 EOS_DEFAULT = (248046, 248044)
+IM_START = 248045
 
 
 class Generator:
-    def __init__(self, eng, eos=EOS_DEFAULT):
+    def __init__(self, eng, eos=EOS_DEFAULT, im_start=IM_START):
         self.eng = eng
         self.eos = set(eos)
+        self.im_start = im_start
         self.processed = []  # tokens whose effect is in the main model state (positions 0..len-1)
+        self.snap = None  # (tokens, host state) saved just before the last <|im_start|> of the previous prompt
         self.k = eng.T_dec - 1
 
     def reset(self):
         self.eng.reset_spec()
         self.processed = []
+        self.snap = None
 
     def _prefill(self, ids):
-        """Bring the state to `ids[:-0]` (all prompt tokens processed). Reuses the previous conversation
-        when the new prompt extends exactly what was processed. Returns (next token, MTP draft, rows of last
-        MTP chunk, prefill info)."""
+        """Bring the state to `ids` (all prompt tokens processed). Returns (next token, MTP draft, rows of last
+        MTP chunk, prefill info).
+
+        Reuse, best first: (1) the prompt extends exactly what was processed (previous prompt + generated tokens);
+        (2) it extends the snapshot taken before the last <|im_start|> of the previous prompt, i.e. the start of
+        the previous assistant turn. (2) covers templates that rewrite the assistant turn (thinking blocks are
+        dropped from history) and clients that re-encode or edit the reply. The GDN state cannot be rewound, so
+        every prompt is prefilled in two parts with a snapshot in between."""
         eng = self.eng
         n_old = len(self.processed)
+        how = "none"
         if n_old and len(ids) > n_old and ids[:n_old] == self.processed:
-            new = ids[n_old:]
-            start = n_old
+            start, how = n_old, "exact"
+        elif self.snap is not None and len(ids) > len(self.snap[0]) and ids[: len(self.snap[0])] == self.snap[0]:
+            eng.large.restore_state(self.snap[1])
+            start, how = len(self.snap[0]), "snapshot"
         else:
             self.reset()
-            new, start = ids, 0
+            start = 0
         t0 = time.perf_counter()
-        nxt, pos, draft = eng.prefill(new, start=start, with_mtp=True)
-        info = dict(reused=start, prefilled=len(new), t_prefill=time.perf_counter() - t0)
+        k = len(ids) - 1 - ids[::-1].index(self.im_start) if self.im_start in ids else -1
+        can_snap = getattr(eng, "large", None) is not None and os.environ.get("QE_SNAPSHOT", "1") == "1"
+        if can_snap and k > start:
+            eng.prefill(ids[start:k], start=start, with_mtp=True)
+            t1 = time.perf_counter()
+            self.snap = (list(ids[:k]), eng.large.save_state())
+            t_snap = time.perf_counter() - t1
+            nxt, pos, draft = eng.prefill(ids[k:], start=k, with_mtp=True)
+        else:
+            t_snap = 0.0
+            nxt, pos, draft = eng.prefill(ids[start:], start=start, with_mtp=True)
+        info = dict(reused=start, reuse=how, prefilled=len(ids) - start, t_prefill=time.perf_counter() - t0,
+                    t_snapshot=t_snap)
         self.processed = list(ids)
         return nxt, draft, eng._mtp_last_rows, info
 

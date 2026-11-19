@@ -637,6 +637,7 @@ class Qwen35Engine:
         from .prefill import LargePrefill
 
         self.large = LargePrefill(self, t_max=t_max)
+        self.large.warmup()
 
     def prefill(self, ids, start=0, with_mtp=False):
         """Prompt prefill: the large-T path when available (chunk starts aligned to 64 by first running the

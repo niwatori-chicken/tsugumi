@@ -11,6 +11,7 @@ On exit it leaves the engine in the state the T-row mode expects after a prefill
 GDN conv history in Hc rows 0..2, recurrent state in snapshot slot 0, a_prev = 0.
 """
 import math
+import os
 import time
 
 import torch
@@ -19,6 +20,13 @@ import ttnn
 from .page_copy import PageCopy
 
 DRAM = ttnn.DRAM_MEMORY_CONFIG
+_DEBUG = os.environ.get("QE_PREFILL_DEBUG", "0") == "1"
+
+
+def _dbg(dev, msg):
+    if _DEBUG:
+        ttnn.synchronize_device(dev)
+        print(f"[prefill-debug] {msg}", flush=True)
 
 
 class LargePrefill:
@@ -160,7 +168,9 @@ class LargePrefill:
         b2 = ttnn.reshape(ttnn.slice(beta, (0, 0, 0, nv), (1, 1, T, 2 * nv), memory_config=DRAM), (1, T, nv))
         ttnn.deallocate(g)
         ttnn.deallocate(beta)
+        _dbg(self.dev, 'gdn pre-conv done')
         conv = self._conv(i, m, y, T, n)
+        _dbg(self.dev, 'conv done')
         ttnn.deallocate(y)
         kd = self.kd
         q = ttnn.reshape(ttnn.slice(conv, (0, 0, 0, 0), (1, 1, T, kd), memory_config=DRAM), (1, T, kd))
@@ -170,7 +180,9 @@ class LargePrefill:
         eye, tril, ones, masks = self.consts
         o, fs = ttnn.transformer.chunk_gated_delta_rule(
             q, k, v, g2, b2, scale=m.scale, initial_state=self.state[i], output_final_state=True, chunk_size=32,
-            eye=eye, tril=tril, ones=ones, masks=masks)
+            eye=eye, tril=tril, ones=ones, masks=masks,
+            use_mcast=os.environ.get("QE_CGDR_MCAST", "1") == "1")
+        _dbg(self.dev, 'cgdr done')
         for t in (q, k, v, g2, b2):
             ttnn.deallocate(t)
         ttnn.deallocate(self.state[i])
@@ -305,6 +317,34 @@ class LargePrefill:
         e._a_prev = 0
         e._last_snap_all = False
 
+    def warmup(self):
+        """Run every chunk bucket once (full and partial) before the engine captures its traces. Ops allocate
+        device buffers on their first run for a shape (e.g. chunk_gated_delta_rule); if that happens after a
+        trace capture, a later trace replay can overwrite them and the next prefill hangs."""
+        e = self.eng
+        T = self.t_min
+        while T <= self.t_max:
+            for n in (T, T - 1):
+                e.reset_spec()
+                self.run([0] * n, start=0, with_mtp=e.mtp is not None)
+            T *= 2
+        e.reset_spec()
+
+    # ---------------- snapshots (conversation reuse) ----------------
+    def save_state(self):
+        """Host copy of the GDN recurrent states and conv histories at the current position. The KV cache is not
+        copied: positions before this point stay valid as long as the same conversation continues."""
+        self._enter()
+        snap = {i: (ttnn.to_torch(self.state[i]), ttnn.to_torch(self.carry[i])) for i in self.state}
+        self._exit()  # also leaves the T-row state in canonical form (slot 0, Hc rows 0..2, a_prev = 0)
+        return snap
+
+    def restore_state(self, snap):
+        up = lambda t, dt: ttnn.from_torch(t, dtype=dt, layout=ttnn.TILE_LAYOUT, device=self.dev, memory_config=DRAM)
+        self.state = {i: up(st, ttnn.float32) for i, (st, _) in snap.items()}
+        self.carry = {i: up(c, ttnn.bfloat16) for i, (_, c) in snap.items()}
+        self._exit()
+
     # ---------------- one chunk ----------------
     def _bucket(self, n):
         T = self.t_min
@@ -348,6 +388,7 @@ class LargePrefill:
             else:
                 a = self._attn(L["mix"], h, T, pos, cos, sin, pt_chunk, pt_full, sdpa_cfg)
             ttnn.deallocate(h)
+            _dbg(self.dev, f'layer {i} mix done')
             x2 = ttnn.add(x, a, memory_config=DRAM)
             ttnn.deallocate(a)
             ttnn.deallocate(x)
@@ -359,8 +400,10 @@ class LargePrefill:
             ttnn.deallocate(m)
             ttnn.deallocate(x)
             x = x2
+        _dbg(self.dev, 'layers done')
         hid = self._norm(x, e.final_norm)
         ttnn.deallocate(x)
+        _dbg(self.dev, 'final norm done')
         if with_mtp and e.mtp is not None:
             self._mtp_kv(xe, hid, prev_hid, T, pos, cos, sin, pt_chunk)
         for t in (cos, sin, pt_chunk) + ((mask,) if mask is not None else ()):
@@ -373,6 +416,7 @@ class LargePrefill:
         cat = ttnn.concat([prev_hid, hid], dim=2, memory_config=DRAM)
         hs = ttnn.matmul(self._shift_matrix(T), cat, memory_config=DRAM, compute_kernel_config=self.sel_ck)
         ttnn.deallocate(cat)
+        _dbg(self.dev, 'mtp shift done')
         emb = ttnn.from_torch(xe, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.dev)
         a = self._norm(emb, mtp.n_emb)
         b = self._norm(hs, mtp.n_hid)
@@ -383,15 +427,18 @@ class LargePrefill:
         ttnn.deallocate(b)
         x = self._mm(c2, mtp.fc, n=e.H)
         ttnn.deallocate(c2)
+        _dbg(self.dev, 'mtp fc done')
         h = self._norm(x, mtp.in_norm)
         ttnn.deallocate(x)
         q, k, v, gate = self._qkv_heads(mtp.attn, h, T, cos, sin)
         ttnn.deallocate(h)
         ttnn.deallocate(q)
         ttnn.deallocate(gate)
+        _dbg(self.dev, 'mtp qkv done')
         self._fill_kv(mtp.attn, k, v, pt_chunk)
         ttnn.deallocate(k)
         ttnn.deallocate(v)
+        _dbg(self.dev, 'mtp fill done')
 
     def logits_host(self, hid, r0, r1, step=128):
         """Full-vocab logits of rows [r0, r1) of a kept hidden [1,1,T,H] -> torch float [r1-r0, V]."""
@@ -416,7 +463,9 @@ class LargePrefill:
         e = self.eng
         assert start % self.BS == 0
         t0 = time.perf_counter()
+        _dbg(self.dev, f'run start={start} n={len(ids)} a_prev={e._a_prev} snap_all={e._last_snap_all}')
         self._enter()
+        _dbg(self.dev, 'entered')
         prev_hid = None
         if with_mtp and e.mtp is not None:
             prev_hid = ttnn.from_torch(torch.zeros(1, 1, 32, e.H), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
