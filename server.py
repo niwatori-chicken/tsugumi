@@ -1,6 +1,6 @@
 """OpenAI-compatible chat server for Qwen3.8-27B on one P100A (lean B=1 engine + MTP speculative decoding).
 
-    python server.py [--port 8010] [--max-seq 163840]
+    python server.py [--port 8010] [--max-seq 159744]
 
 Endpoints: POST /v1/chat/completions (stream or not), GET /v1/models, GET /health.
 Decoding is greedy (temperature/top_p are accepted but ignored). One request at a time.
@@ -9,6 +9,7 @@ Decoding is greedy (temperature/top_p are accepted but ignored). One request at 
 """
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -35,6 +36,8 @@ class Backend:
                                 log=lambda *a: None)
         self.eng.init_spec(T, mtp=True)
         self.eng.init_prefill(prefill_T)
+        if os.environ.get("QE_LARGE_PREFILL", "1") == "1":  # must come before capture_all
+            self.eng.init_large_prefill(int(os.environ.get("QE_LARGE_T", "1024")))
         self.eng.capture_all()
         self.gen = Generator(self.eng)
         self.max_seq = max_seq
@@ -193,7 +196,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8010)
-    ap.add_argument("--max-seq", type=int, default=163840)
+    ap.add_argument("--max-seq", type=int, default=159744)  # large-T prefill needs ~140MB of working DRAM
     a = ap.parse_args()
     import uvicorn
 

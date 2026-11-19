@@ -632,6 +632,23 @@ class Qwen35Engine:
         self.use_T(self.T_dec)
         return last, start + pos, draft
 
+    def init_large_prefill(self, t_max=1024):
+        """Large-T prompt prefill (qe/prefill.py); used by prefill() for prompts of 64+ tokens."""
+        from .prefill import LargePrefill
+
+        self.large = LargePrefill(self, t_max=t_max)
+
+    def prefill(self, ids, start=0, with_mtp=False):
+        """Prompt prefill: the large-T path when available (chunk starts aligned to 64 by first running the
+        T-row mode up to the boundary), else prefill_spec. Same return value as prefill_spec."""
+        lp = getattr(self, "large", None)
+        k = (-start) % 64
+        if lp is None or len(ids) - k < 64:
+            return self.prefill_spec(ids, start=start, with_mtp=with_mtp)
+        if k:
+            self.prefill_spec(ids[:k], start=start, with_mtp=with_mtp)
+        return lp.run(ids[k:], start=start + k, with_mtp=with_mtp)
+
     def capture(self):
         self.forward()  # compile
         self.trace_id = ttnn.begin_trace_capture(self.dev, cq_id=0)

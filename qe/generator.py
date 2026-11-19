@@ -31,7 +31,7 @@ class Generator:
             self.reset()
             new, start = ids, 0
         t0 = time.perf_counter()
-        nxt, pos, draft = eng.prefill_spec(new, start=start, with_mtp=True)
+        nxt, pos, draft = eng.prefill(new, start=start, with_mtp=True)
         info = dict(reused=start, prefilled=len(new), t_prefill=time.perf_counter() - t0)
         self.processed = list(ids)
         return nxt, draft, eng._mtp_last_rows, info

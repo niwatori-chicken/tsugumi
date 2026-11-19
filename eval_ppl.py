@@ -22,6 +22,7 @@ def main():
     ap.add_argument("--topk", type=int, default=1024)
     ap.add_argument("--set", nargs="*", default=[], help="per-group dtype overrides, e.g. mlp_down=bfp8")
     ap.add_argument("--cache", default=None, help="cache subdir (default: --prec)")
+    ap.add_argument("--large", type=int, default=0, help="use the large-T prefill path with this t_max")
     a = ap.parse_args()
     data = torch.load(a.ids)
     C = next(iter(data.values())).shape[1]
@@ -33,6 +34,8 @@ def main():
                            log=lambda *x: None)
         eng.init_spec(4, mtp=False)
         eng.init_prefill(32)
+        if a.large:
+            eng.init_large_prefill(a.large)
         eng.capture_all()
         V = eng.V
         orig = eng.run_spec
@@ -52,8 +55,21 @@ def main():
                 rows.clear()
                 eng.reset_spec()
                 eng._a_prev = 0
-                eng.prefill_spec(ids[n].tolist(), start=0)
-                lg = torch.cat(rows, 0)  # [C, V]
+                if a.large:
+                    eng.large.keep = []
+                    eng.large.run(ids[n].tolist(), start=0, with_mtp=False)
+                    pos = 0
+                    for hid, nn in eng.large.keep:  # rows of the scored range only
+                        lo, hi = max(pos, C // 2 - 1), min(pos + nn, C - 1)
+                        if hi > lo:
+                            rows.append(eng.large.logits_host(hid, lo - pos, hi - pos))
+                        ttnn.deallocate(hid)
+                        pos += nn
+                    eng.large.keep = None
+                    lg = torch.cat([torch.zeros(C // 2 - 1, V)] + rows, 0)  # [C-1, V]; only the scored rows are real
+                else:
+                    eng.prefill_spec(ids[n].tolist(), start=0)
+                    lg = torch.cat(rows, 0)  # [C, V]
                 first = C // 2
                 lp = torch.log_softmax(lg[first - 1: C - 1], -1)  # predicts tokens first..C-1
                 tgt = ids[n, first:C]
