@@ -135,6 +135,7 @@ def main():
     ap.add_argument("--think", action="store_true")
     ap.add_argument("--max-new", type=int, default=0, help="override (thinking tasks)")
     ap.add_argument("--max-seq", type=int, default=16384)
+    ap.add_argument("--api", default=None, help="OpenAI-compatible base URL (e.g. llama-server) instead of the engine")
     a = ap.parse_args()
     items = load(a.task, a.n)
     done = set()
@@ -144,6 +145,8 @@ def main():
     print(f"[{a.task}] {len(items)} items, {len(todo)} to run", flush=True)
     if not todo:
         return summarize(a.out, a.task)
+    if a.api:
+        return run_api(a, todo)
 
     import ttnn
     from transformers import AutoTokenizer
@@ -187,6 +190,33 @@ def main():
                     print(f"  {j + 1}/{len(todo)} score={s} n_out={len(out)} {dt:.1f}s", flush=True)
     finally:
         ttnn.close_device(dev)
+    summarize(a.out, a.task)
+
+
+def run_api(a, todo):
+    """Same prompts through an OpenAI-compatible server (greedy; thinking via chat_template_kwargs)."""
+    import urllib.request
+    default_new = 4096 if a.think else 768
+    with open(a.out, "a") as f:
+        for j, it in enumerate(todo):
+            max_new = a.max_new or it["max_new"] or default_new
+            body = {"messages": [{"role": "user", "content": it["prompt"]}], "max_tokens": max_new, "temperature": 0,
+                    "chat_template_kwargs": {"enable_thinking": a.think}}
+            req = urllib.request.Request(a.api.rstrip("/") + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            t0 = time.perf_counter()
+            r = json.load(urllib.request.urlopen(req, timeout=3600))
+            dt = time.perf_counter() - t0
+            msg = r["choices"][0]["message"]
+            text = (msg.get("content") or "").split("</think>")[-1]
+            n_out = r.get("usage", {}).get("completion_tokens", 0)
+            s, extra = score(a.task, it, text.strip())
+            rec = dict(id=it["id"], score=s, gold=it["gold"], pred=text.strip()[-2000:], n_out=n_out,
+                       truncated=n_out >= max_new, sec=round(dt, 2), think=a.think, api=a.api, **extra)
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.flush()
+            if j % 20 == 0:
+                print(f"  {j + 1}/{len(todo)} score={s} n_out={n_out} {dt:.1f}s", flush=True)
     summarize(a.out, a.task)
 
 
