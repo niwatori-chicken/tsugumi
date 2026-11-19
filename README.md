@@ -75,6 +75,7 @@ python run_mtp.py --prompt "Pythonでフィボナッチ数列を返す関数を�
 |---|---|
 | `QE_MODEL_DIR` / `QE_CACHE_DIR` | モデルと変換済み重みの場所 (`qe/paths.py`) |
 | `QE_LARGE_PREFILL=0` / `QE_LARGE_T` | 大きい T の prefill を使わない (T=32 の旧経路) / 1 チャンクの最大行数 (既定 1024) |
+| `QE_SNAPSHOT=0` | 会話の再利用用の状態スナップショットを取らない |
 | `QE_GQA_ATTN=0` | 自作の GQA アテンションを使わず、ttnn の SDPA に戻す |
 | `QE_CHUNKED_PREFILL=0` | (GQA を切ったとき) prefill で chunked SDPA を使わない |
 | `QE_FUSED_GDN=0` | GDN 融合カーネルを使わず、元の op の並びで動かす |
@@ -84,8 +85,8 @@ python run_mtp.py --prompt "Pythonでフィボナッチ数列を返す関数を�
 - **貪欲法のみ**。temperature などは受け取りますが無視します (投機的サンプリングは未実装)。
 - 全部 bfp4 の perplexity は bf16 比で日本語 +5%、英語 +7% (llama.cpp の IQ3_XXS 並み、Q4_0 は +2〜3%)。
   `eval_ppl.py` / `ref_ppl.py` / `compare_ppl.py` で計測。実務的なタスクでの品質は未評価。
-- 会話の続きの再利用 (前回の KV/状態を使い回す仕組み) はあるものの、チャットテンプレートの差で 2 ターン目に一致せず、
-  実際には毎回全体を prefill しています。
+- 会話の続きは再利用します (前回のプロンプト + 返答、またはアシスタントのターン開始位置の状態スナップショットから差分だけ prefill)。
+  状態は 1 本だけなので、複数の会話を交互に流すと毎回最初から prefill になります。
 - 短い文脈では、GQA カーネルの固定費 (約 0.1ms/層) のぶん、ttnn の SDPA より 1 ステップ 1ms ほど遅くなります。
 - デバイスが固まった場合は `tt-smi -r 0` を 2 回、15 秒ほど待つと戻ることが多いです。
 
