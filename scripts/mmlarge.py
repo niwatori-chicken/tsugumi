@@ -1,6 +1,8 @@
 """Large-M matmul against the engine's bfp4 DRAM width-sharded weights (prefill with T >= 128).
-  python mmlarge.py [M ...]
+  python scripts/mmlarge.py [M ...]
 Compares: dram-sharded program (per_core_M = M/32), minimal_matmul (default config), ttnn.linear (auto)."""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import math, sys, time, torch, ttnn
 from qe.ops import DecodeLinear
 

@@ -60,7 +60,7 @@ export QE_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みのキ�
 python server.py --port 8010 [--max-seq 159744]
 
 # 1 プロンプトで速度と位置ごとの採択率を見る
-python run_mtp.py --prompt "Pythonでフィボナッチ数列を返す関数を書いてください。"
+python scripts/run_mtp.py --prompt "Pythonでフィボナッチ数列を返す関数を書いてください。"
 ```
 
 サーバー:
@@ -84,7 +84,7 @@ python run_mtp.py --prompt "Pythonでフィボナッチ数列を返す関数を�
 
 - **貪欲法のみ**。temperature などは受け取りますが無視します (投機的サンプリングは未実装)。
 - 全部 bfp4 の perplexity は bf16 比で日本語 +5%、英語 +7% (llama.cpp の IQ3_XXS 並み、Q4_0 は +2〜3%)。
-  `eval_ppl.py` / `ref_ppl.py` / `compare_ppl.py` で計測。実務的なタスクでの品質は未評価。
+  `scripts/eval_ppl.py` / `ref_ppl.py` / `compare_ppl.py` で計測。実務的なタスクでの品質は未評価。
 - 会話の続きは再利用します (前回のプロンプト + 返答、またはアシスタントのターン開始位置の状態スナップショットから差分だけ prefill)。
   状態は 1 本だけなので、複数の会話を交互に流すと毎回最初から prefill になります。
 - 短い文脈では、GQA カーネルの固定費 (約 0.1ms/層) のぶん、ttnn の SDPA より 1 ステップ 1ms ほど遅くなります。
@@ -102,11 +102,12 @@ python run_mtp.py --prompt "Pythonでフィボナッチ数列を返す関数を�
 | `qe/prefill.py`、`qe/conv_kernel.py`、`qe/page_copy.py` | 大きい T の prefill、因果 conv カーネル、ページコピー |
 | `kernels/*.cpp` | 自作カーネル (generic_op で起動) |
 | `server.py` | OpenAI 互換サーバー |
-| `run_mtp.py`、`run_spec_test.py`、`run_gen.py` | 生成と速度の確認 (MTP / T 行 / T=1) |
-| `cmp_hf.py` | 先頭 N 層を HF (CPU fp32) と比較 |
-| `test_*.py` | カーネルと層の単体テスト |
-| `bench_*.py`、`mmbench.py`、`mmlarge.py`、`sdpabench.py`、`memprobe.py`、`longctx.py`、`prefill_agree.py`、`quantstudy.py` | 計測 |
-| `eval_ppl.py`、`ref_ppl.py`、`compare_ppl.py` | perplexity (エンジン / CPU の bf16 基準 / 比較) |
+| `scripts/` | テスト・計測・評価のスクリプト (下記。`lowbit/` から `python scripts/<name>.py` で実行) |
+| `scripts/run_mtp.py`、`run_spec_test.py`、`run_gen.py` | 生成と速度の確認 (MTP / T 行 / T=1) |
+| `scripts/cmp_hf.py` | 先頭 N 層を HF (CPU fp32) と比較 |
+| `scripts/test_*.py` | カーネルと層の単体テスト、会話の再利用 |
+| `scripts/bench_*.py`、`mmbench.py`、`mmlarge.py`、`sdpabench.py`、`memprobe.py`、`longctx.py`、`prefill_agree.py`、`quantstudy.py` | 計測 |
+| `scripts/eval_ppl.py`、`ref_ppl.py`、`compare_ppl.py` | perplexity (エンジン / CPU の bf16 基準 / 比較) |
 
 ## ライセンス
 

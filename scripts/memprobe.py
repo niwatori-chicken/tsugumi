@@ -1,4 +1,6 @@
-"""Load the server configuration with a given max_seq and report DRAM usage.  python memprobe.py 131072"""
+"""Load the server configuration with a given max_seq and report DRAM usage.  python scripts/memprobe.py 131072"""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import sys, time
 import ttnn
 from qe.model import Precision, Qwen35Engine

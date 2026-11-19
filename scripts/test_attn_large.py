@@ -1,5 +1,7 @@
 """Large-T attention (LargePrefill._attn) vs a torch fp32 reference with the dequantized weights (layer 3).
-  python test_attn_large.py [T] [N]"""
+  python scripts/test_attn_large.py [T] [N]"""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import json, sys, torch, ttnn
 import qe.paths as qe_paths
 from qe.attn import AttnDecode

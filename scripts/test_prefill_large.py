@@ -1,5 +1,7 @@
 """Large-T prefill vs the T=32 path: next token, MTP draft, greedy continuation, timing.
-  python test_prefill_large.py [N tokens] [t_max] [max_new]"""
+  python scripts/test_prefill_large.py [N tokens] [t_max] [max_new]"""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import sys, time, torch
 import ttnn
 from transformers import AutoTokenizer

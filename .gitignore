@@ -3,6 +3,6 @@ generated/
 *.tensorbin
 quantstudy_model-*.txt
 # one-off experiments kept out of the repo
-cmpbench.py
-argbench.py
-normbench.py
+scripts/cmpbench.py
+scripts/argbench.py
+scripts/normbench.py

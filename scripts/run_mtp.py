@@ -1,8 +1,10 @@
 """Greedy speculative decoding with the built-in MTP head (draft k = T-1 tokens per step).
 
-python run_mtp.py [--T 4] [--max-new 200] [--prompt ...] [--no-trace] [--compare]
+python scripts/run_mtp.py [--T 4] [--max-new 200] [--prompt ...] [--no-trace] [--compare]
 --compare: also run plain greedy (a=1 per step) and check the outputs are identical.
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import argparse
 import faulthandler
 import signal

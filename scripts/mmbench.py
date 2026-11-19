@@ -1,8 +1,10 @@
 """B=1 decode matmul bandwidth bench on P100A (DRAM-sharded weights, trace replay).
 
-Usage: python mmbench.py [--workers 1,2] [--dtypes bfp4,bfp8] [--shapes qwen27]
+Usage: python scripts/mmbench.py [--workers 1,2] [--dtypes bfp4,bfp8] [--shapes qwen27]
 Prints time per matmul and effective weight bandwidth.
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import argparse
 import math
 import time

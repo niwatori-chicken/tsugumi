@@ -1,7 +1,9 @@
 """Greedy generation with the lean engine (prefill = token-by-token decode for now).
 
-python run_gen.py [--prec mixed|bfp4] [--layers N] [--max-new 64] [--prompt "..."] [--no-trace]
+python scripts/run_gen.py [--prec mixed|bfp4] [--layers N] [--max-new 64] [--prompt "..."] [--no-trace]
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import argparse
 import sys
 import time

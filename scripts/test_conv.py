@@ -1,4 +1,6 @@
-"""CausalConvKernel vs torch (bf16 inputs, fp64 ref). python test_conv.py"""
+"""CausalConvKernel vs torch (bf16 inputs, fp64 ref). python scripts/test_conv.py"""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import time, torch, ttnn
 from qe.conv_kernel import CausalConvKernel
 C = 10240

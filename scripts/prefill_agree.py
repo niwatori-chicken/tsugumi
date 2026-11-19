@@ -1,4 +1,6 @@
-"""Dump per-position argmax during prefill (teacher forcing) for comparing prefill paths. python prefill_agree.py OUT.pt"""
+"""Dump per-position argmax during prefill (teacher forcing) for comparing prefill paths. python scripts/prefill_agree.py OUT.pt"""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import sys, glob, random, torch
 import ttnn
 from qe.model import Precision, Qwen35Engine
@@ -6,7 +8,7 @@ from transformers import AutoTokenizer
 import qe.paths as qe_paths
 MODEL = qe_paths.MODEL; CACHE = qe_paths.CACHE
 tok = AutoTokenizer.from_pretrained(MODEL)
-text = open(sys.argv[2] if len(sys.argv) > 2 else "README.md").read()
+text = open(sys.argv[2] if len(sys.argv) > 2 else _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "README.md")).read()
 ids = tok.encode(text)[:6000]
 dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
 try:

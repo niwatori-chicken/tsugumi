@@ -1,4 +1,6 @@
 """Per-component device time in T-row mode (each part traced alone)."""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import sys
 import torch
 import ttnn

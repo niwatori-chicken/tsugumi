@@ -5,8 +5,10 @@ contiguous along the last dim of the ttnn weight [K=in, N=out] (i.e. 16 output c
 one input index), shared exponent = max exponent, sign + mantissa with the hidden bit
 (3 bits for bfp4, 7 for bfp8), round-to-nearest-even, saturating.
 
-Usage: python quantstudy.py <shard.safetensors> [name-filter]
+Usage: python scripts/quantstudy.py <shard.safetensors> [name-filter]
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import sys
 
 import torch

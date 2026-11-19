@@ -1,6 +1,8 @@
 """ttnn.transformer.chunk_gated_delta_rule for the Qwen3.8-27B GDN shape (Nk 16, Nv 48, Dk=Dv 128):
 accuracy vs a token-by-token torch recurrence (with an initial state) and trace timing per T.
-  python bench_cgdr.py [T ...]"""
+  python scripts/bench_cgdr.py [T ...]"""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import sys, time, torch, ttnn
 
 Nk, Nv, D = 16, 48, 128

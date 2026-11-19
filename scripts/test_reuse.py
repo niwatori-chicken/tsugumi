@@ -1,5 +1,7 @@
 """Conversation reuse: 3 turns (thinking off / on) through Generator; reuse kind, TTFT, snapshot time,
-and the reply with reuse vs from scratch.  python test_reuse.py"""
+and the reply with reuse vs from scratch.  python scripts/test_reuse.py"""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import faulthandler, sys, time, torch, ttnn
 faulthandler.dump_traceback_later(90, repeat=True, file=sys.stderr)
 from transformers import AutoTokenizer

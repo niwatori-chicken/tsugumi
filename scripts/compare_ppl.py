@@ -1,11 +1,13 @@
 """Compare eval_ppl.py results against the ref_ppl.py reference.
 
-    python compare_ppl.py REF.pt RUN.pt [RUN2.pt ...]
+    python scripts/compare_ppl.py REF.pt RUN.pt [RUN2.pt ...]
 
 Per language: PPL, its change vs the reference, mean KL(ref || run) over the reference's top-K tokens
 (tokens outside the run's saved top-K get the run's smallest saved log-prob, an upper bound on q),
 and how often the argmax agrees with the reference.
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import math
 import sys
 

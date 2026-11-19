@@ -1,4 +1,6 @@
-"""GQAAttention vs torch reference.  python test_gqa.py"""
+"""GQAAttention vs torch reference.  python scripts/test_gqa.py"""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import sys, time, torch, ttnn
 from qe.gqa_attn import GQAAttention
 NH, NKV, HD, BS = 24, 4, 256, 64

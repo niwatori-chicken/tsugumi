@@ -1,5 +1,7 @@
 """T-row mode test: chunked prefill + plain greedy decode where each step commits 1 row (a=1).
-Compares against the T=1 engine output text. python run_spec_test.py [--layers N] [--T 4]"""
+Compares against the T=1 engine output text. python scripts/run_spec_test.py [--layers N] [--T 4]"""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import argparse
 import sys
 import time

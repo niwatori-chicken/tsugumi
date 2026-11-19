@@ -1,7 +1,9 @@
 """Unit test of the fused GDN recurrence kernel vs a torch fp32 reference (random data).
 
-python test_gdn_kernel.py T [steps] [--nofp32]
+python scripts/test_gdn_kernel.py T [steps] [--nofp32]
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import sys
 import time
 

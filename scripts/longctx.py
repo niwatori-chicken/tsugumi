@@ -1,4 +1,6 @@
-"""Needle test + speed at long context.  python longctx.py N_TOKENS"""
+"""Needle test + speed at long context.  python scripts/longctx.py N_TOKENS"""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import os, sys, time, random, glob
 import ttnn
 from qe.model import Precision, Qwen35Engine

@@ -1,4 +1,6 @@
-"""Large-T prefill: time per component (synchronized) for one chunk. python bench_prefill_large.py [T] [P0]"""
+"""Large-T prefill: time per component (synchronized) for one chunk. python scripts/bench_prefill_large.py [T] [P0]"""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import sys, time, collections, torch, ttnn
 import qe.paths as qe_paths
 from qe.model import Precision, Qwen35Engine

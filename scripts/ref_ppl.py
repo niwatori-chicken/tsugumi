@@ -1,10 +1,12 @@
 """Reference perplexity on CPU (bf16 checkpoint computed in fp32), streaming one decoder layer at a time from
 the safetensors (the full model does not fit in host RAM). Same protocol and outputs as eval_ppl.py.
 
-    python ref_ppl.py IDS.pt OUT.pt [--sub 4] [--topk 64]
+    python scripts/ref_ppl.py IDS.pt OUT.pt [--sub 4] [--topk 64]
 
 All chunks go through layer i before layer i+1 is loaded; hidden states (N chunks x C x 5120 fp32) stay in RAM.
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import argparse
 import math
 import time

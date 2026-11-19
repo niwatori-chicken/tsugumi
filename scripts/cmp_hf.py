@@ -1,7 +1,9 @@
 """Compare engine logits against HF (CPU fp32) for the first N layers (+final norm + lm_head).
 
-python cmp_hf.py --layers 4 [--prec mixed]
+python scripts/cmp_hf.py --layers 4 [--prec mixed]
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
 import argparse
 import json
 import sys
