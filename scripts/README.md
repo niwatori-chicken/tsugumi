@@ -21,7 +21,7 @@
 | `run_mtp.py --prompt "..."` | MTP 投機的デコード (貪欲法) で 1 プロンプト生成し、速度と位置ごとの採択率を表示 |
 | `run_spec_test.py` | T 行モード: chunked prefill と、1 行ずつ確定する貪欲デコード |
 | `run_gen.py` | T=1 の素のデコードで生成 (初期の経路) |
-| `longctx.py N [max_new] [質問]` | 長文脈の needle テストと速度。<br>`TSUMI_MAX_SEQ`、`TSUMI_LARGE_PREFILL`、`TSUMI_LARGE_T` で設定を変える |
+| `longctx.py N [max_new] [質問]` | 長文脈の干し草山テスト (needle in a haystack) と速度。<br>`TSUMI_MAX_SEQ`、`TSUMI_LARGE_PREFILL`、`TSUMI_LARGE_T` で設定を変える |
 
 ## 正しさのテスト
 
@@ -32,6 +32,7 @@
 | `test_gdn_kernel.py` | GDN の再帰カーネル (自作) を torch fp32 と比較 |
 | `test_gdn_fused.py T [steps]` | 融合 GDN カーネル (conv 以降) を torch と比較 |
 | `test_attn_spec.py T N [chunked]` | attention 層: T=1 の逐次デコードと T 行のページ KV 経路を比較 (層 3 の実重み) |
+| `test_kv_bfp8.py [max_seq]` | bfp8 の KV: 書き込みカーネルがホストの変換とビット単位で一致すること (タイル・ブロック境界、シャッフルしたページ表)、bfp8 の KV での GQA アテンション |
 | `test_gqa.py [max_seq]` | GQA split-K アテンション (自作) を torch と比較 (物理ブロックをシャッフルしたページ表で) |
 | `test_attn_large.py [T] [N]` | 大きい T の attention を torch fp32 と比較。<br>q/k (RoPE 後) と K キャッシュは要素ごとにも比較 |
 | `test_conv.py` | 因果 conv カーネル (大きい T の prefill 用) を torch fp64 と比較 |

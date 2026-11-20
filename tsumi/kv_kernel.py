@@ -1,4 +1,4 @@
-"""Launcher for kernels/kv_write.cpp: write T K/V rows into the paged bf16 cache through a page table."""
+"""Launcher for kernels/kv_write.cpp: write T K/V rows into the paged cache (bf16 or bfp8_b) through a page table."""
 import os
 
 import ttnn
@@ -7,7 +7,8 @@ KDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "kernels")
 
 
 class KVWriteKernel:
-    def __init__(self, dev, T, NKV, HD, block_size, nblocks):
+    def __init__(self, dev, T, NKV, HD, block_size, nblocks, kv_dtype=ttnn.bfloat16):
+        self.bfp8 = int(kv_dtype == ttnn.bfloat8_b)
         self.dev, self.T, self.NKV, self.HDT, self.BS = dev, T, NKV, HD // 32, block_size
         grid = dev.compute_with_storage_grid_size()
         n = NKV * self.HDT
@@ -25,7 +26,7 @@ class KVWriteKernel:
 
     def __call__(self, ksrc, vsrc, kc, vc, pos, pt):
         ins = [ksrc, vsrc, kc, vc, pos, pt]
-        ct = [self.T, self.NKV, self.HDT, self.BS, self.posb, self.ptb]
+        ct = [self.T, self.NKV, self.HDT, self.BS, self.posb, self.ptb, self.bfp8]
         for t in ins:
             ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
         addrs = [t.buffer_address() for t in ins]

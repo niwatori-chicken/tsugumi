@@ -6,7 +6,7 @@ re-reads the whole KV cache.
 
   q   : normed + roped and pre-scaled by 1/sqrt(HD), bf16 TILE DRAM. T < 32: [1, T, NH, HD];
         T == 32: [1, NH, 32, HD] (heads permuted to dim 1)
-  kc/vc : [blocks, NKV, BS, HD] bf16 TILE paged caches;  pt : int32 row-major [1, nblocks] page table
+  kc/vc : [blocks, NKV, BS, HD] TILE paged caches, bf16 or bfp8_b (kv_dtype);  pt : int32 row-major [1, nblocks] page table
   pos : int32 [T] row positions (consecutive; POS[0] = first row)
 Returns [1, 1, 32, NH*HD] bf16 (rows >= T zero) — rows = tokens, ready for the gate and o_proj.
 """
@@ -19,7 +19,7 @@ KDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "kernels")
 
 
 def _cbd(cores, index, ntiles, dtype):
-    ps = 4096 if dtype == ttnn.float32 else 2048
+    ps = {ttnn.float32: 4096, ttnn.bfloat8_b: 1088}.get(dtype, 2048)
     return ttnn.CBDescriptor(total_size=ntiles * ps, core_ranges=cores, format_descriptors=[
         ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=ps)])
 
@@ -30,9 +30,11 @@ def _cores(coords):
 
 class GQAAttention:
     def __init__(self, dev, T, NH=24, NKV=4, HD=256, block_size=64, chunk_tiles=2, splits=None,
-                 fidelity=ttnn.MathFidelity.HiFi4, nblocks=4096):
+                 fidelity=ttnn.MathFidelity.HiFi4, nblocks=4096, kv_dtype=ttnn.bfloat16):
         assert T == 32 or (16 % T == 0 and T >= 2)
         self.dev, self.T, self.NH, self.NKV, self.HD, self.BS = dev, T, NH, NKV, HD, block_size
+        self.kv_dtype = kv_dtype
+        self.kvtb = 1088 if kv_dtype == ttnn.bfloat8_b else 2048
         self.GH = NH // NKV
         self.HDT = HD // 32
         self.RT = (self.GH * T + 31) // 32
@@ -52,8 +54,8 @@ class GQAAttention:
         bf, f32 = ttnn.bfloat16, ttnn.float32
         self.m_cbs = [
             _cbd(mc, 0, RT * HDT, bf),  # Q
-            _cbd(mc, 1, 2 * CT * HDT, bf),  # K
-            _cbd(mc, 2, 2 * CT * HDT, bf),  # V
+            _cbd(mc, 1, 2 * CT * HDT, kv_dtype),  # K
+            _cbd(mc, 2, 2 * CT * HDT, kv_dtype),  # V
             _cbd(mc, 3, RT * CT, bf),  # mask
             _cbd(mc, 4, 1, bf),  # scaler
             _cbd(mc, 5, 1, bf),  # info
@@ -114,7 +116,7 @@ class GQAAttention:
             core_ranges=cores, compile_time_args=ct, runtime_args=rt, config=cfg)
         # ---- main ----
         ins = [q, kc, vc, pos, self.sc, self.cf, pt]
-        r_ct = [T, RT, CT, S, self.BS, NKV, self.posb, self.GH, HDT, self.qmode, self.ptb]
+        r_ct = [T, RT, CT, S, self.BS, NKV, self.posb, self.GH, HDT, self.qmode, self.ptb, self.kvtb]
         for t in ins:
             r_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
         addrs = [t.buffer_address() for t in ins]

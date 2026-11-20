@@ -6,10 +6,16 @@ partial RoPE (rotate_half on the first rope_dim dims); out = attn * sigmoid(gate
 import torch
 import ttnn
 
+from .env import env
 from .kv_kernel import KVWriteKernel
 from .ops import DecodeLinear, has_cache
 
 _L1 = ttnn.L1_MEMORY_CONFIG
+
+
+def kv_dtype():
+    """KV cache format (TSUMI_KV_DTYPE): bf16 (68 KiB/token over 17 layers) or bfp8 (36 KiB/token)."""
+    return {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b}[env("KV_DTYPE", "bfp8")]
 
 
 def rope_rot_matrix(head_dim, rope_dim):
@@ -80,12 +86,14 @@ class AttnDecode:
                                                      q_chunk_size=T, k_chunk_size=T)
         nb = self.max_seq // block_size
         if not hasattr(self, "kvw_T"):
-            self.kp = ttnn.from_torch(torch.zeros(nb, NKV, block_size, HD), dtype=ttnn.bfloat16,
-                                      layout=ttnn.TILE_LAYOUT, device=self.dev)
-            self.vp = ttnn.from_torch(torch.zeros(nb, NKV, block_size, HD), dtype=ttnn.bfloat16,
-                                      layout=ttnn.TILE_LAYOUT, device=self.dev)
+            self.kv_dtype = kv_dtype()
+            # zero-filled on the device (unwritten positions inside a chunk are masked, but 0 * NaN would not be)
+            self.kp = ttnn.zeros([nb, NKV, block_size, HD], dtype=self.kv_dtype, layout=ttnn.TILE_LAYOUT,
+                                 device=self.dev)
+            self.vp = ttnn.zeros([nb, NKV, block_size, HD], dtype=self.kv_dtype, layout=ttnn.TILE_LAYOUT,
+                                 device=self.dev)
             self.kvw_T = {}
-        self.kvw_T[T] = KVWriteKernel(self.dev, T, NKV, HD, block_size, nb)
+        self.kvw_T[T] = KVWriteKernel(self.dev, T, NKV, HD, block_size, nb, self.kv_dtype)
         # one user per paged_update_cache call: users of one step share KV tiles, and the op does a
         # read-modify-write of whole tiles per user core, so concurrent users in one tile clobber each other.
         self.kv_shard_1 = ttnn.create_sharded_memory_config(

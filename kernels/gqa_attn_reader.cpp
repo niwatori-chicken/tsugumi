@@ -1,13 +1,13 @@
-// GQA split-K attention (flash-decoding) over a paged bf16 KV cache — reader.
+// GQA split-K attention (flash-decoding) over a paged KV cache (bf16 or bfp8_b) — reader.
 // Core (g, s): kv head g, split s of the key range [0, N) with N = POS[0] + T.
 // Q rows of the group are folded: row r = h' * T + t (h' < GH q heads of the group, t < T tokens), RT row tiles.
 // Keys are processed in chunks of C = CT*32 positions; split s takes chunks [s*nch/S, (s+1)*nch/S).
 //   Q   : pre-scaled by 1/sqrt(HD).  QMODE 0: [1, T, NH(pad 32), HD] bf16 TILE (page t*HDT + d), gathered here;
 //         QMODE 1 (T == 32): [1, NH, 32, HD] (page h*HDT + d), row tile h' of the group = head g*GH + h'
 //   SC  : bf16 tile, ones in row 0 of each face (reduce scaler);  CF : 2 fp32 tiles (-1e30, 0)
-//   Kc/Vc : [blocks, NKV, BS, HD] bf16 TILE;  PT : int32 row-major [1, nblocks] page table (logical -> physical block)
+//   Kc/Vc : [blocks, NKV, BS, HD] TILE, KVTB bytes per tile (2048 bf16, 1088 bfp8_b);  PT : int32 row-major [1, nblocks] page table (logical -> physical block)
 //   POS : int32 [T] (positions of the T rows; only POS[0] is used, rows are consecutive)
-// CT: 0 T, 1 RT, 2 CT, 3 S, 4 BS, 5 NKV, 6 POSB, 7 GH, 8 HDT, 9 QMODE, 10 PTB, then accessors Q, Kc, Vc, POS, SC, CF, PT
+// CT: 0 T, 1 RT, 2 CT, 3 S, 4 BS, 5 NKV, 6 POSB, 7 GH, 8 HDT, 9 QMODE, 10 PTB, 11 KVTB, then accessors Q, Kc, Vc, POS, SC, CF, PT
 // RT: 0..6 addrs, 7 g, 8 s
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -33,7 +33,8 @@ void kernel_main() {
     constexpr uint32_t HDT = get_compile_time_arg_val(8);
     constexpr uint32_t QMODE = get_compile_time_arg_val(9);
     constexpr uint32_t PTB = get_compile_time_arg_val(10);
-    constexpr auto aQ = TensorAccessorArgs<11>();
+    constexpr uint32_t KVTB = get_compile_time_arg_val(11);
+    constexpr auto aQ = TensorAccessorArgs<12>();
     constexpr auto aK = TensorAccessorArgs<aQ.next_compile_time_args_offset()>();
     constexpr auto aV = TensorAccessorArgs<aK.next_compile_time_args_offset()>();
     constexpr auto aP = TensorAccessorArgs<aV.next_compile_time_args_offset()>();
@@ -140,7 +141,7 @@ void kernel_main() {
             const uint32_t b = (uint32_t)PT[p / BS], rt = (p % BS) / 32;
             const uint32_t t0 = ((b * NKV + g) * (BS / 32) + rt) * HDT;
             for (uint32_t d = 0; d < HDT; ++d) {
-                noc.async_read(sK, ck, TB, {.page_id = t0 + d}, {.offset_bytes = (j * HDT + d) * TB});
+                noc.async_read(sK, ck, KVTB, {.page_id = t0 + d}, {.offset_bytes = (j * HDT + d) * KVTB});
             }
         }
         noc.async_read_barrier();
@@ -169,7 +170,7 @@ void kernel_main() {
             const uint32_t b = (uint32_t)PT[p / BS], rt = (p % BS) / 32;
             const uint32_t t0 = ((b * NKV + g) * (BS / 32) + rt) * HDT;
             for (uint32_t d = 0; d < HDT; ++d) {
-                noc.async_read(sV, cv, TB, {.page_id = t0 + d}, {.offset_bytes = (j * HDT + d) * TB});
+                noc.async_read(sV, cv, KVTB, {.page_id = t0 + d}, {.offset_bytes = (j * HDT + d) * KVTB});
             }
         }
         noc.async_read_barrier();

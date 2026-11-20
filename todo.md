@@ -55,7 +55,7 @@
   - 今は貪欲法のみ (temperature / top_p は受け取るが無視)。
   - 投機的サンプリング: 下書きを MTP の分布から引き、min(1, p/q) で受理する。デバイスで top-k を取ってホストで処理する案。
 
-- [ ] **4b. KV キャッシュの bfp8 化 → 最大文脈をモデル上限の 262,144 へ (ブランチを切って進める)**
+- [x] **4b. KV キャッシュの bfp8 化 → 最大文脈をモデル上限の 262,144 へ (ブランチを切って進める)** — 2026-11-20 完了。既定 bfp8・max_seq 262,144 (空き 1.8GiB)。24.5 万トークンの干し草山テスト正解、PPL 不変、12.7 万トークンのデコード 33 → 36 tok/s
   - 今の KV は bf16、(16 attn + 1 MTP) 層 × K/V × 4 head × 256 = 68KiB/token。155,648 トークンで約 10.1GiB。
   - bfp8 (1.0625 B/要素) なら 36.1KiB/token。**262,144 トークン (Qwen3.8-27B の上限) で約 9.0GiB** と、今の 155,648 トークン分より小さい。
     残り約 1GiB は prefill の作業領域に回せる (max_seq と DRAM 断片化の問題、todo 6 も解消)。
@@ -64,14 +64,14 @@
     - 自作カーネル 2 つ: `kernels/kv_write.cpp` (数行の書き込み → タイルの読み出し・書き直し)、`kernels/gqa_attn_reader.cpp` (bfp8 タイルの読み出し)。
     - prefill 側: `paged_fill_cache`、chunked SDPA が bfp8 KV を受けるか確認 (tt_transformers は既定で bfp8 KV)。
     - ホスト側のスナップショット / 会話切り替えは KV に触れないので影響なし。
-  - 確認: PPL・KL (bf16 KV と比較)、needle を 20 万トークン超で、品質ベンチの一部 (JCQA、MGSM)、デコード速度。
+  - 確認: PPL・KL (bf16 KV と比較)、干し草山テストを 20 万トークン超で、品質ベンチの一部 (JCQA、MGSM)、デコード速度。
   - 4 (prefill 用 attention カーネル) とは KV の読み方を共有するので、どちらを先にやるかで設計を合わせる。
 
 - [ ] **4. GQA を意識した prefill 用 attention カーネル (ブランチを切って進める)** — 2026-11-20 に優先度を下げた (4b を先に)
   - 2026-11-20 の測定 (12.3 万トークンの文脈、1 層、`chunked_scaled_dot_product_attention`、T=1024):
     q chunk 128 + HiFi4 66.8ms (KV 帯域律速) / q chunk 256 + HiFi4 78ms (計算律速、96 単位で 120 コアが埋まらない) /
     q chunk 256 + HiFi2 51.9ms。256 より大きい chunk は L1 に入らない。
-  - → **既定を q chunk 256 + HiFi2 にした** (PPL 不変、12.7 万トークンの prefill 125.6 → 110.2 秒、needle 正解)。
+  - → **既定を q chunk 256 + HiFi2 にした** (PPL 不変、12.7 万トークンの prefill 125.6 → 110.2 秒、干し草山テスト正解)。
   - KV を 1/6 しか読まない専用カーネルの残りの伸び (見積もり): HiFi4 のままでは計算律速で 62ms 前後 (ほぼ効果なし)。
     HiFi2 で 120 コアを埋めて 42ms 前後 (attention 2 割、123K の prefill 全体で 1 割強、短い文脈ではもっと小さい)。
     やるなら 4b の bfp8 KV の読み方と合わせる。
