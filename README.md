@@ -66,6 +66,9 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
 サーバー:
 
 - `POST /v1/chat/completions` (stream 対応)、`GET /v1/models`、`GET /health`。1 リクエストずつ処理。
+- **Web UI**: ブラウザで `http://127.0.0.1:8010/` を開くと、試し用の最小限のチャット画面 (`webui/index.html`)。
+  thinking、温度、最大トークン数、system プロンプトを切り替えられ、応答ごとに応答開始までの時間と tok/s を表示する。
+  別のマシンから開くときは `--host 0.0.0.0`。
 - 思考は `chat_template_kwargs.enable_thinking` (既定 false)。`<think>` の中身は `reasoning_content` に分ける。
 - サンプリング: `temperature` > 0 で `top_p`、`top_k` (64 まで)、`min_p`、`seed` が効く。`temperature` がなければ貪欲法。
   MTP の投機的デコードのまま厳密 (1 トークンずつ引いたのと同じ分布)。Qwen の推奨は thinking オフで 0.7 / 0.8 / 20、オンで 0.6 / 0.95 / 20。
