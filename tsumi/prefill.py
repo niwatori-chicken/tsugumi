@@ -342,6 +342,11 @@ class LargePrefill:
                 e.reset_spec()
                 e.prefill_spec([0] * 64, start=0, with_mtp=mtp)
                 self.run([0] * n, start=64, with_mtp=mtp)
+                if n == T and T > self.sdpa_qmax // 2 and self.sdpa_qmax > 128:
+                    # start % 256 == 128: q chunk 128 instead of 256 (a separate SDPA program for T >= 256)
+                    e.reset_spec()
+                    e.prefill_spec([0] * 128, start=0, with_mtp=mtp)
+                    self.run([0] * n, start=128, with_mtp=mtp)
             T *= 2
         e.reset_spec()  # a prompt spanning two chunks (the previous chunk's last rows feed the next chunk's MTP)
         self.run([0] * (self.t_max + self.t_min), start=0, with_mtp=mtp)
