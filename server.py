@@ -12,6 +12,8 @@ the thinking tokens: at the cap a closing sentence and </think> are inserted (TH
 counts the answer only. Other chat_template_kwargs (reasoning_effort, preserve_thinking) go to the template.
 Tool calling: `tools`, `tool_choice` (auto / none; required / a named function with thinking off), assistant
 `tool_calls` and `role: tool` messages in the history; calls are returned as `tool_calls` (tsumi/toolcall.py).
+Images: OpenAI `image_url` content parts (data: URL or http(s)); the ViT runs on the CPU (tsumi/vision.py) and
+each image becomes its own virtual token ids, so conversation reuse tells images apart.
 `logprobs` / `top_logprobs` (<= 20; completions: logprobs = n): log-softmax over the device top-64 logits (a
 little too high; tokens outside it, only forced ones, get -9999); chat logprobs cover the content, not the thinking.
 
@@ -99,6 +101,12 @@ class Backend:
         with stage("trace capture"):
             self.eng.capture_all()
         self.gen = Generator(self.eng)
+        self.vision = None
+        if env("IMAGES", "1") == "1":  # image input: ViT on the CPU, embeddings looked up by virtual token ids
+            from tsumi.vision import ImageTokens, VisionEncoder
+            with stage("vision encoder (CPU)"):
+                self.vision = VisionEncoder(MODEL_DIR, log=log.info)
+            self.eng.images = ImageTokens(self.eng.n_embed, int(env("IMAGE_CACHE_TOKENS", "65536")))
         self.think_end = self.tok.convert_tokens_to_ids("</think>")
         self._force_ids = None
         self._tok_cache = {}
@@ -158,12 +166,52 @@ class Backend:
             self.fail(e)
             raise
 
-    def encode(self, messages, enable_thinking, tools=None, template_kwargs=None):
+    def encode(self, messages, enable_thinking, tools=None, template_kwargs=None, images=None, embed=True):
+        """Prompt ids; each image becomes its virtual ids (encoded on the CPU unless cached). images: a dict
+        that gets n / tokens / encoded / seconds. embed=False only sizes the images (for /tokenize)."""
         ids = self.tok.apply_chat_template(messages, tools=tools, add_generation_prompt=True,
                                            enable_thinking=enable_thinking, **(template_kwargs or {}))
         if not isinstance(ids, list):
             ids = ids["input_ids"]
-        return ids
+        return self._expand_images(ids, messages, images, embed)
+
+    def _expand_images(self, ids, messages, info, embed):
+        from tsumi.vision import IMAGE_PAD, image_sources, load_image
+
+        srcs = image_sources(messages)
+        if ids.count(IMAGE_PAD) != len(srcs):
+            raise ValueError(f"{ids.count(IMAGE_PAD)} image placeholders for {len(srcs)} images")
+        if not srcs:
+            return ids
+        if self.vision is None:
+            raise ValueError("image input is off (TSUMI_IMAGES=0)")
+        reg, t0 = self.eng.images, time.perf_counter()
+        out, k, enc, ntok = [], 0, 0, 0
+        for t in ids:
+            if t != IMAGE_PAD:
+                out.append(t)
+                continue
+            data = load_image(srcs[k])
+            k += 1
+            key = self.vision.key(data)
+            vids = reg.lookup(key, need_emb=embed)
+            if vids is None:
+                if embed:
+                    e, (gh, gw) = self.vision.encode(data)
+                    vids = reg.ids(key, e.shape[0], gh, gw)
+                    reg.put(key, e)
+                    enc += 1
+                else:
+                    gh, gw = self.vision.grid(data)
+                    vids = reg.ids(key, gh * gw, gh, gw)
+            out += vids
+            ntok += len(vids)
+        if embed and ntok > reg.max_tokens // 2:
+            raise ValueError(f"images: {ntok} tokens in one request (limit {reg.max_tokens // 2}, "
+                             f"TSUMI_IMAGE_CACHE_TOKENS / 2)")
+        if info is not None:
+            info.update(n=len(srcs), tokens=ntok, encoded=enc, seconds=time.perf_counter() - t0)
+        return out
 
     def think_budget(self, budget):
         """ThinkBudget for a request (tsumi/generator.py): THINK_FORCE text then </think>."""
@@ -546,17 +594,20 @@ def make_app(backend):
         # tool_choice "required" / a named function: start the reply inside a call (thinking off only; with
         # thinking on the reply starts in <think>, so it is treated as "auto")
         forced = forced_prefix(tool_choice) if tools and not thinking else ""
-        try:  # in a worker thread: a long prompt takes ~1 s to tokenize
+        imgs = {}
+        try:  # in a worker thread: a long prompt takes ~1 s to tokenize, an image 1-15 s to encode
             ids = await run_in_threadpool(backend.encode, prepare_messages(body.get("messages", [])), thinking,
-                                          tools, kw)
-        except Exception as e:  # template errors (bad roles, no user message, ...)
-            return bad_request(f"chat template: {e}")
+                                          tools, kw, imgs)
+        except Exception as e:  # template errors (bad roles, no user message, ...), bad images
+            return bad_request(f"chat template / images: {e}")
         if forced:
             ids = ids + backend.tok.encode(forced, add_special_tokens=False)
         rid = "chatcmpl-" + uuid.uuid4().hex[:24]
         tag = rid[-6:]
         params = {"_pre": ["thinking"] if thinking and think is None else [], "_think": think,
-                  "_post": [f"tools {len(tools)}"] if tools else []}
+                  "_post": ([f"tools {len(tools)}"] if tools else []) +
+                           ([f"images {imgs['n']} ({imgs['tokens']} tok, {imgs['encoded']} encoded in "
+                             f"{imgs['seconds']:.1f}s)"] if imgs else [])}
         max_new, make_sampler, stops, think, err = common(body, ids, tag, params, 2048)
         if err is not None:
             return err
@@ -794,7 +845,7 @@ def make_app(backend):
                 kw = dict(body.get("chat_template_kwargs") or {})
                 thinking = bool(kw.pop("enable_thinking", False))
                 ids = await run_in_threadpool(backend.encode, prepare_messages(body["messages"]), thinking,
-                                              body.get("tools") or None, kw)
+                                              body.get("tools") or None, kw, None, False)
             else:
                 ids = await run_in_threadpool(prompt_ids, body)
         except Exception as e:
@@ -868,6 +919,9 @@ def log_settings(a):
         ("prefill", f"large T {g('LARGE_T', '1024')} (on={g('LARGE_PREFILL', '1')}), SDPA {g('PREFILL_SDPA', 'hifi2')}"),
         ("drafts", f"MTP (vocab {'63,168' if g('DRAFT_VOCAB', '1') == '1' else 'full'}), n-gram {ngram}, "
                    f"verify T 4 / {g('VERIFY_T', '8')}"),
+        ("images", "off" if g("IMAGES", "1") != "1" else
+                   f"on (ViT on the CPU, max {g('IMAGE_MAX_PIXELS', str(1 << 20))} pixels/image, "
+                   f"cache {g('IMAGE_CACHE_TOKENS', '65536')} tokens, URL fetch={g('IMAGE_FETCH', '1')})"),
         ("conversations", f"multi={g('MULTI_CONV', '1')} max={g('MAX_CONVS', '8')} snapshot={g('SNAPSHOT', '1')}"),
         ("hang detection", f"device timeout {os.environ.get('TT_METAL_OPERATION_TIMEOUT_SECONDS')}s, "
                            f"backstop {g('HANG_BACKSTOP', '300')}s"),

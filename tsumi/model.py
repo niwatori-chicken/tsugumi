@@ -249,8 +249,8 @@ class MTPHead:
         """tokens: embeddings for rows (positions pos..); sel_rows[i] = hid_src row feeding MTP row i."""
         e = self.eng
         x = torch.zeros(1, 1, 32, e.H, dtype=torch.bfloat16)
-        for i, t in enumerate(tokens):
-            x[0, 0, i] = e.embed[t]
+        if len(tokens):
+            x[0, 0, :len(tokens)] = e.embed_rows(tokens)
         ttnn.copy_host_to_device_tensor(
             ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, memory_config=e.resid_mem), self.x_emb)
         M = torch.zeros(1, 1, 32, 32)
@@ -351,6 +351,9 @@ class Qwen35Engine:
                                                         name="lm_head")))
         del lm
         self.embed = sd[LM_PREFIX + "embed_tokens.weight"].to(torch.bfloat16)  # host-side lookup
+        self.n_embed = self.embed.shape[0]
+        self.images = None  # tsumi.vision.ImageTokens: embeddings of virtual image token ids (>= n_embed)
+        self.mrope = []  # M-RoPE spans of the images in the current sequence (ImageTokens.layout)
         log(f"model loaded in {time.time() - t0:.0f}s")
 
         # per-step device inputs (fixed addresses for trace)
@@ -363,6 +366,13 @@ class Qwen35Engine:
                                    device=dev)
         inv = 1.0 / (self.theta ** (torch.arange(0, self.rope_dim, 2, dtype=torch.float64) / self.rope_dim))
         self.inv_freq = inv
+        # interleaved M-RoPE: frequency i uses the h position if i % 3 == 1 (i < 3 * sec[1]), w if i % 3 == 2
+        # (i < 3 * sec[2]), else t. Text has t = h = w: the plain RoPE.
+        sec = rp.get("mrope_section", [11, 11, 10])
+        ax = torch.zeros(len(inv), dtype=torch.long)
+        for a, off in ((1, 1), (2, 2)):
+            ax[off: sec[a] * 3: 3] = a
+        self.mrope_axis = ax
         self.trace_id = None
         self.logits_out = None
         self.fused_gdn = env('FUSED_GDN', '1') == '1'
@@ -372,8 +382,39 @@ class Qwen35Engine:
         self._kv_rowwise = False
 
     # ---- host-side step inputs ----
+    def embed_rows(self, toks):
+        """[n, H] bf16 input embeddings (image tokens: the vision encoder's)."""
+        t = torch.as_tensor(toks, dtype=torch.long)
+        if not len(t) or int(t.max()) < self.n_embed:
+            return self.embed[t]
+        out = torch.empty(len(t), self.H, dtype=torch.bfloat16)
+        txt = t < self.n_embed
+        out[txt] = self.embed[t[txt]]
+        out[~txt] = self.images.rows(t[~txt].tolist())
+        return out
+
+    def set_sequence(self, ids):
+        """M-RoPE layout for the sequence ids (and the tokens generated after it); call before its prefill."""
+        self.mrope = self.images.layout(ids) if self.images is not None else []
+        self._mrope_starts = [sp[0] for sp in self.mrope]
+
+    def rope_pos(self, pos):
+        """RoPE position of KV position pos: an int (text) or (t, h, w) (image token)."""
+        if not self.mrope or pos < self.mrope[0][0]:
+            return pos
+        import bisect
+        k0, n, s, gw, delta = self.mrope[bisect.bisect_right(self._mrope_starts, pos) - 1]
+        if pos < k0 + n:
+            j = pos - k0
+            return (s, s + j // gw, s + j % gw)
+        return pos + delta
+
     def _rope_rows(self, pos):
-        f = pos * self.inv_freq
+        pos = self.rope_pos(pos)
+        if isinstance(pos, tuple):
+            f = torch.tensor(pos, dtype=torch.float64)[self.mrope_axis] * self.inv_freq
+        else:
+            f = pos * self.inv_freq
         emb = torch.cat([f, f])
         cos = torch.ones(self.HD, dtype=torch.float64)
         sin = torch.zeros(self.HD, dtype=torch.float64)
@@ -383,7 +424,7 @@ class Qwen35Engine:
 
     def set_inputs(self, token, pos):
         x = torch.zeros(1, 1, 32, self.H, dtype=torch.bfloat16)
-        x[0, 0, 0] = self.embed[token]
+        x[0, 0, 0] = self.embed_rows([token])[0]
         ttnn.copy_host_to_device_tensor(
             ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, memory_config=self.resid_mem), self.x_in)
         ttnn.copy_host_to_device_tensor(ttnn.from_torch(torch.tensor([pos], dtype=torch.int32), dtype=ttnn.int32),
@@ -532,8 +573,8 @@ class Qwen35Engine:
         """tokens: list (<= T) for positions pos..; a_prev: rows committed by the previous step (0 after reset)."""
         T, sh = self.T, self.sh
         x = torch.zeros(1, 1, 32, self.H, dtype=torch.bfloat16)
-        for i, t in enumerate(tokens):
-            x[0, 0, i] = self.embed[t]
+        if len(tokens):
+            x[0, 0, :len(tokens)] = self.embed_rows(tokens)
         ttnn.copy_host_to_device_tensor(
             ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, memory_config=self.resid_mem), self.x_in)
         self._set_positions(pos)

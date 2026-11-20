@@ -396,7 +396,7 @@ class LargePrefill:
         T = self._bucket(n)
         up = lambda t, dt=ttnn.bfloat16: ttnn.from_torch(t, dtype=dt, layout=ttnn.TILE_LAYOUT, device=dev)
         xe = torch.zeros(1, 1, T, e.H, dtype=torch.bfloat16)
-        xe[0, 0, :n] = e.embed[torch.tensor(toks)]
+        xe[0, 0, :n] = e.embed_rows(toks)
         x = up(xe)
         mask = None
         if n < T:

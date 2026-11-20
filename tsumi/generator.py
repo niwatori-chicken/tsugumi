@@ -163,6 +163,7 @@ class Generator:
         saved GDN state); no match starts a new conversation (the others keep their KV until evicted)."""
         eng = self.eng
         t0 = time.perf_counter()
+        eng.set_sequence(ids)  # M-RoPE positions of the image tokens (virtual ids, tsumi/vision.py)
         cands = [self.cur] + [c for c in self.convs if c is not self.cur] if self.multi else [self.cur]
         best, (start, how) = self.cur, (0, "none")
         for c in cands:
@@ -288,6 +289,8 @@ class Generator:
                 return take, (TV or eng.T_dec), "forced"
             if ng is not None:
                 prop, m = ng.propose(kl)
+                if any(t >= eng.n_embed for t in prop):  # never draft image tokens
+                    prop = prop[:next(j for j, t in enumerate(prop) if t >= eng.n_embed)]
                 if prop and m >= self.ngram_min:
                     return prop + [prop[-1]] * (kl - len(prop)), (TV or eng.T_dec), "ngram"
             ds = [d1]
