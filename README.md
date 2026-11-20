@@ -81,6 +81,7 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
   リクエストごとに受付 (プロンプト長、パラメータ、無視したパラメータ) と完了 (再利用、応答開始、tok/s、終了理由) の 2 行。
   `TSUMI_LOG_LEVEL=DEBUG` で詳しく。`run_server.sh` は tt-metal / ttnn のログを warning 以上に絞る (`TT_LOGGER_LEVEL`、`LOGURU_LEVEL`)。
 - `finish_reason` は `stop` / `length` (max_tokens で打ち切り) / `tool_calls`。`stop` (停止文字列、4 つまで) は応答本文に効き、思考には効かない。
+- 終了 (SIGTERM / Ctrl-C): 受け付けを止め、生成中なら次のトークンで終えて応答を閉じ、デバイスを閉じて終わる (1 秒前後)。
 - `GET /health` は処理中かどうか・待ちの数・処理中のリクエスト (生成済みトークン数、経過秒) を返す。待っている間にクライアントが
   切断したリクエストは、順番が来ても生成しない。
 - ハング検知: デバイスの処理が 30 秒進まないと (`TT_METAL_OPERATION_TIMEOUT_SECONDS`)、そのリクエストに 503 を返し、

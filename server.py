@@ -10,6 +10,8 @@ Decoding is greedy unless the request sets temperature > 0; then top_p, top_k (<
 Tool calling: `tools`, `tool_choice` (auto / none; required / a named function with thinking off), assistant
 `tool_calls` and `role: tool` messages in the history; calls are returned as `tool_calls` (tsumi/toolcall.py).
 
+Shutdown (SIGINT / SIGTERM): stop accepting requests, end a running generation at its next token, close the device.
+
 Hang handling: a device wait that makes no progress for TT_METAL_OPERATION_TIMEOUT_SECONDS (default here 30)
 raises; the request gets an error, /health turns 503 and the process exits with code 75 (EXIT_HANG). A
 faulthandler backstop (TSUMI_HANG_BACKSTOP seconds without a new token, default 300) kills the process if a
@@ -18,6 +20,7 @@ wait hangs without raising. run_server.sh resets the device and restarts the ser
 import argparse
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -95,6 +98,7 @@ class Backend:
         self.max_seq = max_seq
         self.lock = threading.Lock()
         self.waiting = 0      # requests waiting for the device
+        self.stopping = False  # shutdown requested: running generations end at the next token
         self.active = None    # the running request: dict(id, prompt, generated, since)
         self.dead = None  # reason string once the device is considered hung
         self.backstop = int(env("HANG_BACKSTOP", "300"))
@@ -110,6 +114,21 @@ class Backend:
             self.dead = f"{type(e).__name__}: {msg.strip()[:300]}"
             log.error(f"device error, exiting with {EXIT_HANG} after this response: {self.dead}")
             threading.Timer(1.0, os._exit, [EXIT_HANG]).start()  # let the error response go out first
+
+    def shutdown(self, wait=30, guard=60):
+        """Stop a running generation at its next token, wait for the device, close it."""
+        import ttnn
+
+        self.stopping = True
+        t0 = time.perf_counter()
+        if not self.lock.acquire(timeout=wait):
+            log.warning(f"a generation did not stop within {wait}s; closing the device anyway")
+        faulthandler.dump_traceback_later(guard, exit=True)  # if closing itself hangs
+        try:
+            ttnn.close_device(self.dev)
+            log.info(f"device closed ({time.perf_counter() - t0:.1f}s)")
+        finally:
+            faulthandler.cancel_dump_traceback_later()
 
     def debug_hang(self):
         from tsumi.hang_kernel import run_hang_kernel
@@ -160,7 +179,7 @@ class Backend:
                     self.active["generated"] = len(out)
                 yield text[len(prefix):], None
                 prefix_off, read_off = read_off, len(out)
-                if stop_check is not None and stop_check():  # a stop string: end the generation here
+                if self.stopping or (stop_check is not None and stop_check()):  # stop string / shutdown
                     stopped = True
                     break
         finally:
@@ -441,19 +460,36 @@ def make_app(backend):
                 if not await acquire(req, tag, len(ids)):
                     return
                 it = gen()
+                step_lock = threading.Lock()  # held while a worker thread runs one step of `it`
+
+                def step():
+                    with step_lock:
+                        return next(it, None)
+
+                def cleanup():  # close the generation (records its committed state), then free the device
+                    with step_lock:
+                        try:
+                            it.close()
+                        finally:
+                            release()
+
                 done = False
                 try:
                     while True:
-                        c = await run_in_threadpool(next, it, None)  # waits for the running step if cancelled
+                        c = await run_in_threadpool(step)
                         if c is None:
                             done = True
                             break
                         yield c
                 finally:
-                    it.close()
-                    release()
+                    if step_lock.acquire(blocking=False):  # no step running: clean up now
+                        step_lock.release()
+                        cleanup()
+                    else:  # cancelled (shutdown) while a worker thread is still in a step: clean up after it
+                        threading.Thread(target=cleanup, daemon=True).start()
                     if not done:
-                        log.info(f"req {tag}: client disconnected, generation stopped")
+                        log.info(f"req {tag}: " + ("stopped for shutdown" if backend.stopping
+                                                   else "client disconnected, generation stopped"))
 
             return StreamingResponse(agen(), media_type="text/event-stream")
 
@@ -509,7 +545,24 @@ def main():
     log.info(f"ready in {time.time() - t0:.0f}s: http://{a.host}:{a.port}/ (web UI), /v1/chat/completions")
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         log.warning(f"listening on {a.host} without authentication: anyone on the network can use the server")
-    uvicorn.run(make_app(backend), host=a.host, port=a.port, log_level="warning")
+    # uvicorn handles SIGINT / SIGTERM: stop accepting, give open requests a few seconds, then return here
+    class Server(uvicorn.Server):
+        def handle_exit(self, sig, frame):  # end running generations at their next token, before the grace period
+            backend.stopping = True
+            super().handle_exit(sig, frame)
+
+    server = Server(uvicorn.Config(make_app(backend), host=a.host, port=a.port, log_level="warning",
+                                   timeout_graceful_shutdown=5))
+    # uvicorn re-raises the signal it caught after shutting down, with the handler that was installed before it:
+    # with the default handler that kills the process before the device is closed, so install a harmless one
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda signum, frame: log.info(f"{signal.Signals(signum).name} received"))
+    server.run()
+    if backend.dead:  # device error path: the process exits with EXIT_HANG from fail()
+        return
+    log.info("shutting down")
+    backend.shutdown()
+    log.info("bye")
 
 
 def log_settings(a):
