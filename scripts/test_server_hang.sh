@@ -30,5 +30,5 @@ echo "   /health -> $(curl -s -m 5 -w ' (HTTP %{http_code})' $U/health)"
 echo "   chat -> $(curl -s -m 5 -o /dev/null -w 'HTTP %{http_code}' $U/v1/chat/completions -H 'content-type: application/json' -d '{"messages":[{"role":"user","content":"hi"}]}')"
 wait_ok || { echo "FAIL: server did not come back"; grep run_server $LOG; exit 1; }
 echo "3. back after $(( $(date +%s) - t1 ))s"
-grep -E "^\[run_server\]|device error" $LOG | sed 's/^/   /'
+grep -E "\[run_server\]|device error" $LOG | sed 's/^/   /'
 echo "4. answer: $(ask)"

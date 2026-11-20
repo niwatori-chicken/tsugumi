@@ -331,7 +331,7 @@ class Qwen35Engine:
                     raise NotImplementedError("separate attn_o dtype")
             L["mlp"] = MLPDecode(dev, sd, p + "mlp.", self.H, self.I, prec, c + ".mlp")
             self.layers.append(L)
-            log(f"layer {i} ({lt}) loaded, {time.time() - t0:.0f}s")
+            log(f"loaded layer {i + 1}/{len(self.layer_types)} ({lt}), {time.time() - t0:.0f}s")
         self.final_norm = norm_w(LM_PREFIX + "norm.weight")
         # lm_head split in chunks (DRAM-sharded matmul needs a bounded per-core N)
         self.lm_chunks = []

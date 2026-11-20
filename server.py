@@ -25,6 +25,7 @@ import uuid
 import faulthandler
 import tsumi.paths as tsumi_paths
 from tsumi.env import env
+from tsumi.log import get_logger
 from tsumi.sampling import Sampler
 from tsumi.toolcall import ToolStreamParser, forced_prefix, prepare_messages
 
@@ -32,6 +33,7 @@ from tsumi.toolcall import ToolStreamParser, forced_prefix, prepare_messages
 MODEL_DIR = tsumi_paths.MODEL
 CACHE = tsumi_paths.CACHE
 MODEL_NAME = "qwen3.8-27b-tt"
+log = get_logger()
 EXIT_HANG = 75
 # must be set before tt-metal reads its runtime options (first ttnn import)
 os.environ.setdefault("TT_METAL_OPERATION_TIMEOUT_SECONDS", "30")
@@ -45,19 +47,51 @@ class Backend:
         from tsumi.generator import Generator
         from tsumi.model import Precision, Qwen35Engine
 
-        self.tok = AutoTokenizer.from_pretrained(MODEL_DIR)
-        self.dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
-        self.eng = Qwen35Engine(self.dev, MODEL_DIR, Precision("bfp4"), f"{CACHE}/bfp4", max_seq=max_seq,
-                                log=lambda *a: None)
+        t_all = time.perf_counter()
+
+        class stage:  # "name ..." then "name done in Xs"
+            def __init__(self, name):
+                self.name = name
+
+            def __enter__(self):
+                self.t = time.perf_counter()
+                log.info(f"{self.name} ...")
+
+            def __exit__(self, *exc):
+                if exc[0] is None:
+                    log.info(f"{self.name}: done in {time.perf_counter() - self.t:.1f}s")
+
+        def eng_log(msg):  # engine messages: one line per 8 layers at INFO, every layer at DEBUG
+            if msg.startswith("loaded layer"):
+                i = int(msg.split()[2].split("/")[0])
+                (log.info if i % 8 == 0 else log.debug)(msg)
+            else:
+                log.info(msg)
+
+        with stage("tokenizer"):
+            self.tok = AutoTokenizer.from_pretrained(MODEL_DIR)
+        with stage("open device"):
+            self.dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
+        with stage(f"load weights ({CACHE}/bfp4; 2-3 min when not in the page cache)"):
+            self.eng = Qwen35Engine(self.dev, MODEL_DIR, Precision("bfp4"), f"{CACHE}/bfp4", max_seq=max_seq,
+                                    log=eng_log)
         tv = int(env("VERIFY_T", "8"))  # longer verify mode for prompt-lookup drafts (0 = off)
-        self.eng.init_spec(T, mtp=True, verify_T=tv or None)
-        self.eng.init_prefill(prefill_T)
-        if tv:
-            self.eng.init_verify(tv)
+        with stage(f"T-row modes (verify T={T}{f', {tv}' if tv else ''}, prefill T={prefill_T}) and MTP head"):
+            self.eng.init_spec(T, mtp=True, verify_T=tv or None)
+            self.eng.init_prefill(prefill_T)
+            if tv:
+                self.eng.init_verify(tv)
         if env("LARGE_PREFILL", "1") == "1":  # must come before capture_all
-            self.eng.init_large_prefill(int(env("LARGE_T", "1024")))
-        self.eng.capture_all()
+            with stage("large-T prefill and warm-up (compiles every chunk shape)"):
+                self.eng.init_large_prefill(int(env("LARGE_T", "1024")))
+        with stage("trace capture"):
+            self.eng.capture_all()
         self.gen = Generator(self.eng)
+        v = ttnn.get_memory_view(self.dev, ttnn.BufferType.DRAM)
+        G = 1 << 30
+        log.info(f"DRAM: used {v.total_bytes_allocated_per_bank * v.num_banks / G:.2f} GiB, "
+                 f"free {v.total_bytes_free_per_bank * v.num_banks / G:.2f} GiB; "
+                 f"startup {time.perf_counter() - t_all:.0f}s")
         self.max_seq = max_seq
         self.lock = threading.Lock()
         self.dead = None  # reason string once the device is considered hung
@@ -72,7 +106,7 @@ class Backend:
             lines = str(e).splitlines() or [""]
             msg = next((l for l in lines if "TIMEOUT" in l), lines[0])  # the TT_THROW header line says little
             self.dead = f"{type(e).__name__}: {msg.strip()[:300]}"
-            print(f"[server] device error, exiting with {EXIT_HANG} after this response: {self.dead}", flush=True)
+            log.error(f"device error, exiting with {EXIT_HANG} after this response: {self.dead}")
             threading.Timer(1.0, os._exit, [EXIT_HANG]).start()  # let the error response go out first
 
     def debug_hang(self):
@@ -97,36 +131,43 @@ class Backend:
         return ids
 
     def stream(self, ids, max_new, sampler=None):
-        """Yields (text_delta, done_info). Text is decoded incrementally; incomplete UTF-8 is held back."""
+        """Yields (text_delta, done_info). Text is decoded incrementally (only the last few tokens are re-decoded,
+        so long replies stay O(n)); incomplete UTF-8 is held back."""
         out = []
-        sent = ""
         stats = {}
         t0 = time.perf_counter()
         t_first = None
+        eos = False
+        prefix_off = read_off = 0  # decode out[prefix_off:] and emit what goes beyond out[prefix_off:read_off]
         self._arm()
         try:
             for t in self._tokens(ids, max_new, stats, sampler):
                 if t_first is None:
                     t_first = time.perf_counter()
                 if t in self.gen.eos:
+                    eos = True
                     continue  # let the generator finish so it records the committed state
                 out.append(t)
-                text = self.tok.decode(out)
-                if text.endswith("�"):
+                prefix = self.tok.decode(out[prefix_off:read_off])
+                text = self.tok.decode(out[prefix_off:])
+                if text.endswith("\ufffd") or len(text) <= len(prefix):
                     continue
-                if len(text) > len(sent):
-                    yield text[len(sent):], None
-                    sent = text
+                yield text[len(prefix):], None
+                prefix_off, read_off = read_off, len(out)
         finally:
             faulthandler.cancel_dump_traceback_later()
-        text = self.tok.decode(out)
-        if len(text) > len(sent):
-            yield text[len(sent):], None
+        prefix = self.tok.decode(out[prefix_off:read_off])
+        text = self.tok.decode(out[prefix_off:])
+        if len(text) > len(prefix):
+            yield text[len(prefix):], None
         dt = time.perf_counter() - (t_first or t0)
         steps = max(stats.get("steps", 0), 1)
         yield "", dict(prompt_tokens=len(ids), completion_tokens=len(out), reused=stats.get("reused", 0),
+                       reuse=stats.get("reuse"), switched=stats.get("switched", False),
                        ttft=(t_first or t0) - t0, decode_tps=len(out) / dt if dt > 0 else 0.0,
-                       tokens_per_step=(stats.get("accepted", 0) + steps) / steps)
+                       tokens_per_step=(stats.get("accepted", 0) + steps) / steps,
+                       ngram_steps=stats.get("ngram_steps", 0), steps=stats.get("steps", 0),
+                       finish="stop" if eos else "length", total=time.perf_counter() - t0)
 
 
 class ThinkSplitter:
@@ -158,6 +199,18 @@ class ThinkSplitter:
             self.buf = self.buf[len(self.buf) - keep:]
             break
         return res
+
+
+def log_done(tag, info, ncalls=0):
+    """One line per finished request."""
+    reuse = f"reused {info['reused']} ({info['reuse']}{', switched' if info.get('switched') else ''})" \
+        if info.get("reused") else "no reuse"
+    ng = f", n-gram {info['ngram_steps']}/{info['steps']} steps" if info.get("ngram_steps") else ""
+    fin = "tool_calls" if ncalls else info["finish"]
+    log.info(f"req {tag}: done, {fin}; prompt {info['prompt_tokens']} ({reuse}), ttft {info['ttft']:.2f}s, "
+             f"{info['completion_tokens']} tok {info['decode_tps']:.1f} tok/s {info['tokens_per_step']:.2f} tok/step"
+             f"{ng}" + (f", {ncalls} tool call{'s' if ncalls > 1 else ''}" if ncalls else "") +
+             f", {info['total']:.1f}s")
 
 
 def make_app(backend):
@@ -225,6 +278,15 @@ def make_app(backend):
         if len(ids) + 8 >= backend.max_seq:
             return JSONResponse({"error": {"message": f"prompt too long ({len(ids)} tokens)"}}, status_code=400)
         rid = "chatcmpl-" + uuid.uuid4().hex[:24]
+        tag = rid[-6:]
+        params = [f"prompt {len(ids)} tok", f"max {max_new}"] + (["thinking"] if thinking else []) + \
+            ([f"temp {body.get('temperature')}"] if (body.get("temperature") or 0) > 0 else []) + \
+            ([f"tools {len(tools)}"] if tools else []) + (["stream"] if body.get("stream") else [])
+        ignored = [k for k in ("stop", "presence_penalty", "frequency_penalty", "logprobs", "response_format", "n",
+                               "logit_bias") if body.get(k) not in (None, False, 0, 1, [], "") or
+                   (k == "n" and (body.get("n") or 1) > 1)]
+        log.info(f"req {tag}: {', '.join(params)}" + (" (waiting: busy)" if backend.lock.locked() else "") +
+                 (f"; ignored parameters: {', '.join(ignored)}" if ignored else ""))
         created = int(time.time())
         temperature = float(body.get("temperature") or 0.0)
         try:
@@ -291,9 +353,9 @@ def make_app(backend):
                     except Exception:
                         yield error_event()
                         return
-                    yield chunk({}, finish="tool_calls" if ncalls else "stop", usage=usage(info), timings=info)
+                    yield chunk({}, finish="tool_calls" if ncalls else info["finish"], usage=usage(info), timings=info)
                     yield "data: [DONE]\n\n"
-                    print(f"[req] {info} tool_calls={ncalls}", flush=True)
+                    log_done(tag, info, ncalls)
 
             async def agen():
                 """Runs the blocking generator in worker threads, one chunk at a time, so the event loop stays free.
@@ -301,14 +363,18 @@ def make_app(backend):
                 ends the generation where it is and releases the device lock (left suspended, it would hold the
                 lock until garbage collection)."""
                 it = gen()
+                done = False
                 try:
                     while True:
                         c = await run_in_threadpool(next, it, None)  # waits for the running step if cancelled
                         if c is None:
+                            done = True
                             break
                         yield c
                 finally:
                     it.close()
+                    if not done:
+                        log.info(f"req {tag}: client disconnected, generation stopped")
 
             return StreamingResponse(agen(), media_type="text/event-stream")
 
@@ -334,14 +400,14 @@ def make_app(backend):
         if res is None:
             return unavailable()
         parts, calls, info = res
-        print(f"[req] {info} tool_calls={len(calls)}", flush=True)
+        log_done(tag, info, len(calls))
         msg = {"role": "assistant", "content": parts["content"] if parts["content"] or not calls else None}
         if parts["reasoning_content"]:
             msg["reasoning_content"] = parts["reasoning_content"]
         if calls:
             msg["tool_calls"] = calls
         return {"id": rid, "object": "chat.completion", "created": created, "model": MODEL_NAME,
-                "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls" if calls else "stop"}],
+                "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls" if calls else info["finish"]}],
                 "usage": usage(info), "timings": info}
     return app
 
@@ -354,10 +420,33 @@ def main():
     a = ap.parse_args()
     import uvicorn
 
+    log_settings(a)
     t0 = time.time()
     backend = Backend(a.max_seq)
-    print(f"[server] ready in {time.time() - t0:.0f}s on http://{a.host}:{a.port}", flush=True)
+    log.info(f"ready in {time.time() - t0:.0f}s: http://{a.host}:{a.port}/ (web UI), /v1/chat/completions")
+    if a.host not in ("127.0.0.1", "localhost", "::1"):
+        log.warning(f"listening on {a.host} without authentication: anyone on the network can use the server")
     uvicorn.run(make_app(backend), host=a.host, port=a.port, log_level="warning")
+
+
+def log_settings(a):
+    """The settings in effect (TSUMI_* / QE_* environment, flags), one line each."""
+    g = lambda k, d: env(k, d)
+    ngram = "off" if g("NGRAM", "3") == "0" else f"when >= {g('NGRAM_MIN', '6')} tokens repeat"
+    items = [
+        ("model", MODEL_DIR), ("weights cache", CACHE), ("listen", f"{a.host}:{a.port}"),
+        ("max_seq", f"{a.max_seq} tokens"),
+        ("KV cache", g("KV_DTYPE", "bfp8")),
+        ("prefill", f"large T {g('LARGE_T', '1024')} (on={g('LARGE_PREFILL', '1')}), SDPA {g('PREFILL_SDPA', 'hifi2')}"),
+        ("drafts", f"MTP (vocab {'63,168' if g('DRAFT_VOCAB', '1') == '1' else 'full'}), n-gram {ngram}, "
+                   f"verify T 4 / {g('VERIFY_T', '8')}"),
+        ("conversations", f"multi={g('MULTI_CONV', '1')} max={g('MAX_CONVS', '8')} snapshot={g('SNAPSHOT', '1')}"),
+        ("hang detection", f"device timeout {os.environ.get('TT_METAL_OPERATION_TIMEOUT_SECONDS')}s, "
+                           f"backstop {g('HANG_BACKSTOP', '300')}s"),
+    ]
+    log.info("settings:")
+    for k, v in items:
+        log.info(f"  {k:15s} {v}")
 
 
 if __name__ == "__main__":
