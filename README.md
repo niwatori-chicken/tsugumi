@@ -11,8 +11,9 @@
 | デコード (コード生成、貪欲法) | **47 tok/s** |
 | デコード (日本語の説明文 / 英語の物語) | 32 / 28 tok/s |
 | prefill (数千トークンのプロンプト) | **約 1,500〜2,000 tok/s** (4,000 トークンで応答開始まで約 2 秒) |
-| 最大文脈 | **155,648 トークン** (KV 用に DRAM 残り約 10GB) |
-| 12.4 万トークンのプロンプト | prefill 130 秒 (957 tok/s)、デコード 34 tok/s、needle テスト正解 |
+| 最大文脈 | **262,144 トークン** (モデルの上限。KV は bfp8 で約 9GiB) |
+| 12.7 万トークンのプロンプト | prefill 110 秒 (1,150 tok/s)、デコード 36 tok/s、干し草山テスト正解 |
+| 24.5 万トークンのプロンプト | prefill 307 秒 (800 tok/s)、デコード 30 tok/s、干し草山テスト正解 |
 
 - 投機的デコードの出力は、通常の貪欲法 (1 トークンずつ) の出力と一致します (コードのプロンプトで確認)。サンプリングも同じ分布です。
 - 短いプロンプトでは最初のトークンまで約 0.6 秒です。
@@ -59,7 +60,7 @@ export TSUMI_MODEL_DIR=/path/to/Qwen3.8-27B             # HF 形式のモデル
 export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みのキャッシュ (初回に作られる、約 8 分)
 
 # OpenAI 互換サーバー (127.0.0.1:8010)。run_server.sh はハング時にデバイスをリセットして再起動する
-./run_server.sh --port 8010 [--max-seq 155648]     # または python server.py ...
+./run_server.sh --port 8010 [--max-seq 262144]     # または python server.py ...
 ```
 
 サーバー:
@@ -81,6 +82,8 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
 | 変数 | 意味 |
 |---|---|
 | `TSUMI_MODEL_DIR` / `TSUMI_CACHE_DIR` | モデルと変換済み重みの場所 (`tsumi/paths.py`) |
+| `TSUMI_KV_DTYPE=bf16` | KV キャッシュを bf16 にする (既定 bfp8。bf16 では max_seq 155,648 まで) |
+| `TSUMI_PREFILL_SDPA=hifi4` | prefill の attention を q chunk 128 + HiFi4 に戻す (既定は 256 + HiFi2) |
 | `TSUMI_LARGE_PREFILL=0` / `TSUMI_LARGE_T` | 大きい T の prefill を使わない (T=32 の旧経路) / 1 チャンクの最大行数 (既定 1024) |
 | `TSUMI_MULTI_CONV=0` / `TSUMI_MAX_CONVS` | 複数の会話を保持しない / 保持する会話数の上限 (既定 8、ホストに 1 会話約 180MB) |
 | `TSUMI_SNAPSHOT=0` | 会話の再利用用の状態スナップショットを取らない |
@@ -95,7 +98,7 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
   実務的なタスクでの品質は未評価。
 - 会話の続きは再利用します (前回のプロンプト + 返答、またはアシスタントのターン開始位置の状態スナップショットから差分だけ prefill)。
   複数の会話 (本体とサブエージェントなど) は KV のブロックを分けて保持し、リクエストごとに切り替えます (約 0.1 秒)。
-  KV の合計は最大文脈ぶん (155,648 トークン) で、足りなくなると最後に使ったのが最も古い会話から捨てます。
+  KV の合計は最大文脈ぶん (262,144 トークン) で、足りなくなると最後に使ったのが最も古い会話から捨てます。
 - 短い文脈では、GQA カーネルの固定費 (約 0.1ms/層) のぶん、ttnn の SDPA より 1 ステップ 1ms ほど遅くなります。
 - デバイスが固まった場合は `tt-smi -r 0` を 2 回、15 秒ほど待つと戻ることが多いです。
 

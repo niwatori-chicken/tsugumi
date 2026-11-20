@@ -1,6 +1,6 @@
 #!/bin/bash
 # Run server.py and bring it back after a device hang.
-#   ./run_server.sh [server.py args ...]       (e.g. --port 8010 --max-seq 155648)
+#   ./run_server.sh [server.py args ...]       (e.g. --port 8010 --max-seq 262144)
 # When the server exits abnormally (75 = device timeout detected, 1 = backstop / crash), the device is reset
 # (tt-smi -r 0 twice, waiting after each) and the server is started again. Gives up after MAX_RESTARTS restarts
 # within RESTART_WINDOW seconds. Ctrl-C / SIGTERM stops the server and this script.

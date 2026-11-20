@@ -241,6 +241,13 @@ class LargePrefill:
         return r
 
     def _fill_kv(self, A, k, v, pt_chunk):
+        if A.kp.dtype != k.dtype:  # bfp8 cache: paged_fill_cache copies tiles as they are
+            k8, v8 = ttnn.typecast(k, A.kp.dtype), ttnn.typecast(v, A.vp.dtype)
+            ttnn.experimental.paged_fill_cache(A.kp, k8, pt_chunk, batch_idx=0)
+            ttnn.experimental.paged_fill_cache(A.vp, v8, pt_chunk, batch_idx=0)
+            ttnn.deallocate(k8)
+            ttnn.deallocate(v8)
+            return
         ttnn.experimental.paged_fill_cache(A.kp, k, pt_chunk, batch_idx=0)
         ttnn.experimental.paged_fill_cache(A.vp, v, pt_chunk, batch_idx=0)
 

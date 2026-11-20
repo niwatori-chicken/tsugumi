@@ -105,7 +105,9 @@ class SpecShared:
         if env("GQA_ATTN", "1") == "1":
             from .gqa_attn import GQAAttention
 
-            self.gqa = GQAAttention(dev, T, HD=HD, block_size=block_size, nblocks=nb)
+            from .attn import kv_dtype
+
+            self.gqa = GQAAttention(dev, T, HD=HD, block_size=block_size, nblocks=nb, kv_dtype=kv_dtype())
         self.cos = bf(torch.ones(1, T, 1, HD))
         self.sin = bf(torch.zeros(1, T, 1, HD))
         self.sel_ck = ttnn.WormholeComputeKernelConfig(math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False,
