@@ -326,6 +326,8 @@ class Backend:
             if think is not None else {}
         yield "", dict(**th,prompt_tokens=len(ids), completion_tokens=len(out), reused=stats.get("reused", 0),
                        reuse=stats.get("reuse"), switched=stats.get("switched", False),
+                       prefilled=stats.get("prefilled", 0), t_prefill=stats.get("t_prefill", 0.0),
+                       prefill_tps=stats.get("prefilled", 0) / stats["t_prefill"] if stats.get("t_prefill") else 0.0,
                        ttft=(t_first or t0) - t0, decode_tps=len(out) / dt if dt > 0 else 0.0,
                        tokens_per_step=(stats.get("accepted", 0) + steps) / steps,
                        ngram_steps=stats.get("ngram_steps", 0), steps=stats.get("steps", 0),
@@ -679,6 +681,8 @@ def make_app(backend):
                     yield from content("")
                     if tp:
                         yield from tp.finish()
+                    if imgs:  # image encoding (before the prefill, not in ttft)
+                        done["images"] = dict(imgs)
                     yield "done", done
                     return
                 for field, txt in sp.feed(delta):

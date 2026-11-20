@@ -256,10 +256,17 @@ async function send() {
     else history.pop();
     const s = el.querySelector(".stats");
     if (timings) {
-      s.textContent = `応答開始 ${timings.ttft.toFixed(2)}s · ${timings.decode_tps.toFixed(1)} tok/s · ` +
-        `${timings.completion_tokens} トークン · プロンプト ${timings.prompt_tokens} (再利用 ${timings.reused}) · ` +
-        `${timings.tokens_per_step.toFixed(2)} トークン/ステップ` +
-        (timings.think_tokens !== undefined ? ` · 思考 ${timings.think_tokens}${timings.think_forced ? " (上限で打ち切り)" : ""}` : "");
+      const t = timings, n = (x) => x.toLocaleString();
+      const pre = [`プロンプト ${n(t.prompt_tokens)} トークン`];
+      if (t.reused) pre.push(`再利用 ${n(t.reused)}`);
+      if (t.images) pre.push(`画像 ${t.images.n} 枚 (${n(t.images.tokens)} トークン${t.images.encoded ? `, 読み込み ${t.images.seconds.toFixed(2)}s` : ", 読み込み済み"})`);
+      if (t.prefilled !== undefined)
+        pre.push(`prefill ${n(t.prefilled)} トークン ${t.t_prefill.toFixed(2)}s` + (t.prefilled >= 64 ? ` (${n(Math.round(t.prefill_tps))} tok/s)` : ""));
+      pre.push(`応答開始 ${t.ttft.toFixed(2)}s`);
+      const gen = [`生成 ${n(t.completion_tokens)} トークン ${t.decode_tps.toFixed(1)} tok/s`,
+                   `${t.tokens_per_step.toFixed(2)} トークン/ステップ`];
+      if (t.think_tokens !== undefined) gen.push(`思考 ${n(t.think_tokens)}${t.think_forced ? " (上限で打ち切り)" : ""}`);
+      s.innerHTML = esc(pre.join(" · ")) + "<br>" + esc(gen.join(" · "));
     } else if (tFirst !== null) {
       s.textContent = `中断 · 応答開始 ${((tFirst - t0) / 1000).toFixed(2)}s`;
     }

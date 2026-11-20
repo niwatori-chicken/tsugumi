@@ -69,7 +69,8 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
 - `POST /v1/chat/completions`・`POST /v1/completions` (テンプレートなしの続き書き、プロンプトは文字列かトークン ID 列。どちらも stream 対応)、
   `POST /tokenize`・`/detokenize` (vLLM 形式)、`GET /v1/models`、`GET /health`。1 リクエストずつ処理。
 - **Web UI**: ブラウザで `http://127.0.0.1:8010/` を開くと、試し用の最小限のチャット画面 (`webui/index.html`)。
-  thinking、温度、最大トークン数、system プロンプトを切り替えられ、応答ごとに応答開始までの時間と tok/s を表示する。
+  thinking、温度、最大トークン数、system プロンプトを切り替えられ、応答ごとにプロンプト側 (再利用、画像の読み込み、
+  prefill のトークン数・秒・tok/s、応答開始) と生成側 (トークン数、tok/s、トークン/ステップ、思考) の数値を表示する。
   別のマシンから開くときは `--host 0.0.0.0`。
 - **画像入力**: `messages` の content に OpenAI 形式の `{"type": "image_url", "image_url": {"url": ...}}` (data: URL の base64、
   または http(s) の URL)。ViT (27 層、約 4.6 億パラメータ) はデバイスで動かす (重み bfp8 で DRAM 0.52 GiB、1024×1024 で
