@@ -56,11 +56,14 @@
   - 投機的サンプリング: 下書きを MTP の分布から引き、min(1, p/q) で受理する。デバイスで top-k を取ってホストで処理する案。
 
 - [ ] **4. GQA を意識した prefill 用 attention カーネル (ブランチを切って進める)**
-  - chunked SDPA は (q ヘッド, q チャンク) ごとに KV を読み直す。12.3 万トークンの文脈で 66.8ms/層、約 24GB/層の帯域律速。
-  - 単位を (KV ヘッド, q ブロック = 6 ヘッド × 32〜64 トークン, KV 区間) にして KV の読み込みを 1/6 にする
-    (既存の GQA split-K カーネルの拡張)。124K の prefill は 957 → 1,500 tok/s 前後の見込み。
-  - 手順: 単体カーネルとテスト → `tsumi/prefill.py` で環境変数で切り替え → PPL・needle・速度 → 既定化・マージ。
-  - 上流への提案 (KV chain forwarding が causal / chunked では無効) の根拠にもなる。ユーザーが別途検証予定。
+  - 2026-11-20 の測定 (12.3 万トークンの文脈、1 層、`chunked_scaled_dot_product_attention`、T=1024):
+    q chunk 128 + HiFi4 66.8ms (KV 帯域律速) / q chunk 256 + HiFi4 78ms (計算律速、96 単位で 120 コアが埋まらない) /
+    q chunk 256 + HiFi2 51.9ms。256 より大きい chunk は L1 に入らない。
+  - → **既定を q chunk 256 + HiFi2 にした** (PPL 不変、12.7 万トークンの prefill 125.6 → 110.2 秒、needle 正解)。
+  - KV を 1/6 しか読まない専用カーネルの残りの伸び (見積もり): HiFi4 のままでは計算律速で 62ms 前後 (ほぼ効果なし)。
+    HiFi2 で 120 コアを埋めて 42ms 前後 (attention 2 割、123K の prefill 全体で 1 割強、短い文脈ではもっと小さい)。
+    やるなら 4b の bfp8 KV の読み方と合わせる。
+  - 上流への提案 (KV chain forwarding が causal / chunked では無効) の根拠としては引き続き有効。ユーザーが別途検証予定。
 
 - [ ] **4b. KV キャッシュの bfp8 化 → 最大文脈をモデル上限の 262,144 へ (ブランチを切って進める)**
   - 今の KV は bf16、(16 attn + 1 MTP) 層 × K/V × 4 head × 256 = 68KiB/token。155,648 トークンで約 10.1GiB。
