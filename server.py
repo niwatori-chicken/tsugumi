@@ -35,7 +35,7 @@ from tsumi.toolcall import ToolStreamParser, forced_prefix, prepare_messages
 
 MODEL_DIR = tsumi_paths.MODEL
 CACHE = tsumi_paths.CACHE
-MODEL_NAME = "qwen3.8-27b-tt"
+MODEL_NAMES = [os.path.basename(os.path.normpath(MODEL_DIR))]  # set from --served-model-name in main()
 log = get_logger()
 EXIT_HANG = 75
 # must be set before tt-metal reads its runtime options (first ttnn import)
@@ -329,15 +329,22 @@ def make_app(backend):
                     faulthandler.cancel_dump_traceback_later()
             return {"status": "no hang"}
 
+    started = int(time.time())
+
     @app.get("/v1/models")
     def models():
-        return {"object": "list", "data": [{"id": MODEL_NAME, "object": "model", "owned_by": "local"}]}
+        meta = dict(weights="bfp4", kv_cache=env("KV_DTYPE", "bfp8"), max_seq=backend.max_seq,
+                    model_dir=MODEL_DIR, engine="tsumi (Tenstorrent P100A)")
+        return {"object": "list", "data": [{"id": n, "object": "model", "created": started, "owned_by": "tsumi",
+                                            "meta": meta} for n in MODEL_NAMES]}
 
     @app.post("/v1/chat/completions")
     async def chat(req: Request):
         if backend.dead:
             return unavailable()
         body = await req.json()
+        # one model: any requested name is accepted; an alias is echoed back, anything else gets the first name
+        model_name = body.get("model") if body.get("model") in MODEL_NAMES else MODEL_NAMES[0]
         kw = dict(body.get("chat_template_kwargs") or {})
         thinking = bool(kw.pop("enable_thinking", False))
         tool_choice = body.get("tool_choice") or "auto"
@@ -418,7 +425,7 @@ def make_app(backend):
                         total_tokens=info["prompt_tokens"] + info["completion_tokens"])
 
         def chunk(delta, finish=None, usage=None, timings=None):
-            d = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": MODEL_NAME,
+            d = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": model_name,
                  "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
             if usage:
                 d["usage"] = usage
@@ -525,7 +532,7 @@ def make_app(backend):
             msg["reasoning_content"] = parts["reasoning_content"]
         if calls:
             msg["tool_calls"] = calls
-        return {"id": rid, "object": "chat.completion", "created": created, "model": MODEL_NAME,
+        return {"id": rid, "object": "chat.completion", "created": created, "model": model_name,
                 "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls" if calls else info["finish"]}],
                 "usage": usage(info), "timings": info}
     return app
@@ -536,8 +543,14 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8010)
     ap.add_argument("--max-seq", type=int, default=262144)  # the model limit; bfp8 KV (9 GiB) leaves ~1.8 GiB free
+    ap.add_argument("--served-model-name", default=env("SERVED_MODEL_NAME", ""),
+                    help="name(s) in the API, comma separated (default: the model directory name, e.g. Qwen3.8-27B)")
     a = ap.parse_args()
     import uvicorn
+
+    names = [n.strip() for n in a.served_model_name.split(",") if n.strip()]
+    if names:
+        MODEL_NAMES[:] = names
 
     log_settings(a)
     t0 = time.time()
@@ -570,7 +583,8 @@ def log_settings(a):
     g = lambda k, d: env(k, d)
     ngram = "off" if g("NGRAM", "3") == "0" else f"when >= {g('NGRAM_MIN', '6')} tokens repeat"
     items = [
-        ("model", MODEL_DIR), ("weights cache", CACHE), ("listen", f"{a.host}:{a.port}"),
+        ("model", MODEL_DIR), ("served as", ", ".join(MODEL_NAMES)), ("weights cache", CACHE),
+        ("listen", f"{a.host}:{a.port}"),
         ("max_seq", f"{a.max_seq} tokens"),
         ("KV cache", g("KV_DTYPE", "bfp8")),
         ("prefill", f"large T {g('LARGE_T', '1024')} (on={g('LARGE_PREFILL', '1')}), SDPA {g('PREFILL_SDPA', 'hifi2')}"),
