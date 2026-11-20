@@ -161,10 +161,32 @@ class MTPHead:
         self.trace = None
         self.out = None
         self.traces = {}
-        # draft lm_head: bfp4 copy of the shared lm_head (half the bytes of the bfp8 verify head)
+        # draft lm_head: bfp4 copy of the shared lm_head (half the bytes of the bfp8 verify head), by default only the
+        # rows of the reduced draft vocabulary (tsumi/draft_vocab.pt, 63,168 frequent tokens: 1/4 of the bytes; the
+        # draft index is mapped back on the host). The main model verifies over the full vocabulary either way.
         self.lm_chunks = []
+        self.vocab_map = None
+        vf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "draft_vocab.pt")
+        if not draft_lm_bfp8 and env("DRAFT_VOCAB", "1") == "1" and os.path.exists(vf):
+            ids = torch.load(vf)
+            self.vocab_map = ids.tolist()
+            n = len(self.vocab_map)
+            tag = f"{n}.{int(ids.sum()) % 1000003}"
+            lm = None
+            for lo in range(0, n, 31584):  # same chunk width as the full lm_head
+                hi = min(lo + 31584, n)
+                cf = os.path.join(cache_dir, f"lm_head_draft_sub.{tag}.{lo}")
+                w = None
+                if not has_cache(cf, ttnn.bfloat4_b):
+                    if lm is None:
+                        lm = sd["lm_head.weight"]
+                    w = lm[ids[lo:hi].long()].T.contiguous().to(torch.bfloat16)
+                self.lm_chunks.append((lo, hi, DecodeLinear(dev, w, ttnn.bfloat4_b, cache_file=cf, shape=(H, hi - lo),
+                                                            name="lm_draft_sub")))
+                del w
+            del lm
         lm = None
-        for lo, hi, lin in ([] if draft_lm_bfp8 else eng.lm_chunks):
+        for lo, hi, lin in ([] if draft_lm_bfp8 or self.vocab_map else eng.lm_chunks):
             cf = os.path.join(cache_dir, f"lm_head_draft.{lo}")
             w = None
             if not has_cache(cf, ttnn.bfloat4_b):
@@ -243,6 +265,8 @@ class MTPHead:
         else:
             out = self.forward()
         am = ttnn.to_torch(out[1]).reshape(-1)[: e.T]
+        if self.vocab_map is not None:
+            return [self.vocab_map[int(v)] for v in am]
         return [int(v) for v in am]
 
 
@@ -563,9 +587,7 @@ class Qwen35Engine:
     def _logits_topk(self, outs):
         """Main-model rows -> (logits, (values, indices)) of the TOPK largest logits per row (all 32 rows; ~1.2 ms,
         +0.8 ms over the argmax path). Greedy takes index 0; sampling works on the top-k on the host."""
-        logits = ttnn.concat(outs, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [1,1,32,V]
-        for o in outs:
-            ttnn.deallocate(o)
+        logits = self._concat_chunks(outs)
         v, i = ttnn.topk(logits, TOPK, dim=-1, largest=True, sorted=True, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         return logits, (v, i)
 
@@ -584,10 +606,17 @@ class Qwen35Engine:
         v, i = self.last_topk
         return self._greedy(v[r], i[r]) if self.sampler is None else self.sampler(v[r], i[r])
 
-    def _logits_argmax(self, outs):
+    @staticmethod
+    def _concat_chunks(outs):
+        if len(outs) == 1:  # concat of one tensor returns it: do not free it
+            return outs[0]
         logits = ttnn.concat(outs, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [1,1,32,V]
         for o in outs:
             ttnn.deallocate(o)
+        return logits
+
+    def _logits_argmax(self, outs):
+        logits = self._concat_chunks(outs)
         rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         rows = getattr(self, "T", 1)
         if rows < 32:  # argmax cost is per row (~50us each); only the first T rows are real

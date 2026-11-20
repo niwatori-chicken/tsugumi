@@ -126,8 +126,8 @@ def main():
             print(f"host set_inputs_spec: {(time.perf_counter() - t1) / 10 * 1e3:.2f} ms")
             t1 = time.perf_counter()
             for _ in range(10):
-                ttnn.to_torch(eng.spec_out[1])
-            print(f"host read argmax: {(time.perf_counter() - t1) / 10 * 1e3:.2f} ms")
+                eng.topk_to_host(eng.spec_out[1], eng.T)
+            print(f"host read top-k: {(time.perf_counter() - t1) / 10 * 1e3:.2f} ms")
     finally:
         ttnn.close_device(dev)
 
