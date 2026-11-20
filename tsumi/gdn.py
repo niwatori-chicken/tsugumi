@@ -163,7 +163,7 @@ class GDNDecode:
         return self.w_out(gated, out_mem=_L1)
 
     # ---------------- T-row (verify / chunked prefill) path ----------------
-    def init_spec(self, T, snap_all=True):
+    def init_spec(self, T, snap_all=True, slots=None):
         """T-row mode. First call (speculative T) allocates conv history/prev-block rows and T state snapshots;
         later calls (e.g. a 32-row prefill with snap_all=False) only add a kernel for that T."""
         z = lambda shape, dt=ttnn.bfloat16: ttnn.from_torch(torch.zeros(*shape), dtype=dt, layout=ttnn.TILE_LAYOUT,
@@ -171,7 +171,9 @@ class GDNDecode:
         if not hasattr(self, "kern_T"):
             self.Hc = z((1, 1, 32, self.qkv_dim))
             self.Bp = z((1, 1, 32, self.qkv_dim))
-            self.snap = z((1, T * self.Nv, self.Dk, self.Dv), ttnn.float32)
+            # state snapshots, slot-major (slot * Nv + head); shared by every T-row mode, so sized for the largest
+            # verify T (a T=4 step after a T=8 step reads slot a_prev - 1 <= 7)
+            self.snap = z((1, (slots or T) * self.Nv, self.Dk, self.Dv), ttnn.float32)
             self.kern_T, self.consts_by_T = {}, {}
         self.kern_T[T] = GDNFusedKernel(self.dev, self.Nv, self.Nk, T, self.qkv_dim, self.kd, snap_all=snap_all)
         self.consts_by_T[T] = GDNFusedKernel.make_consts(self.dev, self._norm_w_host, T)

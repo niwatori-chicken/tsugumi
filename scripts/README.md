@@ -51,6 +51,10 @@
 
 | スクリプト | 内容 |
 |---|---|
+| `profile_step.py [T] [P0] [--traced]` | 1 ステップ (本体の検証 + MTP) の op ごとのデバイス時間。`python -m tracy -r -p` で実行し、`TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT=6000` を付ける。`--traced` はトレース実行の時間だけ |
+| `summarize_profile.py [--segments N] [--seq]` | 上のプロファイルを op 名ごとに集計 (`--seq` で op の並び) |
+| `bench_decode.py [max_new] [--copy\|--all] [--dump FILE]` | 決まったプロンプト集でのデコード速度 (日英の文章、コード、thinking、`--copy` で写しの多い応答)。`--dump` で出力を保存 (下書き方式のオフライン試算用) |
+| `make_draft_vocab.py [N]` | MTP 下書き用の語彙表 `tsumi/draft_vocab.pt` を作る (分野ごとに重みを揃えた頻度)。評価用テキストでのカバー率も表示 |
 | `mmbench.py` | デコード用行列積 (DRAM シャーディング) の実効帯域。ワーカー数・in0_block_w の掃引 |
 | `mmlarge.py [M ...]` | 大きい M の行列積 (`minimal_matmul` / `ttnn.linear`) を bfp4 重みで計測 |
 | `bench_parts.py` | デコード 1 ステップの部品ごとのデバイス時間 |

@@ -8,7 +8,8 @@
 
 | | 速度 |
 |---|---|
-| デコード (コード生成、貪欲法) | **47 tok/s** |
+| デコード (コード生成、貪欲法) | **47〜50 tok/s** |
+| デコード (コードの修正・文章の校正など、プロンプトを写す応答) | **75〜115 tok/s** (n-gram 下書き) |
 | デコード (日本語の説明文 / 英語の物語) | 32 / 28 tok/s |
 | prefill (数千トークンのプロンプト) | **約 1,500〜2,000 tok/s** (4,000 トークンで応答開始まで約 2 秒) |
 | 最大文脈 | **262,144 トークン** (モデルの上限。KV は bfp8 で約 9GiB) |
@@ -85,6 +86,9 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
 | 変数 | 意味 |
 |---|---|
 | `TSUMI_MODEL_DIR` / `TSUMI_CACHE_DIR` | モデルと変換済み重みの場所 (`tsumi/paths.py`) |
+| `TSUMI_NGRAM=0` / `TSUMI_NGRAM_MIN` | n-gram 下書き (プロンプト参照) を使わない / 使う条件の一致長 (既定 6 トークン) |
+| `TSUMI_VERIFY_T` | n-gram 下書きを検証する長いモードの行数 (既定 8、0 で T=4 のまま) |
+| `TSUMI_DRAFT_VOCAB=0` | MTP の下書きを全語彙で出す (既定は頻出 63,168 語、`tsumi/draft_vocab.pt`) |
 | `TSUMI_KV_DTYPE=bf16` | KV キャッシュを bf16 にする (既定 bfp8。bf16 では max_seq 155,648 まで) |
 | `TSUMI_PREFILL_SDPA=hifi4` | prefill の attention を q chunk 128 + HiFi4 に戻す (既定は 256 + HiFi2) |
 | `TSUMI_LARGE_PREFILL=0` / `TSUMI_LARGE_T` | 大きい T の prefill を使わない (T=32 の旧経路) / 1 チャンクの最大行数 (既定 1024) |

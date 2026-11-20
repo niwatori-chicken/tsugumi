@@ -49,8 +49,11 @@ class Backend:
         self.dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
         self.eng = Qwen35Engine(self.dev, MODEL_DIR, Precision("bfp4"), f"{CACHE}/bfp4", max_seq=max_seq,
                                 log=lambda *a: None)
-        self.eng.init_spec(T, mtp=True)
+        tv = int(env("VERIFY_T", "8"))  # longer verify mode for prompt-lookup drafts (0 = off)
+        self.eng.init_spec(T, mtp=True, verify_T=tv or None)
         self.eng.init_prefill(prefill_T)
+        if tv:
+            self.eng.init_verify(tv)
         if env("LARGE_PREFILL", "1") == "1":  # must come before capture_all
             self.eng.init_large_prefill(int(env("LARGE_T", "1024")))
         self.eng.capture_all()
