@@ -521,6 +521,8 @@ class LargePrefill:
                 prev_hid = ttnn.slice(hid, (0, 0, T - 32, 0), (1, 1, T, e.H), memory_config=DRAM)
             pos += n
             p += n
+            if e.progress is not None:  # e.g. the server's hang backstop: a 250k-token prefill takes minutes
+                e.progress()
         self._exit()
         # last row -> logits / argmax, and hid_src row 0 for the MTP draft
         hl = self._row_select(hid, [n - 1])

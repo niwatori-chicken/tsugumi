@@ -12,7 +12,8 @@ the thinking tokens: at the cap a closing sentence and </think> are inserted (TH
 counts the answer only. Other chat_template_kwargs (reasoning_effort, preserve_thinking) go to the template.
 Tool calling: `tools`, `tool_choice` (auto / none; required / a named function with thinking off), assistant
 `tool_calls` and `role: tool` messages in the history; calls are returned as `tool_calls` (tsumi/toolcall.py).
-Images: OpenAI `image_url` content parts (data: URL or http(s)); the ViT runs on the CPU (tsumi/vision.py) and
+Images: OpenAI `image_url` content parts (data: URL or http(s)); the ViT runs on the device (tsumi/vision_tt.py,
+TSUMI_VISION_DEVICE=0: on the CPU) under the device lock, and
 each image becomes its own virtual token ids, so conversation reuse tells images apart.
 `logprobs` / `top_logprobs` (<= 20; completions: logprobs = n): log-softmax over the device top-64 logits (a
 little too high; tokens outside it, only forced ones, get -9999); chat logprobs cover the content, not the thinking.
@@ -89,6 +90,11 @@ class Backend:
         with stage(f"load weights ({CACHE}/bfp4; 2-3 min when not in the page cache)"):
             self.eng = Qwen35Engine(self.dev, MODEL_DIR, Precision("bfp4"), f"{CACHE}/bfp4", max_seq=max_seq,
                                     log=eng_log)
+        self.vision_tt = None
+        if env("IMAGES", "1") == "1" and env("VISION_DEVICE", "1") == "1":  # before the traces (persistent buffers)
+            from tsumi.vision_tt import VisionTT
+            with stage("vision encoder weights (bfp8, ~0.5 GiB)"):
+                self.vision_tt = VisionTT(self.dev, MODEL_DIR, f"{CACHE}/bfp4", log=log.info)
         tv = int(env("VERIFY_T", "8"))  # longer verify mode for prompt-lookup drafts (0 = off)
         with stage(f"T-row modes (verify T={T}{f', {tv}' if tv else ''}, prefill T={prefill_T}) and MTP head"):
             self.eng.init_spec(T, mtp=True, verify_T=tv or None)
@@ -98,14 +104,19 @@ class Backend:
         if env("LARGE_PREFILL", "1") == "1":  # must come before capture_all
             with stage("large-T prefill and warm-up (compiles every chunk shape)"):
                 self.eng.init_large_prefill(int(env("LARGE_T", "1024")))
+        if self.vision_tt is not None:  # every image size bucket, compiled before the traces (tsumi/vision_tt.py)
+            with stage("vision encoder warm-up"):
+                self.vision_tt.warmup(int(env("IMAGE_MAX_PIXELS", str(1 << 20))))
         with stage("trace capture"):
             self.eng.capture_all()
         self.gen = Generator(self.eng)
+        self.lock = threading.Lock()
         self.vision = None
-        if env("IMAGES", "1") == "1":  # image input: ViT on the CPU, embeddings looked up by virtual token ids
+        if env("IMAGES", "1") == "1":  # image input; the embeddings are looked up by virtual token ids
             from tsumi.vision import ImageTokens, VisionEncoder
-            with stage("vision encoder (CPU)"):
-                self.vision = VisionEncoder(MODEL_DIR, log=log.info)
+            with stage("image preprocessing" + (" and CPU vision encoder" if self.vision_tt is None else "")):
+                self.vision = VisionEncoder(MODEL_DIR, log=log.info, tt=self.vision_tt, device_lock=self.lock,
+                                            on_device_error=self.fail)
             self.eng.images = ImageTokens(self.eng.n_embed, int(env("IMAGE_CACHE_TOKENS", "65536")))
         self.think_end = self.tok.convert_tokens_to_ids("</think>")
         self._force_ids = None
@@ -117,12 +128,12 @@ class Backend:
                  f"free {v.total_bytes_free_per_bank * v.num_banks / G:.2f} GiB; "
                  f"startup {time.perf_counter() - t_all:.0f}s")
         self.max_seq = max_seq
-        self.lock = threading.Lock()
         self.waiting = 0      # requests waiting for the device
         self.stopping = False  # shutdown requested: running generations end at the next token
         self.active = None    # the running request: dict(id, prompt, generated, since)
         self.dead = None  # reason string once the device is considered hung
         self.backstop = int(env("HANG_BACKSTOP", "300"))
+        self.eng.progress = self._arm  # long prefills: re-armed per chunk, not only per generated token
 
     def _arm(self):
         faulthandler.dump_traceback_later(self.backstop, exit=True)
@@ -920,7 +931,7 @@ def log_settings(a):
         ("drafts", f"MTP (vocab {'63,168' if g('DRAFT_VOCAB', '1') == '1' else 'full'}), n-gram {ngram}, "
                    f"verify T 4 / {g('VERIFY_T', '8')}"),
         ("images", "off" if g("IMAGES", "1") != "1" else
-                   f"on (ViT on the CPU, max {g('IMAGE_MAX_PIXELS', str(1 << 20))} pixels/image, "
+                   f"on (ViT on the {'device' if g('VISION_DEVICE', '1') == '1' else 'CPU'}, max {g('IMAGE_MAX_PIXELS', str(1 << 20))} pixels/image, "
                    f"cache {g('IMAGE_CACHE_TOKENS', '65536')} tokens, URL fetch={g('IMAGE_FETCH', '1')})"),
         ("conversations", f"multi={g('MULTI_CONV', '1')} max={g('MAX_CONVS', '8')} snapshot={g('SNAPSHOT', '1')}"),
         ("hang detection", f"device timeout {os.environ.get('TT_METAL_OPERATION_TIMEOUT_SECONDS')}s, "

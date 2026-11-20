@@ -146,21 +146,26 @@ def load_image(url, max_bytes=32 << 20, timeout=30):
 
 
 class VisionEncoder:
-    """The ViT + 2x2 merger on the CPU (float32): image -> [n, 5120] embeddings, n = (h/32) * (w/32)."""
+    """Image -> [n, 5120] embeddings, n = (h/32) * (w/32): the HF preprocessing on the CPU, then the ViT + 2x2 merger
+    on the device (tt: a tsumi.vision_tt.VisionTT, run under device_lock) or on the CPU (float32, HF model)."""
 
-    def __init__(self, model_dir, max_pixels=None, min_pixels=None, threads=None, log=print):
+    def __init__(self, model_dir, max_pixels=None, min_pixels=None, threads=None, log=print, tt=None,
+                 device_lock=None, on_device_error=None):
         from transformers import AutoConfig, AutoImageProcessor
         from transformers.initialization import no_init_weights
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
         t0 = time.time()
         cfg = AutoConfig.from_pretrained(model_dir).vision_config
-        cfg._attn_implementation = "sdpa"
-        with no_init_weights():
-            m = Qwen3_5VisionModel(cfg)
-        sd = LazySD(model_dir)
-        m.load_state_dict({k: sd[VISION_PREFIX + k].float() for k in m.state_dict()}, assign=True, strict=True)
-        self.model = m.eval()
+        self.tt, self.device_lock, self.on_device_error = tt, device_lock, on_device_error
+        self.model = None
+        if tt is None:
+            cfg._attn_implementation = "sdpa"
+            with no_init_weights():
+                m = Qwen3_5VisionModel(cfg)
+            sd = LazySD(model_dir)
+            m.load_state_dict({k: sd[VISION_PREFIX + k].float() for k in m.state_dict()}, assign=True, strict=True)
+            self.model = m.eval()
         self.proc = AutoImageProcessor.from_pretrained(model_dir)
         self.merge = cfg.spatial_merge_size
         self.unit = cfg.patch_size * self.merge  # pixels per merged token side (32)
@@ -168,7 +173,8 @@ class VisionEncoder:
         self.min_pixels = int(min_pixels or env("IMAGE_MIN_PIXELS", str(64 * 1024)))
         self.threads = threads
         self.lock = threading.Lock()  # one image at a time (uses every core)
-        log(f"vision encoder loaded in {time.time() - t0:.0f}s (max {self.max_pixels} pixels/image)")
+        log(f"vision encoder ({'device' if tt is not None else 'CPU'}) ready in {time.time() - t0:.0f}s "
+            f"(max {self.max_pixels} pixels/image)")
 
     def key(self, data):
         """Cache key of an image (its bytes and the size setting)."""
@@ -192,6 +198,15 @@ class VisionEncoder:
     def encode(self, data):
         """bytes -> ([n, H] bf16 embeddings, (gh, gw))."""
         pv, g, hw = self.preprocess(data)
+        if self.tt is not None:
+            self.tt.check(pv.shape[0])
+            with self.device_lock:
+                try:
+                    return self.tt.forward(pv, g), hw
+                except Exception as e:
+                    if self.on_device_error is not None:
+                        self.on_device_error(e)
+                    raise
         with self.lock:
             nt = torch.get_num_threads()
             if self.threads:
