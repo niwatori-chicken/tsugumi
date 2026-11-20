@@ -13,8 +13,8 @@ import ttnn
 TILE = 32
 
 
-def _in0_grid(k_tiles, max_cores=64):
-    for c in range(max_cores, 0, -1):
+def _in0_grid(k_tiles, max_cores=64, cores=None):
+    for c in ([cores] if cores else range(max_cores, 0, -1)):
         if k_tiles % c == 0:
             for rows in range(1, 9):
                 if c % rows == 0 and c // rows <= 8:
@@ -54,7 +54,7 @@ class DecodeLinear:
     """y = x @ W for decode (M <= 32 rows). W given as torch [K, N] (ttnn orientation)."""
 
     def __init__(self, dev, w_kn, dtype, workers=None, in0_block_w=None, fidelity=None, cache_file=None, name="",
-                 shape=None, no_weight=False):
+                 shape=None, no_weight=False, in0_cores=None):
         K, N = w_kn.shape if w_kn is not None else shape
         self.K, self.N, self.name = K, N, name
         banks = dev.dram_grid_size().x
@@ -71,7 +71,7 @@ class DecodeLinear:
         )
         self.w = None if no_weight else load_or_convert(dev, w_kn, dtype, self.wmem, cache_file, pad_n=self.Np)
         k_tiles = K // TILE
-        c, rows, cols = _in0_grid(k_tiles)
+        c, rows, cols = _in0_grid(k_tiles, cores=in0_cores)
         self.in0_cores = c
         self.xmem = ttnn.create_sharded_memory_config(
             (TILE, K // c),
