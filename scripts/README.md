@@ -39,6 +39,8 @@
 | `test_multiconv.py` | 複数の会話を交互に流しても単独と出力が一致すること、切り替え時間、KV が足りないときの追い出し |
 | `test_reuse.py [--off]` | 会話の再利用: 3 ターン (thinking オフ/オン) の再利用の種類、応答開始までの時間、最初からとの出力比較 |
 | `test_prefill_cache.py` | トレース取得後に、開始位置・長さがばらばらの prefill とデコードを繰り返しても、プログラムキャッシュが増えないこと (増えるとハングの原因になる) |
+| `test_hang.py [spin]` | 終わらないカーネルを流し、ホストの待ちがどう終わるか (例外 / 保険) を見る。終わったらデバイスをリセット |
+| `test_server_hang.sh [port]` | `run_server.sh` 経由のサーバーで、通常応答 → `/debug/hang` → 503 → 自動リセット・再起動 → 通常応答。<br>`BACKSTOP=20 TT_METAL_OPERATION_TIMEOUT_SECONDS=0` で保険の経路 |
 | `prefill_agree.py OUT.pt [テキスト]` | prefill 中の位置ごとの argmax を保存する (prefill 経路どうしの比較用) |
 
 ## 計測
@@ -54,7 +56,7 @@
 | `bench_prefill_large.py [T] [P0]` | 大きい T の prefill 1 チャンクの部品ごとの時間 |
 | `sdpa_start.py` | chunked SDPA の開始位置: 整数とテンソルでのプログラム数・速度・出力の比較 |
 | `sdpabench.py` | chunked SDPA の速度 (k_chunk 依存) と、開始位置がずれたときの正しさ |
-| `memprobe.py MAX_SEQ` | サーバー構成で読み込んだときの DRAM 使用量 |
+| `memprobe.py MAX_SEQ [--no-large]` | サーバー構成で読み込んだときの DRAM 使用量 (段階ごと、最大の連続空きも) |
 | `quantstudy.py` | 重みの量子化誤差 (bfp4/bfp8 などの TT 形式、CPU) |
 
 ## 品質ベンチマーク (todo 2)

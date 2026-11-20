@@ -1,4 +1,4 @@
-"""Load the server configuration with a given max_seq and report DRAM usage.  python scripts/memprobe.py 131072"""
+"""Load the server configuration with a given max_seq and report DRAM usage.  python scripts/memprobe.py 131072 [--no-large]"""
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
 import sys, time
@@ -21,6 +21,9 @@ try:
     mem("weights")
     eng.init_spec(4, mtp=True); eng.init_prefill(32)
     mem("spec+prefill")
+    if len(sys.argv) < 3 or sys.argv[2] != "--no-large":
+        eng.init_large_prefill(1024)
+        mem("large prefill (after warmup)")
     eng.capture_all()
     mem("traced")
     tok = AutoTokenizer.from_pretrained(MODEL)
@@ -30,5 +33,6 @@ try:
     for t in g.generate(ids, max_new=40):
         out.append(t)
     print("[out]", tok.decode(out), flush=True)
+    mem("after a request")
 finally:
     ttnn.close_device(dev)

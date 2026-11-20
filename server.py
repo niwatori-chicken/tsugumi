@@ -1,11 +1,16 @@
 """OpenAI-compatible chat server for Qwen3.8-27B on one P100A (lean B=1 engine + MTP speculative decoding).
 
-    python server.py [--port 8010] [--max-seq 159744]
+    python server.py [--port 8010] [--max-seq 155648]
 
 Endpoints: POST /v1/chat/completions (stream or not), GET /v1/models, GET /health.
 Decoding is greedy (temperature/top_p are accepted but ignored). One request at a time.
 `chat_template_kwargs.enable_thinking` controls thinking (default: false); <think> content goes to
 `reasoning_content`.
+
+Hang handling: a device wait that makes no progress for TT_METAL_OPERATION_TIMEOUT_SECONDS (default here 30)
+raises; the request gets an error, /health turns 503 and the process exits with code 75 (EXIT_HANG). A
+faulthandler backstop (TSUMI_HANG_BACKSTOP seconds without a new token, default 300) kills the process if a
+wait hangs without raising. run_server.sh resets the device and restarts the server after either.
 """
 import argparse
 import json
@@ -14,6 +19,7 @@ import sys
 import threading
 import time
 import uuid
+import faulthandler
 import tsumi.paths as tsumi_paths
 from tsumi.env import env
 
@@ -21,6 +27,9 @@ from tsumi.env import env
 MODEL_DIR = tsumi_paths.MODEL
 CACHE = tsumi_paths.CACHE
 MODEL_NAME = "qwen3.8-27b-tt"
+EXIT_HANG = 75
+# must be set before tt-metal reads its runtime options (first ttnn import)
+os.environ.setdefault("TT_METAL_OPERATION_TIMEOUT_SECONDS", "30")
 
 
 class Backend:
@@ -43,6 +52,34 @@ class Backend:
         self.gen = Generator(self.eng)
         self.max_seq = max_seq
         self.lock = threading.Lock()
+        self.dead = None  # reason string once the device is considered hung
+        self.backstop = int(env("HANG_BACKSTOP", "300"))
+
+    def _arm(self):
+        faulthandler.dump_traceback_later(self.backstop, exit=True)
+
+    def fail(self, e):
+        """Device error during a request: stop serving and exit so run_server.sh can reset the device."""
+        if self.dead is None:
+            lines = str(e).splitlines() or [""]
+            msg = next((l for l in lines if "TIMEOUT" in l), lines[0])  # the TT_THROW header line says little
+            self.dead = f"{type(e).__name__}: {msg.strip()[:300]}"
+            print(f"[server] device error, exiting with {EXIT_HANG} after this response: {self.dead}", flush=True)
+            threading.Timer(1.0, os._exit, [EXIT_HANG]).start()  # let the error response go out first
+
+    def debug_hang(self):
+        from tsumi.hang_kernel import run_hang_kernel
+        run_hang_kernel(self.dev)
+
+    def _tokens(self, ids, max_new, stats):
+        """Generator tokens; re-arms the backstop per token. Device errors go to fail() and are re-raised."""
+        try:
+            for t in self.gen.generate(ids, max_new=max_new, stats=stats):
+                self._arm()
+                yield t
+        except Exception as e:
+            self.fail(e)
+            raise
 
     def encode(self, messages, enable_thinking):
         ids = self.tok.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=enable_thinking)
@@ -57,18 +94,22 @@ class Backend:
         stats = {}
         t0 = time.perf_counter()
         t_first = None
-        for t in self.gen.generate(ids, max_new=max_new, stats=stats):
-            if t_first is None:
-                t_first = time.perf_counter()
-            if t in self.gen.eos:
-                continue  # let the generator finish so it records the committed state
-            out.append(t)
-            text = self.tok.decode(out)
-            if text.endswith("�"):
-                continue
-            if len(text) > len(sent):
-                yield text[len(sent):], None
-                sent = text
+        self._arm()
+        try:
+            for t in self._tokens(ids, max_new, stats):
+                if t_first is None:
+                    t_first = time.perf_counter()
+                if t in self.gen.eos:
+                    continue  # let the generator finish so it records the committed state
+                out.append(t)
+                text = self.tok.decode(out)
+                if text.endswith("�"):
+                    continue
+                if len(text) > len(sent):
+                    yield text[len(sent):], None
+                    sent = text
+        finally:
+            faulthandler.cancel_dump_traceback_later()
         text = self.tok.decode(out)
         if len(text) > len(sent):
             yield text[len(sent):], None
@@ -118,7 +159,27 @@ def make_app(backend):
 
     @app.get("/health")
     def health():
+        if backend.dead:
+            return JSONResponse({"status": "error", "error": backend.dead}, status_code=503)
         return {"status": "ok"}
+
+    def unavailable():
+        return JSONResponse({"error": {"message": f"device error, server restarting: {backend.dead}",
+                                       "type": "server_error"}}, status_code=503)
+
+    if env("DEBUG_HANG", "0") == "1":  # test-only (scripts/test_server_hang.sh)
+        @app.post("/debug/hang")
+        def debug_hang():
+            with backend.lock:
+                backend._arm()
+                try:
+                    backend.debug_hang()
+                except Exception as e:
+                    backend.fail(e)
+                    return unavailable()
+                finally:
+                    faulthandler.cancel_dump_traceback_later()
+            return {"status": "no hang"}
 
     @app.get("/v1/models")
     def models():
@@ -126,6 +187,8 @@ def make_app(backend):
 
     @app.post("/v1/chat/completions")
     async def chat(req: Request):
+        if backend.dead:
+            return unavailable()
         body = await req.json()
         messages = body.get("messages", [])
         for m in messages:
@@ -153,15 +216,22 @@ def make_app(backend):
         if body.get("stream"):
             def gen():
                 with backend.lock:
+                    if backend.dead:
+                        yield "data: " + json.dumps({"error": {"message": f"device error: {backend.dead}"}}) + "\n\n"
+                        return
                     sp = ThinkSplitter(in_think)
                     yield chunk({"role": "assistant"})
                     info = None
-                    for delta, done in backend.stream(ids, max_new):
-                        if done:
-                            info = done
-                            break
-                        for field, txt in sp.feed(delta):
-                            yield chunk({field: txt})
+                    try:
+                        for delta, done in backend.stream(ids, max_new):
+                            if done:
+                                info = done
+                                break
+                            for field, txt in sp.feed(delta):
+                                yield chunk({field: txt})
+                    except Exception:
+                        yield "data: " + json.dumps({"error": {"message": f"device error: {backend.dead}"}}) + "\n\n"
+                        return
                     usage = dict(prompt_tokens=info["prompt_tokens"], completion_tokens=info["completion_tokens"],
                                  total_tokens=info["prompt_tokens"] + info["completion_tokens"])
                     yield chunk({}, finish="stop", usage=usage)
@@ -171,15 +241,20 @@ def make_app(backend):
             return StreamingResponse(gen(), media_type="text/event-stream")
 
         with backend.lock:
+            if backend.dead:
+                return unavailable()
             sp = ThinkSplitter(in_think)
             parts = {"content": "", "reasoning_content": ""}
             info = None
-            for delta, done in backend.stream(ids, max_new):
-                if done:
-                    info = done
-                    break
-                for field, txt in sp.feed(delta):
-                    parts[field] += txt
+            try:
+                for delta, done in backend.stream(ids, max_new):
+                    if done:
+                        info = done
+                        break
+                    for field, txt in sp.feed(delta):
+                        parts[field] += txt
+            except Exception:
+                return unavailable()
         print(f"[req] {info}", flush=True)
         msg = {"role": "assistant", "content": parts["content"]}
         if parts["reasoning_content"]:
@@ -197,7 +272,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8010)
-    ap.add_argument("--max-seq", type=int, default=159744)  # large-T prefill needs ~140MB of working DRAM
+    ap.add_argument("--max-seq", type=int, default=155648)  # large-T prefill needs ~190MB of working DRAM, in 35MB contiguous pieces
     a = ap.parse_args()
     import uvicorn
 

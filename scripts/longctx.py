@@ -27,7 +27,7 @@ ids = ids if isinstance(ids, list) else ids["input_ids"]
 print(f"[prompt] {len(ids)} tokens", flush=True)
 dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
 try:
-    eng = Qwen35Engine(dev, MODEL, Precision("bfp4"), f"{CACHE}/bfp4", max_seq=int(env("MAX_SEQ", "163840")), log=lambda *a: None)
+    eng = Qwen35Engine(dev, MODEL, Precision("bfp4"), f"{CACHE}/bfp4", max_seq=int(env("MAX_SEQ", "155648")), log=lambda *a: None)
     eng.init_spec(4, mtp=True); eng.init_prefill(32)
     if env("LARGE_PREFILL", "1") == "1":
         eng.init_large_prefill(int(env("LARGE_T", "1024")))

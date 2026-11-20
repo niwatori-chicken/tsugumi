@@ -47,6 +47,7 @@ class Generator:
         self.cur = None
         self.tick = 0
         eng.pager.on_full = self._evict
+        eng.pager.release(eng.pager.blocks)  # blocks mapped by warmup / earlier direct prefill calls
         self._new_conv()
 
     # the active conversation's fields

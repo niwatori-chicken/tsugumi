@@ -11,7 +11,7 @@
 | デコード (コード生成、貪欲法) | **47 tok/s** |
 | デコード (日本語の説明文 / 英語の物語) | 32 / 28 tok/s |
 | prefill (数千トークンのプロンプト) | **約 1,500〜2,000 tok/s** (4,000 トークンで応答開始まで約 2 秒) |
-| 最大文脈 | **159,744 トークン** (KV 用に DRAM 残り約 10GB) |
+| 最大文脈 | **155,648 トークン** (KV 用に DRAM 残り約 10GB) |
 | 12.4 万トークンのプロンプト | prefill 130 秒 (957 tok/s)、デコード 34 tok/s、needle テスト正解 |
 
 - 投機的デコードの出力は、通常の貪欲法 (1 トークンずつ) の出力と一致します (コードのプロンプトで確認)。
@@ -58,8 +58,8 @@ export TT_METAL_HOME=/path/to/tt-metal PYTHONPATH=/path/to/tt-metal
 export TSUMI_MODEL_DIR=/path/to/Qwen3.8-27B             # HF 形式のモデル
 export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みのキャッシュ (初回に作られる、約 8 分)
 
-# OpenAI 互換サーバー (127.0.0.1:8010)
-python server.py --port 8010 [--max-seq 159744]
+# OpenAI 互換サーバー (127.0.0.1:8010)。run_server.sh はハング時にデバイスをリセットして再起動する
+./run_server.sh --port 8010 [--max-seq 155648]     # または python server.py ...
 ```
 
 サーバー:
@@ -67,6 +67,9 @@ python server.py --port 8010 [--max-seq 159744]
 - `POST /v1/chat/completions` (stream 対応)、`GET /v1/models`、`GET /health`。1 リクエストずつ処理。
 - 思考は `chat_template_kwargs.enable_thinking` (既定 false)。`<think>` の中身は `reasoning_content` に分ける。
 - 起動は約 20 秒 (キャッシュがページキャッシュにあるとき)。
+- ハング検知: デバイスの処理が 30 秒進まないと (`TT_METAL_OPERATION_TIMEOUT_SECONDS`)、そのリクエストに 503 を返し、
+  `/health` も 503 にして終了コード 75 で終わる。トークンが 300 秒出ないとき (`TSUMI_HANG_BACKSTOP`) も強制終了する。
+  `run_server.sh` はそれを見て `tt-smi -r 0` を 2 回 → 再起動する (約 1.5 分で復帰。10 分に 3 回を超えたら諦める)。
 
 環境変数 (旧名の `QE_...` も引き続き読めます):
 
@@ -87,7 +90,7 @@ python server.py --port 8010 [--max-seq 159744]
   実務的なタスクでの品質は未評価。
 - 会話の続きは再利用します (前回のプロンプト + 返答、またはアシスタントのターン開始位置の状態スナップショットから差分だけ prefill)。
   複数の会話 (本体とサブエージェントなど) は KV のブロックを分けて保持し、リクエストごとに切り替えます (約 0.1 秒)。
-  KV の合計は最大文脈ぶん (159,744 トークン) で、足りなくなると最後に使ったのが最も古い会話から捨てます。
+  KV の合計は最大文脈ぶん (155,648 トークン) で、足りなくなると最後に使ったのが最も古い会話から捨てます。
 - 短い文脈では、GQA カーネルの固定費 (約 0.1ms/層) のぶん、ttnn の SDPA より 1 ステップ 1ms ほど遅くなります。
 - デバイスが固まった場合は `tt-smi -r 0` を 2 回、15 秒ほど待つと戻ることが多いです。
 
