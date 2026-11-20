@@ -94,6 +94,8 @@ class Backend:
                  f"startup {time.perf_counter() - t_all:.0f}s")
         self.max_seq = max_seq
         self.lock = threading.Lock()
+        self.waiting = 0      # requests waiting for the device
+        self.active = None    # the running request: dict(id, prompt, generated, since)
         self.dead = None  # reason string once the device is considered hung
         self.backstop = int(env("HANG_BACKSTOP", "300"))
 
@@ -130,7 +132,7 @@ class Backend:
             ids = ids["input_ids"]
         return ids
 
-    def stream(self, ids, max_new, sampler=None):
+    def stream(self, ids, max_new, sampler=None, stop_check=None):
         """Yields (text_delta, done_info). Text is decoded incrementally (only the last few tokens are re-decoded,
         so long replies stay O(n)); incomplete UTF-8 is held back."""
         out = []
@@ -139,9 +141,11 @@ class Backend:
         t_first = None
         eos = False
         prefix_off = read_off = 0  # decode out[prefix_off:] and emit what goes beyond out[prefix_off:read_off]
+        stopped = False
         self._arm()
+        toks = self._tokens(ids, max_new, stats, sampler)
         try:
-            for t in self._tokens(ids, max_new, stats, sampler):
+            for t in toks:
                 if t_first is None:
                     t_first = time.perf_counter()
                 if t in self.gen.eos:
@@ -152,9 +156,15 @@ class Backend:
                 text = self.tok.decode(out[prefix_off:])
                 if text.endswith("\ufffd") or len(text) <= len(prefix):
                     continue
+                if self.active is not None:
+                    self.active["generated"] = len(out)
                 yield text[len(prefix):], None
                 prefix_off, read_off = read_off, len(out)
+                if stop_check is not None and stop_check():  # a stop string: end the generation here
+                    stopped = True
+                    break
         finally:
+            toks.close()  # an early end still records the committed state (Generator handles GeneratorExit)
             faulthandler.cancel_dump_traceback_later()
         prefix = self.tok.decode(out[prefix_off:read_off])
         text = self.tok.decode(out[prefix_off:])
@@ -167,7 +177,37 @@ class Backend:
                        ttft=(t_first or t0) - t0, decode_tps=len(out) / dt if dt > 0 else 0.0,
                        tokens_per_step=(stats.get("accepted", 0) + steps) / steps,
                        ngram_steps=stats.get("ngram_steps", 0), steps=stats.get("steps", 0),
-                       finish="stop" if eos else "length", total=time.perf_counter() - t0)
+                       finish="stop" if eos or stopped else "length", total=time.perf_counter() - t0)
+
+
+class StopMatcher:
+    """OpenAI `stop`: cut the reply before the first stop string (not included). Text that could be the start of a
+    stop string is held back until it is decided."""
+
+    def __init__(self, stops):
+        self.stops = [x for x in ([stops] if isinstance(stops, str) else (stops or [])) if x][:4]
+        self.hold = max((len(x) for x in self.stops), default=1) - 1
+        self.buf = ""
+        self.hit = False
+
+    def feed(self, text):
+        if not self.stops:
+            return text
+        if self.hit:
+            return ""
+        self.buf += text
+        cut = min((i for i in (self.buf.find(x) for x in self.stops) if i >= 0), default=-1)
+        if cut >= 0:
+            self.hit = True
+            out, self.buf = self.buf[:cut], ""
+            return out
+        n = len(self.buf) - self.hold
+        out, self.buf = (self.buf[:n], self.buf[n:]) if n > 0 else ("", self.buf)
+        return out
+
+    def finish(self):
+        out, self.buf = ("" if self.hit else self.buf), ""
+        return out
 
 
 class ThinkSplitter:
@@ -228,7 +268,29 @@ def make_app(backend):
     def health():
         if backend.dead:
             return JSONResponse({"status": "error", "error": backend.dead}, status_code=503)
-        return {"status": "ok"}
+        a = backend.active
+        return {"status": "ok", "busy": a is not None, "waiting": backend.waiting,
+                "active": None if a is None else dict(id=a["id"], prompt_tokens=a["prompt"],
+                                                      generated=a["generated"],
+                                                      seconds=round(time.time() - a["since"], 1))}
+
+    async def acquire(req, tag, n_prompt):
+        """Wait for the device without blocking the event loop; give up if the client disconnects meanwhile."""
+        backend.waiting += 1
+        try:
+            while True:
+                if await run_in_threadpool(backend.lock.acquire, True, 0.25):
+                    backend.active = dict(id=tag, prompt=n_prompt, generated=0, since=time.time())
+                    return True
+                if await req.is_disconnected():
+                    log.info(f"req {tag}: client disconnected while waiting")
+                    return False
+        finally:
+            backend.waiting -= 1
+
+    def release():
+        backend.active = None
+        backend.lock.release()
 
     def unavailable():
         return JSONResponse({"error": {"message": f"device error, server restarting: {backend.dead}",
@@ -237,7 +299,7 @@ def make_app(backend):
     if env("DEBUG_HANG", "0") == "1":  # test-only (scripts/test_server_hang.sh)
         @app.post("/debug/hang")
         def debug_hang():
-            with backend.lock:
+            with backend.lock:  # test-only path: plain blocking lock
                 backend._arm()
                 try:
                     backend.debug_hang()
@@ -267,8 +329,9 @@ def make_app(backend):
         # thinking on the reply starts in <think>, so it is treated as "auto")
         forced = forced_prefix(tool_choice) if tools and not thinking else ""
         max_new = int(body.get("max_tokens") or body.get("max_completion_tokens") or 2048)
-        try:
-            ids = backend.encode(prepare_messages(body.get("messages", [])), thinking, tools, kw)
+        try:  # in a worker thread: a long prompt takes ~1 s to tokenize
+            ids = await run_in_threadpool(backend.encode, prepare_messages(body.get("messages", [])), thinking,
+                                          tools, kw)
         except Exception as e:  # template errors (bad roles, no user message, ...)
             return JSONResponse({"error": {"message": f"chat template: {e}", "type": "invalid_request_error"}},
                                 status_code=400)
@@ -282,10 +345,15 @@ def make_app(backend):
         params = [f"prompt {len(ids)} tok", f"max {max_new}"] + (["thinking"] if thinking else []) + \
             ([f"temp {body.get('temperature')}"] if (body.get("temperature") or 0) > 0 else []) + \
             ([f"tools {len(tools)}"] if tools else []) + (["stream"] if body.get("stream") else [])
-        ignored = [k for k in ("stop", "presence_penalty", "frequency_penalty", "logprobs", "response_format", "n",
+        stops = body.get("stop")
+        if stops:
+            params.append(f"stop {len([stops] if isinstance(stops, str) else stops)}")
+        ignored = [k for k in ("presence_penalty", "frequency_penalty", "logprobs", "response_format", "n",
                                "logit_bias") if body.get(k) not in (None, False, 0, 1, [], "") or
                    (k == "n" and (body.get("n") or 1) > 1)]
-        log.info(f"req {tag}: {', '.join(params)}" + (" (waiting: busy)" if backend.lock.locked() else "") +
+        busy = backend.lock.locked()
+        log.info(f"req {tag}: {', '.join(params)}" +
+                 (f" (waiting: busy, {backend.waiting} ahead)" if busy else "") +
                  (f"; ignored parameters: {', '.join(ignored)}" if ignored else ""))
         created = int(time.time())
         temperature = float(body.get("temperature") or 0.0)
@@ -302,18 +370,27 @@ def make_app(backend):
             return Sampler(temperature, body.get("top_p"), body.get("top_k"), body.get("min_p"), body.get("seed"))
 
         def events():
-            """(field, value) pairs: reasoning_content / content text, tool_call dicts, then ("done", info)."""
+            """(field, value) pairs: reasoning_content / content text, tool_call dicts, then ("done", info).
+            Stop strings apply to the content (not to the thinking)."""
             sp = ThinkSplitter(thinking)  # the template opens <think> itself when thinking is enabled
             tp = ToolStreamParser(tools, prefix=forced) if tools else None
-            for delta, done in backend.stream(ids, max_new, make_sampler()):
+            sm = StopMatcher(stops)
+
+            def content(txt):
+                txt = sm.feed(txt) if txt else sm.finish()
+                if txt:
+                    yield from (tp.feed(txt) if tp else [("content", txt)])
+
+            for delta, done in backend.stream(ids, max_new, make_sampler(), stop_check=lambda: sm.hit):
                 if done:
+                    yield from content("")
                     if tp:
                         yield from tp.finish()
                     yield "done", done
                     return
                 for field, txt in sp.feed(delta):
-                    if tp and field == "content":
-                        yield from tp.feed(txt)
+                    if field == "content":
+                        yield from content(txt)
                     else:
                         yield field, txt
 
@@ -334,34 +411,35 @@ def make_app(backend):
             return "data: " + json.dumps({"error": {"message": f"device error: {backend.dead}"}}) + "\n\n"
 
         if body.get("stream"):
-            def gen():
-                with backend.lock:
-                    if backend.dead:
-                        yield error_event()
-                        return
-                    yield chunk({"role": "assistant"})
-                    info, ncalls = None, 0
-                    try:
-                        for field, v in events():
-                            if field == "done":
-                                info = v
-                            elif field == "tool_call":
-                                yield chunk({"tool_calls": [dict(index=ncalls, **v)]})
-                                ncalls += 1
-                            else:
-                                yield chunk({field: v})
-                    except Exception:
-                        yield error_event()
-                        return
-                    yield chunk({}, finish="tool_calls" if ncalls else info["finish"], usage=usage(info), timings=info)
-                    yield "data: [DONE]\n\n"
-                    log_done(tag, info, ncalls)
+            def gen():  # runs with the device lock held (taken by agen)
+                if backend.dead:
+                    yield error_event()
+                    return
+                yield chunk({"role": "assistant"})
+                info, ncalls = None, 0
+                try:
+                    for field, v in events():
+                        if field == "done":
+                            info = v
+                        elif field == "tool_call":
+                            yield chunk({"tool_calls": [dict(index=ncalls, **v)]})
+                            ncalls += 1
+                        else:
+                            yield chunk({field: v})
+                except Exception:
+                    yield error_event()
+                    return
+                yield chunk({}, finish="tool_calls" if ncalls else info["finish"], usage=usage(info), timings=info)
+                yield "data: [DONE]\n\n"
+                log_done(tag, info, ncalls)
 
             async def agen():
                 """Runs the blocking generator in worker threads, one chunk at a time, so the event loop stays free.
                 When the client disconnects, Starlette cancels this task: the finally closes the generator, which
                 ends the generation where it is and releases the device lock (left suspended, it would hold the
                 lock until garbage collection)."""
+                if not await acquire(req, tag, len(ids)):
+                    return
                 it = gen()
                 done = False
                 try:
@@ -373,30 +451,35 @@ def make_app(backend):
                         yield c
                 finally:
                     it.close()
+                    release()
                     if not done:
                         log.info(f"req {tag}: client disconnected, generation stopped")
 
             return StreamingResponse(agen(), media_type="text/event-stream")
 
-        def run():  # blocking: in a worker thread, not on the event loop
-            with backend.lock:
-                if backend.dead:
-                    return None
-                parts = {"content": "", "reasoning_content": ""}
-                calls, info = [], None
-                try:
-                    for field, v in events():
-                        if field == "done":
-                            info = v
-                        elif field == "tool_call":
-                            calls.append(v)
-                        else:
-                            parts[field] += v
-                except Exception:
-                    return None
+        def run():  # blocking, in a worker thread, with the device lock held
+            if backend.dead:
+                return None
+            parts = {"content": "", "reasoning_content": ""}
+            calls, info = [], None
+            try:
+                for field, v in events():
+                    if field == "done":
+                        info = v
+                    elif field == "tool_call":
+                        calls.append(v)
+                    else:
+                        parts[field] += v
+            except Exception:
+                return None
             return parts, calls, info
 
-        res = await run_in_threadpool(run)
+        if not await acquire(req, tag, len(ids)):
+            return JSONResponse({"error": {"message": "client disconnected"}}, status_code=499)
+        try:
+            res = await run_in_threadpool(run)
+        finally:
+            release()
         if res is None:
             return unavailable()
         parts, calls, info = res
