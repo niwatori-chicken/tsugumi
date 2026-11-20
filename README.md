@@ -66,6 +66,9 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
 
 - `POST /v1/chat/completions` (stream 対応)、`GET /v1/models`、`GET /health`。1 リクエストずつ処理。
 - 思考は `chat_template_kwargs.enable_thinking` (既定 false)。`<think>` の中身は `reasoning_content` に分ける。
+- ツール呼び出し: `tools` / `tool_choice` / 履歴の `tool_calls` と `role: tool` に対応 (OpenAI 形式、ストリーミングも)。
+  モデルが出す `<tool_call>` の XML を `tool_calls` に変換する (`tsumi/toolcall.py`)。
+  `tool_choice` は auto / none。required と関数名の指定は thinking オフのときだけ効く (応答の先頭を `<tool_call>` にする)。
 - 起動は約 20 秒 (キャッシュがページキャッシュにあるとき)。
 - ハング検知: デバイスの処理が 30 秒進まないと (`TT_METAL_OPERATION_TIMEOUT_SECONDS`)、そのリクエストに 503 を返し、
   `/health` も 503 にして終了コード 75 で終わる。トークンが 300 秒出ないとき (`TSUMI_HANG_BACKSTOP`) も強制終了する。

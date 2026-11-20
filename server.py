@@ -5,7 +5,9 @@
 Endpoints: POST /v1/chat/completions (stream or not), GET /v1/models, GET /health.
 Decoding is greedy (temperature/top_p are accepted but ignored). One request at a time.
 `chat_template_kwargs.enable_thinking` controls thinking (default: false); <think> content goes to
-`reasoning_content`.
+`reasoning_content`. Other chat_template_kwargs (reasoning_effort, preserve_thinking) go to the template.
+Tool calling: `tools`, `tool_choice` (auto / none; required / a named function with thinking off), assistant
+`tool_calls` and `role: tool` messages in the history; calls are returned as `tool_calls` (tsumi/toolcall.py).
 
 Hang handling: a device wait that makes no progress for TT_METAL_OPERATION_TIMEOUT_SECONDS (default here 30)
 raises; the request gets an error, /health turns 503 and the process exits with code 75 (EXIT_HANG). A
@@ -22,6 +24,7 @@ import uuid
 import faulthandler
 import tsumi.paths as tsumi_paths
 from tsumi.env import env
+from tsumi.toolcall import ToolStreamParser, forced_prefix, prepare_messages
 
 
 MODEL_DIR = tsumi_paths.MODEL
@@ -81,8 +84,9 @@ class Backend:
             self.fail(e)
             raise
 
-    def encode(self, messages, enable_thinking):
-        ids = self.tok.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=enable_thinking)
+    def encode(self, messages, enable_thinking, tools=None, template_kwargs=None):
+        ids = self.tok.apply_chat_template(messages, tools=tools, add_generation_prompt=True,
+                                           enable_thinking=enable_thinking, **(template_kwargs or {}))
         if not isinstance(ids, list):
             ids = ids["input_ids"]
         return ids
@@ -190,21 +194,48 @@ def make_app(backend):
         if backend.dead:
             return unavailable()
         body = await req.json()
-        messages = body.get("messages", [])
-        for m in messages:
-            if m.get("role") == "developer":
-                m["role"] = "system"
-        kw = body.get("chat_template_kwargs") or {}
-        thinking = bool(kw.get("enable_thinking", False))
+        kw = dict(body.get("chat_template_kwargs") or {})
+        thinking = bool(kw.pop("enable_thinking", False))
+        tool_choice = body.get("tool_choice") or "auto"
+        tools = body.get("tools") or None
+        if tool_choice == "none":
+            tools = None
+        # tool_choice "required" / a named function: start the reply inside a call (thinking off only; with
+        # thinking on the reply starts in <think>, so it is treated as "auto")
+        forced = forced_prefix(tool_choice) if tools and not thinking else ""
         max_new = int(body.get("max_tokens") or body.get("max_completion_tokens") or 2048)
-        ids = backend.encode(messages, thinking)
+        try:
+            ids = backend.encode(prepare_messages(body.get("messages", [])), thinking, tools, kw)
+        except Exception as e:  # template errors (bad roles, no user message, ...)
+            return JSONResponse({"error": {"message": f"chat template: {e}", "type": "invalid_request_error"}},
+                                status_code=400)
+        if forced:
+            ids = ids + backend.tok.encode(forced, add_special_tokens=False)
         max_new = max(1, min(max_new, backend.max_seq - len(ids) - 8))
         if len(ids) + 8 >= backend.max_seq:
             return JSONResponse({"error": {"message": f"prompt too long ({len(ids)} tokens)"}}, status_code=400)
         rid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
-        # the template opens <think> itself when thinking is enabled
-        in_think = thinking
+
+        def events():
+            """(field, value) pairs: reasoning_content / content text, tool_call dicts, then ("done", info)."""
+            sp = ThinkSplitter(thinking)  # the template opens <think> itself when thinking is enabled
+            tp = ToolStreamParser(tools, prefix=forced) if tools else None
+            for delta, done in backend.stream(ids, max_new):
+                if done:
+                    if tp:
+                        yield from tp.finish()
+                    yield "done", done
+                    return
+                for field, txt in sp.feed(delta):
+                    if tp and field == "content":
+                        yield from tp.feed(txt)
+                    else:
+                        yield field, txt
+
+        def usage(info):
+            return dict(prompt_tokens=info["prompt_tokens"], completion_tokens=info["completion_tokens"],
+                        total_tokens=info["prompt_tokens"] + info["completion_tokens"])
 
         def chunk(delta, finish=None, usage=None):
             d = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": MODEL_NAME,
@@ -213,58 +244,59 @@ def make_app(backend):
                 d["usage"] = usage
             return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
 
+        def error_event():
+            return "data: " + json.dumps({"error": {"message": f"device error: {backend.dead}"}}) + "\n\n"
+
         if body.get("stream"):
             def gen():
                 with backend.lock:
                     if backend.dead:
-                        yield "data: " + json.dumps({"error": {"message": f"device error: {backend.dead}"}}) + "\n\n"
+                        yield error_event()
                         return
-                    sp = ThinkSplitter(in_think)
                     yield chunk({"role": "assistant"})
-                    info = None
+                    info, ncalls = None, 0
                     try:
-                        for delta, done in backend.stream(ids, max_new):
-                            if done:
-                                info = done
-                                break
-                            for field, txt in sp.feed(delta):
-                                yield chunk({field: txt})
+                        for field, v in events():
+                            if field == "done":
+                                info = v
+                            elif field == "tool_call":
+                                yield chunk({"tool_calls": [dict(index=ncalls, **v)]})
+                                ncalls += 1
+                            else:
+                                yield chunk({field: v})
                     except Exception:
-                        yield "data: " + json.dumps({"error": {"message": f"device error: {backend.dead}"}}) + "\n\n"
+                        yield error_event()
                         return
-                    usage = dict(prompt_tokens=info["prompt_tokens"], completion_tokens=info["completion_tokens"],
-                                 total_tokens=info["prompt_tokens"] + info["completion_tokens"])
-                    yield chunk({}, finish="stop", usage=usage)
+                    yield chunk({}, finish="tool_calls" if ncalls else "stop", usage=usage(info))
                     yield "data: [DONE]\n\n"
-                    print(f"[req] {info}", flush=True)
+                    print(f"[req] {info} tool_calls={ncalls}", flush=True)
 
             return StreamingResponse(gen(), media_type="text/event-stream")
 
         with backend.lock:
             if backend.dead:
                 return unavailable()
-            sp = ThinkSplitter(in_think)
             parts = {"content": "", "reasoning_content": ""}
-            info = None
+            calls, info = [], None
             try:
-                for delta, done in backend.stream(ids, max_new):
-                    if done:
-                        info = done
-                        break
-                    for field, txt in sp.feed(delta):
-                        parts[field] += txt
+                for field, v in events():
+                    if field == "done":
+                        info = v
+                    elif field == "tool_call":
+                        calls.append(v)
+                    else:
+                        parts[field] += v
             except Exception:
                 return unavailable()
-        print(f"[req] {info}", flush=True)
-        msg = {"role": "assistant", "content": parts["content"]}
+        print(f"[req] {info} tool_calls={len(calls)}", flush=True)
+        msg = {"role": "assistant", "content": parts["content"] if parts["content"] or not calls else None}
         if parts["reasoning_content"]:
             msg["reasoning_content"] = parts["reasoning_content"]
+        if calls:
+            msg["tool_calls"] = calls
         return {"id": rid, "object": "chat.completion", "created": created, "model": MODEL_NAME,
-                "choices": [{"index": 0, "message": msg, "finish_reason": "stop"}],
-                "usage": dict(prompt_tokens=info["prompt_tokens"], completion_tokens=info["completion_tokens"],
-                              total_tokens=info["prompt_tokens"] + info["completion_tokens"]),
-                "timings": info}
-
+                "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls" if calls else "stop"}],
+                "usage": usage(info), "timings": info}
     return app
 
 

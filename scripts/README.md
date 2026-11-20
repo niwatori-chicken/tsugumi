@@ -41,6 +41,8 @@
 | `test_prefill_cache.py` | トレース取得後に、開始位置・長さがばらばらの prefill とデコードを繰り返しても、プログラムキャッシュが増えないこと (増えるとハングの原因になる) |
 | `test_hang.py [spin]` | 終わらないカーネルを流し、ホストの待ちがどう終わるか (例外 / 保険) を見る。終わったらデバイスをリセット |
 | `test_server_hang.sh [port]` | `run_server.sh` 経由のサーバーで、通常応答 → `/debug/hang` → 503 → 自動リセット・再起動 → 通常応答。<br>`BACKSTOP=20 TT_METAL_OPERATION_TIMEOUT_SECONDS=0` で保険の経路 |
+| `test_toolcall.py` | ツール呼び出しの解析 (デバイス不要): ストリームの全分割で同じ結果、型変換、途中で切れた呼び出し、テンプレートとの往復 |
+| `test_tools.py [URL]` | 起動中のサーバーに対して、架空のツールでエージェントのループを回す (並列呼び出し、stream、thinking、tool_choice) |
 | `prefill_agree.py OUT.pt [テキスト]` | prefill 中の位置ごとの argmax を保存する (prefill 経路どうしの比較用) |
 
 ## 計測
