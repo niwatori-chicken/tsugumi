@@ -47,6 +47,14 @@
   footer { border-top: 1px solid var(--line); background: var(--panel); padding: 10px 16px; }
   .row { max-width: 860px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
   textarea { flex: 1; resize: none; padding: 8px 10px; min-height: 44px; max-height: 40vh; line-height: 1.5; }
+  #attach { padding: 4px 10px; }
+  #pending { max-width: 860px; margin: 0 auto 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+  #pending:empty { display: none; }
+  .thumb { position: relative; }
+  .thumb img, .user .imgs img { height: 64px; max-width: 160px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); display: block; }
+  .thumb button { position: absolute; top: -6px; right: -6px; padding: 0 6px; border-radius: 10px; font-size: 12px; line-height: 18px; }
+  .user .imgs { display: flex; gap: 6px; justify-content: flex-end; margin-bottom: 4px; flex-wrap: wrap; }
+  body.drag #log { outline: 2px dashed var(--accent); outline-offset: -8px; }
   .cursor::after { content: "▍"; animation: blink 1s steps(1) infinite; color: var(--muted); }
   @keyframes blink { 50% { opacity: 0; } }
 </style>
@@ -65,7 +73,10 @@
 </header>
 <div id="log"></div>
 <footer>
+  <div id="pending"></div>
   <div class="row">
+    <button id="attach" title="画像を添付 (貼り付け・ドラッグ&ドロップでも可)">画像</button>
+    <input type="file" id="file" accept="image/*" multiple hidden>
     <textarea id="input" rows="1" placeholder="メッセージ (Enter で送信、Shift+Enter で改行)"></textarea>
     <button id="send">送信</button>
   </div>
@@ -75,6 +86,49 @@ const $ = (id) => document.getElementById(id);
 const log = $("log"), input = $("input"), sendBtn = $("send"), status = $("status");
 let history = [];   // OpenAI messages (assistant turns without reasoning, as clients usually send them)
 let ctrl = null;    // AbortController of the running request
+let pending = [];   // data: URLs of the images to send with the next message
+const MAX_PIXELS = 1024 * 1024;  // larger images are scaled down here (the server would do it anyway)
+
+function readImage(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onerror = () => reject(fr.error);
+    fr.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("画像を読めません"));
+      img.onload = () => {
+        const px = img.naturalWidth * img.naturalHeight;
+        if (px <= MAX_PIXELS) return resolve(fr.result);
+        const k = Math.sqrt(MAX_PIXELS / px);
+        const c = document.createElement("canvas");
+        c.width = Math.max(1, Math.round(img.naturalWidth * k)); c.height = Math.max(1, Math.round(img.naturalHeight * k));
+        c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+        resolve(c.toDataURL("image/jpeg", 0.92));
+      };
+      img.src = fr.result;
+    };
+    fr.readAsDataURL(file);
+  });
+}
+async function addImages(files) {
+  for (const f of files) {
+    if (!f.type.startsWith("image/")) continue;
+    try { pending.push(await readImage(f)); } catch (e) { status.textContent = e.message; }
+  }
+  showPending();
+}
+function showPending() {
+  const box = $("pending");
+  box.innerHTML = "";
+  pending.forEach((u, i) => {
+    const d = document.createElement("div");
+    d.className = "thumb";
+    d.innerHTML = '<img alt=""><button title="外す">×</button>';
+    d.querySelector("img").src = u;
+    d.querySelector("button").onclick = () => { pending.splice(i, 1); showPending(); };
+    box.appendChild(d);
+  });
+}
 
 const store = {     // remembered settings (per browser; failures are ignored)
   get(k, d) { try { const v = localStorage.getItem("tsumi." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
@@ -128,10 +182,21 @@ const atBottom = () => log.scrollHeight - log.scrollTop - log.clientHeight < 80;
 
 async function send() {
   const text = input.value.trim();
-  if (!text || ctrl) return;
+  if ((!text && !pending.length) || ctrl) return;
   input.value = ""; autosize();
-  history.push({ role: "user", content: text });
-  addMsg("user").querySelector(".body").textContent = text;
+  const imgs = pending; pending = []; showPending();
+  history.push({ role: "user", content: imgs.length
+    ? imgs.map((u) => ({ type: "image_url", image_url: { url: u } })).concat(text ? [{ type: "text", text }] : [])
+    : text });
+  const ub = addMsg("user");
+  if (imgs.length) {
+    const row = document.createElement("div");
+    row.className = "imgs";
+    for (const u of imgs) { const im = document.createElement("img"); im.src = u; im.alt = ""; row.appendChild(im); }
+    ub.insertBefore(row, ub.firstChild);
+  }
+  ub.querySelector(".body").textContent = text;
+  if (!text) ub.querySelector(".body").hidden = true;
   const el = addMsg("assistant");
   const body = el.querySelector(".body"), think = el.querySelector(".think"), det = el.querySelector("details");
   log.scrollTop = log.scrollHeight;
@@ -211,7 +276,16 @@ input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
 });
 sendBtn.addEventListener("click", () => (ctrl ? ctrl.abort() : send()));
-$("new").addEventListener("click", () => { if (ctrl) ctrl.abort(); history = []; log.innerHTML = ""; input.focus(); });
+$("new").addEventListener("click", () => { if (ctrl) ctrl.abort(); history = []; pending = []; showPending(); log.innerHTML = ""; input.focus(); });
+$("attach").addEventListener("click", () => $("file").click());
+$("file").addEventListener("change", (e) => { addImages([...e.target.files]); e.target.value = ""; });
+input.addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith("image/"));
+  if (files.length) { e.preventDefault(); addImages(files); }
+});
+document.addEventListener("dragover", (e) => { e.preventDefault(); document.body.classList.add("drag"); });
+document.addEventListener("dragleave", (e) => { if (!e.relatedTarget) document.body.classList.remove("drag"); });
+document.addEventListener("drop", (e) => { e.preventDefault(); document.body.classList.remove("drag"); addImages([...e.dataTransfer.files]); });
 fetch("/health").then((r) => r.json()).then((h) => { if (h.status !== "ok") status.textContent = "サーバー: " + h.status; })
   .catch(() => { status.textContent = "サーバーに接続できません"; });
 input.focus();

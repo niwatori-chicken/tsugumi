@@ -28,6 +28,7 @@
 | スクリプト | 内容 |
 |---|---|
 | `cmp_hf.py` | 先頭 N 層 (+ 最終ノルム + lm_head) のロジットを HF (CPU fp32) と比較 |
+| `cmp_hf_mm.py` | 画像入力: M-RoPE の位置と cos/sin を HF と比較、画像入りのプロンプトで先頭 N 層のロジットを HF と比較 |
 | `test_gdn.py` | GDN のデコード (T=1) を HF の逐次再帰と比較 (乱数の重み) |
 | `test_gdn_kernel.py` | GDN の再帰カーネル (自作) を torch fp32 と比較 |
 | `test_gdn_fused.py T [steps]` | 融合 GDN カーネル (conv 以降) を torch と比較 |
@@ -45,6 +46,8 @@
 | `test_sampling.py [N]` | サンプリング: seed の再現性、投機的サンプリングと 1 トークンずつの分布の比較 (TV 距離)、速度と採択率。<br>`EXACT_PROMPT=...` で比較用のプロンプトを変える |
 | `test_toolcall.py` | ツール呼び出しの解析 (デバイス不要): ストリームの全分割で同じ結果、型変換、途中で切れた呼び出し、テンプレートとの往復 |
 | `test_tools.py [URL]` | 起動中のサーバーに対して、架空のツールでエージェントのループを回す (並列呼び出し、stream、thinking、tool_choice) |
+| `test_api2.py [URL]` | 起動中のサーバーに対して、思考の上限・logprobs・`/v1/completions`・`/tokenize` (26 項目) |
+| `test_images.py [URL]` | 起動中のサーバーに対して、画像入力 (図形の色と形、文字の読み取り、2 枚の比較、会話の再利用、stream、エラー) |
 | `prefill_agree.py OUT.pt [テキスト]` | prefill 中の位置ごとの argmax を保存する (prefill 経路どうしの比較用) |
 
 ## 計測
