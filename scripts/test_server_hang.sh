@@ -18,9 +18,9 @@ wait_ok() {
   done
   return 1
 }
-TSUMI_DEBUG_HANG=1 TSUMI_HANG_BACKSTOP=${BACKSTOP:-300} setsid ./run_server.sh --port $PORT --max-seq 16384 > $LOG 2>&1 &
+TSUMI_DEBUG_HANG=1 TSUMI_HANG_BACKSTOP=${BACKSTOP:-300} ./run_server.sh --port $PORT --max-seq 16384 > $LOG 2>&1 &
 wrapper=$!
-trap 'kill -TERM -$wrapper 2>/dev/null' EXIT
+trap 'kill -TERM $wrapper 2>/dev/null; wait $wrapper 2>/dev/null' EXIT
 t0=$(date +%s)
 wait_ok || { echo "FAIL: server did not start"; exit 1; }
 echo "1. up in $(( $(date +%s) - t0 ))s, answer: $(ask)"

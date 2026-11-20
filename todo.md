@@ -45,7 +45,7 @@
   - LLM による採点 (ELYZA-tasks-100 など) とツール呼び出しを使うベンチは後回し。
   - 結果を見て決める: bfp4 のグリッドに合わせた GPTQ / imatrix 付き丸め (速度は不変)、または GDN+attn を bfp8 (+3.6GB、検証 1 回 +9ms 程度)。
 
-- [ ] **2b. ツール呼び出し (function calling) への対応**
+- [x] **2b. ツール呼び出し (function calling) への対応** — 2026-11-20 完了。`tools` / `tool_choice` / `tool_calls` / `role: tool`、ストリーミング、並列呼び出し。ターン間の再利用も効く (`scripts/test_tools.py`)。残り: BFCL などでの評価
   - サーバーは OpenAI API の `tools` / `tool_calls` に未対応。エージェントで実用するには必要。
   - チャットテンプレートにツール定義を渡す。生成からツール呼び出しを取り出して `tool_calls` で返す
     (Qwen の `<tool_call>` 形式、ストリーミングでも)。`role: tool` の結果を履歴に入れる。
