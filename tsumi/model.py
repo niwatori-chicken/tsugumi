@@ -459,8 +459,11 @@ class Qwen35Engine:
         return int(ttnn.to_torch(outs[1]).reshape(-1)[0])
 
     # ---------------- T-row mode (chunked prefill / speculative verify) ----------------
-    def init_spec(self, T, mtp=False):
+    def init_spec(self, T, mtp=False, verify_T=None):
+        """T-row verify mode (T = 1 + drafts). verify_T: a second, longer verify mode added by init_verify (for
+        prompt-lookup drafts); the GDN state snapshots are sized for it here."""
         self.T_dec = T
+        self.T_verify = None
         from .kvpager import KVPager
 
         self.pager = KVPager(self.dev, self.max_seq // 64)
@@ -469,7 +472,10 @@ class Qwen35Engine:
         self._last_snap_all = True
         self.use_T(T)
         for L in self.layers:
-            L["mix"].init_spec(T)
+            if L["type"] == "linear_attention":
+                L["mix"].init_spec(T, slots=max(T, verify_T or 0))
+            else:
+                L["mix"].init_spec(T)
         self.hid_src = ttnn.from_torch(torch.zeros(1, 1, 32, self.H), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                                        device=self.dev)
         self.T_pre = None
@@ -485,6 +491,17 @@ class Qwen35Engine:
             self.mtp.init_spec(T)
         self.h_last = None
         self.use_T(T)
+
+    def init_verify(self, TV=8):
+        """Add a TV-row verify mode (all TV GDN states kept, like T_dec): used for long prompt-lookup drafts."""
+        assert self.layers[0]["mix"].snap.shape[1] >= TV * self.layers[0]["mix"].Nv or \
+            self.layers[0]["type"] != "linear_attention", "init_spec(verify_T=TV) first"
+        self.T_verify = TV
+        self.sh_by[TV] = SpecShared(self.dev, TV, self.HD, self.max_seq, self.pager)
+        for L in self.layers:
+            L["mix"].init_spec(TV)
+        if self.mtp is not None:
+            self.mtp.init_spec(TV)
 
     def init_prefill(self, TP=32):
         """Add a TP-row mode for prompt prefill (GDN kernel writes only the final state)."""

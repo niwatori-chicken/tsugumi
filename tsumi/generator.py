@@ -11,6 +11,40 @@ EOS_DEFAULT = (248046, 248044)
 IM_START = 248045
 
 
+class NGramIndex:
+    """Prompt-lookup drafts: where the last N tokens of the context occurred before, propose what followed them.
+
+    Copy-heavy replies (code edits, quoting the prompt, rewriting a text) repeat long stretches of the context;
+    there the proposals are right far more often than the MTP drafts, and they cost nothing to make."""
+
+    def __init__(self, n=3):
+        self.n = n
+        self.toks = []
+        self.ends = {}  # n-gram -> end indices (exclusive) of its occurrences, in order
+
+    def extend(self, tokens):
+        n, toks, ends = self.n, self.toks, self.ends
+        for t in tokens:
+            toks.append(t)
+            if len(toks) >= n:
+                ends.setdefault(tuple(toks[-n:]), []).append(len(toks))
+
+    def propose(self, k, max_match=32):
+        """(k tokens that followed the most recent earlier occurrence of the current suffix, length of the
+        matching suffix up to max_match), or ([], 0) if the last N tokens never occurred before."""
+        toks, L = self.toks, len(self.toks)
+        if L < self.n:
+            return [], 0
+        occ = self.ends.get(tuple(toks[-self.n:]), ())
+        for e in reversed(occ):
+            if e < L:
+                m = self.n
+                while m < max_match and e - m - 1 >= 0 and toks[e - m - 1] == toks[L - m - 1]:
+                    m += 1
+                return toks[e:e + k], m
+        return [], 0
+
+
 class Conversation:
     """One conversation's slot: its KV blocks (in the shared pool), the tokens in its state, the GDN state saved
     when it was switched out, and the snapshot at the start of its last assistant turn."""
@@ -43,6 +77,10 @@ class Generator:
         self.k = eng.T_dec - 1
         self.multi = getattr(eng, "large", None) is not None and env("MULTI_CONV", "1") == "1"
         self.max_convs = max_convs or int(env("MAX_CONVS", "8"))
+        # prompt-lookup drafts: index n-grams of NGRAM tokens (0 = off); use them when the context's suffix matches
+        # an earlier stretch over at least NGRAM_MIN tokens, verified in the longer T_verify mode when the engine has one
+        self.ngram_n = int(env("NGRAM", "3"))
+        self.ngram_min = int(env("NGRAM_MIN", "6"))
         self.convs = []
         self.cur = None
         self.tick = 0
@@ -174,6 +212,7 @@ class Generator:
             yield from self._generate(ids, max_new, stats)
         finally:
             self.eng.sampler = None
+            self.eng.use_T(self.eng.T_dec)  # a step may have left the engine in the T_verify mode
 
     def _generate(self, ids, max_new, stats):
         eng, k = self.eng, self.k
@@ -188,23 +227,49 @@ class Generator:
         n_out = 1
         if cur in self.eos:
             return
-        drafts = [d]
-        q = p + 1
-        for j in range(1, k):
-            am = eng.mtp.run([drafts[-1]], q, [last_rows - 1 if j == 1 else 0])
-            drafts.append(am[0])
-            q += 1
+        ng = None
+        if self.ngram_n:
+            ng = NGramIndex(self.ngram_n)  # built after the first token went out: no cost to the time to first token
+            ng.extend(ids)
+            ng.extend([cur])
+            if stats is not None:
+                stats.setdefault("ngram_steps", 0)
+                stats.setdefault("ngram_accepted", 0)
+
+        TV = eng.T_verify
+        kl = (TV or eng.T_dec) - 1  # drafts in an n-gram step
+
+        def plan(d1, q, row):
+            """Drafts for the next step and the mode to verify them in: the prompt-lookup proposal if the context's
+            suffix repeats an earlier stretch (>= ngram_min tokens), else d1 + MTP chained drafts (T_dec mode)."""
+            if ng is not None:
+                prop, m = ng.propose(kl)
+                if prop and m >= self.ngram_min:
+                    return prop + [prop[-1]] * (kl - len(prop)), (TV or eng.T_dec), True
+            ds = [d1]
+            for j in range(1, k):
+                am = eng.mtp.run([ds[-1]], q, [row if j == 1 else 0])
+                ds.append(am[0])
+                q += 1
+            return ds, eng.T_dec, False
+
+        drafts, Tm, from_ng = plan(d, p + 1, last_rows - 1)
         while n_out < max_new:
+            eng.use_T(Tm)
+            kk = len(drafts)
             y = eng.run_spec([cur] + drafts, p, a_prev)
             if eng.sampler is not None:
-                y = [eng._pick_row(r) for r in range(k + 1)]
+                y = [eng._pick_row(r) for r in range(kk + 1)]
             n = 0
-            while n < k and drafts[n] == y[n]:
+            while n < kk and drafts[n] == y[n]:
                 n += 1
             new = drafts[:n] + [y[n]]
             if stats is not None:
                 stats["steps"] += 1
                 stats["accepted"] += n
+                if from_ng:
+                    stats["ngram_steps"] += 1
+                    stats["ngram_accepted"] += n
             # committed to the main state: cur + drafts[:n]
             self.processed += [cur] + drafts[:n]
             stop = False
@@ -222,15 +287,12 @@ class Generator:
                 # the main state holds cur + drafts[:n]; the next prompt must re-feed from there
                 eng._a_prev = n + 1
                 return
-            am = eng.mtp.run(new, p + 1, list(range(n + 1)))
-            nd = [am[n]]
-            q = p + n + 2
-            for j in range(1, k):
-                am = eng.mtp.run([nd[-1]], q, [n if j == 1 else 0])
-                nd.append(am[0])
-                q += 1
+            if ng is not None:
+                ng.extend(new)
+            am = eng.mtp.run(new, p + 1, list(range(n + 1)))  # always (in this step's mode): fills the MTP KV
+            eng.use_T(eng.T_dec)
+            drafts, Tm, from_ng = plan(am[n], p + n + 2, n)
             cur = y[n]
             p = p + n + 1
-            drafts = nd
             a_prev = n + 1
         eng._a_prev = a_prev

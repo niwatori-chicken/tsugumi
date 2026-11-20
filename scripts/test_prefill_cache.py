@@ -12,7 +12,7 @@ from tsumi.generator import Generator
 dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
 try:
     eng = Qwen35Engine(dev, tsumi_paths.MODEL, Precision("bfp4"), f"{tsumi_paths.CACHE}/bfp4", max_seq=16384, log=lambda *a: None)
-    eng.init_spec(4, mtp=True); eng.init_prefill(32)
+    eng.init_spec(4, mtp=True, verify_T=8); eng.init_prefill(32); eng.init_verify(8)  # server configuration
     t0 = time.perf_counter(); eng.init_large_prefill(1024); print(f"[warmup] {time.perf_counter() - t0:.1f}s", flush=True)
     eng.capture_all()
     gen = Generator(eng)
