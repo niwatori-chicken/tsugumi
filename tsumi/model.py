@@ -14,6 +14,7 @@ from .gdn import GDNDecode, GDNWeights
 from .ops import DecodeLinear, has_cache
 
 _L1 = ttnn.L1_MEMORY_CONFIG
+TOPK = 64  # main-model logits kept per row for sampling (top_k is capped at this)
 LM_PREFIX = "model.language_model."
 
 
@@ -246,6 +247,8 @@ class MTPHead:
 class Qwen35Engine:
     def __init__(self, dev, model_dir, prec: Precision, cache_dir, max_seq=4096, n_layers=None, log=print):
         self.dev = dev
+        self.sampler = None  # set by Generator.generate for sampled decoding; None = greedy
+        self.last_topk = None
         cfg = json.load(open(os.path.join(model_dir, "config.json")))
         tc = cfg.get("text_config", cfg)
         self.cfg = tc
@@ -541,8 +544,8 @@ class Qwen35Engine:
             ttnn.deallocate(o)
             outs.append(o1)
         ttnn.deallocate(h)
-        logits, am = self._logits_argmax(outs)
-        return logits, am, hidden
+        logits, tk = self._logits_topk(outs)
+        return logits, tk, hidden
 
     def _lm_head_rows(self, h, chunks=None):
         outs = []
@@ -552,6 +555,30 @@ class Qwen35Engine:
             ttnn.deallocate(o)
             outs.append(o1)
         return outs
+
+    def _logits_topk(self, outs):
+        """Main-model rows -> (logits, (values, indices)) of the TOPK largest logits per row (all 32 rows; ~1.2 ms,
+        +0.8 ms over the argmax path). Greedy takes index 0; sampling works on the top-k on the host."""
+        logits = ttnn.concat(outs, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [1,1,32,V]
+        for o in outs:
+            ttnn.deallocate(o)
+        v, i = ttnn.topk(logits, TOPK, dim=-1, largest=True, sorted=True, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        return logits, (v, i)
+
+    def topk_to_host(self, tk, rows):
+        v, i = tk
+        return (ttnn.to_torch(v).reshape(-1, TOPK)[:rows].float(), ttnn.to_torch(i).reshape(-1, TOPK)[:rows].long())
+
+    @staticmethod
+    def _greedy(v, i):
+        """argmax with ttnn.argmax's tie-break (lowest token id among the equal bf16 maxima); topk orders ties
+        differently, and ties are common in bf16."""
+        return int(i[v == v[0]].min())
+
+    def _pick_row(self, r):
+        """Token for row r of the last top-k: greedy or the active sampler."""
+        v, i = self.last_topk
+        return self._greedy(v[r], i[r]) if self.sampler is None else self.sampler(v[r], i[r])
 
     def _logits_argmax(self, outs):
         logits = ttnn.concat(outs, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [1,1,32,V]
@@ -604,8 +631,9 @@ class Qwen35Engine:
             out = self.forward_spec()
         self.last_spec = out
         self._last_snap_all = (self.T != self.T_pre)
-        am = ttnn.to_torch(out[1]).reshape(-1)[: self.T]
-        return [int(v) for v in am]
+        self.last_topk = self.topk_to_host(out[1], self.T)
+        v, i = self.last_topk
+        return [self._greedy(v[r], i[r]) for r in range(self.T)]
 
     def prefill_spec(self, ids, start=0, with_mtp=False):
         """Chunked prefill of ids at positions start.. : full T_pre-row chunks first, the rest in T_dec rows.
@@ -622,8 +650,10 @@ class Qwen35Engine:
             n = min(T, len(ids) - pos, (self.T_pre - mis) if mis else T)
             self.use_T(T)
             chunk = ids[pos:pos + n]
-            am = self.run_spec(chunk, start + pos, a_prev)
-            last = am[len(chunk) - 1]
+            self.run_spec(chunk, start + pos, a_prev)
+            # the last chunk's pick is the next token (sampled if a sampler is set; earlier chunks draw nothing, so
+            # a seed gives the same text however the prompt is split); before the MTP run (it overwrites hid_src)
+            last = self._pick_row(len(chunk) - 1) if pos + len(chunk) == len(ids) else -1
             if with_mtp:
                 toks = [ids[pos + i + 1] if pos + i + 1 < len(ids) else last for i in range(len(chunk))]
                 mam = self.mtp.run(toks, start + pos + 1, list(range(len(chunk))))
@@ -650,7 +680,11 @@ class Qwen35Engine:
         if lp is None or len(ids) - k < 64:
             return self.prefill_spec(ids, start=start, with_mtp=with_mtp)
         if k:
-            self.prefill_spec(ids[:k], start=start, with_mtp=with_mtp)
+            smp, self.sampler = self.sampler, None  # only the final token is picked with the sampler
+            try:
+                self.prefill_spec(ids[:k], start=start, with_mtp=with_mtp)
+            finally:
+                self.sampler = smp
         return lp.run(ids[k:], start=start + k, with_mtp=with_mtp)
 
     def capture(self):

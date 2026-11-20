@@ -14,7 +14,7 @@
 | 最大文脈 | **155,648 トークン** (KV 用に DRAM 残り約 10GB) |
 | 12.4 万トークンのプロンプト | prefill 130 秒 (957 tok/s)、デコード 34 tok/s、needle テスト正解 |
 
-- 投機的デコードの出力は、通常の貪欲法 (1 トークンずつ) の出力と一致します (コードのプロンプトで確認)。
+- 投機的デコードの出力は、通常の貪欲法 (1 トークンずつ) の出力と一致します (コードのプロンプトで確認)。サンプリングも同じ分布です。
 - 短いプロンプトでは最初のトークンまで約 0.6 秒です。
 
 ## 仕組み
@@ -66,6 +66,8 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
 
 - `POST /v1/chat/completions` (stream 対応)、`GET /v1/models`、`GET /health`。1 リクエストずつ処理。
 - 思考は `chat_template_kwargs.enable_thinking` (既定 false)。`<think>` の中身は `reasoning_content` に分ける。
+- サンプリング: `temperature` > 0 で `top_p`、`top_k` (64 まで)、`min_p`、`seed` が効く。`temperature` がなければ貪欲法。
+  MTP の投機的デコードのまま厳密 (1 トークンずつ引いたのと同じ分布)。Qwen の推奨は thinking オフで 0.7 / 0.8 / 20、オンで 0.6 / 0.95 / 20。
 - ツール呼び出し: `tools` / `tool_choice` / 履歴の `tool_calls` と `role: tool` に対応 (OpenAI 形式、ストリーミングも)。
   モデルが出す `<tool_call>` の XML を `tool_calls` に変換する (`tsumi/toolcall.py`)。
   `tool_choice` は auto / none。required と関数名の指定は thinking オフのときだけ効く (応答の先頭を `<tool_call>` にする)。

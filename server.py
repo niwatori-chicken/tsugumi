@@ -3,7 +3,8 @@
     python server.py [--port 8010] [--max-seq 155648]
 
 Endpoints: POST /v1/chat/completions (stream or not), GET /v1/models, GET /health.
-Decoding is greedy (temperature/top_p are accepted but ignored). One request at a time.
+Decoding is greedy unless the request sets temperature > 0; then top_p, top_k (<= 64), min_p and seed apply
+(exact speculative sampling, tsumi/sampling.py). One request at a time.
 `chat_template_kwargs.enable_thinking` controls thinking (default: false); <think> content goes to
 `reasoning_content`. Other chat_template_kwargs (reasoning_effort, preserve_thinking) go to the template.
 Tool calling: `tools`, `tool_choice` (auto / none; required / a named function with thinking off), assistant
@@ -24,6 +25,7 @@ import uuid
 import faulthandler
 import tsumi.paths as tsumi_paths
 from tsumi.env import env
+from tsumi.sampling import Sampler
 from tsumi.toolcall import ToolStreamParser, forced_prefix, prepare_messages
 
 
@@ -74,10 +76,10 @@ class Backend:
         from tsumi.hang_kernel import run_hang_kernel
         run_hang_kernel(self.dev)
 
-    def _tokens(self, ids, max_new, stats):
+    def _tokens(self, ids, max_new, stats, sampler=None):
         """Generator tokens; re-arms the backstop per token. Device errors go to fail() and are re-raised."""
         try:
-            for t in self.gen.generate(ids, max_new=max_new, stats=stats):
+            for t in self.gen.generate(ids, max_new=max_new, stats=stats, sampler=sampler):
                 self._arm()
                 yield t
         except Exception as e:
@@ -91,7 +93,7 @@ class Backend:
             ids = ids["input_ids"]
         return ids
 
-    def stream(self, ids, max_new):
+    def stream(self, ids, max_new, sampler=None):
         """Yields (text_delta, done_info). Text is decoded incrementally; incomplete UTF-8 is held back."""
         out = []
         sent = ""
@@ -100,7 +102,7 @@ class Backend:
         t_first = None
         self._arm()
         try:
-            for t in self._tokens(ids, max_new, stats):
+            for t in self._tokens(ids, max_new, stats, sampler):
                 if t_first is None:
                     t_first = time.perf_counter()
                 if t in self.gen.eos:
@@ -216,12 +218,24 @@ def make_app(backend):
             return JSONResponse({"error": {"message": f"prompt too long ({len(ids)} tokens)"}}, status_code=400)
         rid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
+        temperature = float(body.get("temperature") or 0.0)
+        try:
+            if temperature > 0:
+                Sampler(temperature, body.get("top_p"), body.get("top_k"), body.get("min_p"), body.get("seed"))
+        except (TypeError, ValueError) as e:
+            return JSONResponse({"error": {"message": f"sampling parameters: {e}", "type": "invalid_request_error"}},
+                                status_code=400)
+
+        def make_sampler():  # per request; None = greedy
+            if temperature <= 0:
+                return None
+            return Sampler(temperature, body.get("top_p"), body.get("top_k"), body.get("min_p"), body.get("seed"))
 
         def events():
             """(field, value) pairs: reasoning_content / content text, tool_call dicts, then ("done", info)."""
             sp = ThinkSplitter(thinking)  # the template opens <think> itself when thinking is enabled
             tp = ToolStreamParser(tools, prefix=forced) if tools else None
-            for delta, done in backend.stream(ids, max_new):
+            for delta, done in backend.stream(ids, max_new, make_sampler()):
                 if done:
                     if tp:
                         yield from tp.finish()

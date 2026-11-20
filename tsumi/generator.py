@@ -145,7 +145,11 @@ class Generator:
         k = len(ids) - 1 - ids[::-1].index(self.im_start) if self.im_start in ids else -1
         can_snap = getattr(eng, "large", None) is not None and env("SNAPSHOT", "1") == "1"
         if can_snap and k > start:
-            eng.prefill(ids[start:k], start=start, with_mtp=True)
+            smp, eng.sampler = eng.sampler, None  # the first part's next token is not used
+            try:
+                eng.prefill(ids[start:k], start=start, with_mtp=True)
+            finally:
+                eng.sampler = smp
             t1 = time.perf_counter()
             self.snap = (list(ids[:k]), eng.large.save_state())
             t_snap = time.perf_counter() - t1
@@ -159,8 +163,19 @@ class Generator:
         self.processed = list(ids)
         return nxt, draft, eng._mtp_last_rows, info
 
-    def generate(self, ids, max_new=512, stats=None):
-        """Yields generated token ids (greedy, speculative with MTP)."""
+    def generate(self, ids, max_new=512, stats=None, sampler=None):
+        """Yields generated token ids (speculative with MTP drafts).
+
+        sampler=None is greedy. With a sampler (tsumi/sampling.py), every verified row is sampled from the main
+        model's top-k and a draft is accepted when the sample equals it. The drafts are deterministic (MTP argmax),
+        so this is exact speculative sampling: the output has the same distribution as sampling token by token."""
+        self.eng.sampler = sampler
+        try:
+            yield from self._generate(ids, max_new, stats)
+        finally:
+            self.eng.sampler = None
+
+    def _generate(self, ids, max_new, stats):
         eng, k = self.eng, self.k
         cur, d, last_rows, info = self._prefill(ids)
         if stats is not None:
@@ -181,6 +196,8 @@ class Generator:
             q += 1
         while n_out < max_new:
             y = eng.run_spec([cur] + drafts, p, a_prev)
+            if eng.sampler is not None:
+                y = [eng._pick_row(r) for r in range(k + 1)]
             n = 0
             while n < k and drafts[n] == y[n]:
                 n += 1
