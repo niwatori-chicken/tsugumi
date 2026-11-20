@@ -513,11 +513,13 @@ class LargePrefill:
         e.use_T(e.T_dec)
         if getattr(e, "hid_src", None) is not None:
             ttnn.copy(hl, e.hid_src)
-        logits, am = e._logits_argmax(e._lm_head_rows(hl))
+        logits, tk = e._logits_topk(e._lm_head_rows(hl))
         ttnn.deallocate(hl)
-        nxt = int(ttnn.to_torch(am).reshape(-1)[0])
+        e.last_topk = e.topk_to_host(tk, 1)
+        nxt = e._pick_row(0)  # before the MTP run (it overwrites hid_src)
         ttnn.deallocate(logits)
-        ttnn.deallocate(am)
+        for t in tk:
+            ttnn.deallocate(t)
         draft = None
         if with_mtp and e.mtp is not None:
             draft = e.mtp.run([nxt], pos, [0])[0]

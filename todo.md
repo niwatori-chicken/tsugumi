@@ -51,7 +51,7 @@
     (Qwen の `<tool_call>` 形式、ストリーミングでも)。`role: tool` の結果を履歴に入れる。
   - できたら、ツール呼び出しのベンチ (BFCL など) も評価に加える。
 
-- [ ] **3. サンプリング (temperature)**
+- [x] **3. サンプリング (temperature)** — 2026-11-20 完了。デバイスで top-64 → ホストで temperature / top_k / min_p / top_p / seed。下書きが決定的なので「引いた値が下書きと一致したら受理」で厳密。採択率は落ちない (2.2〜2.4/step)。`scripts/test_sampling.py`
   - 今は貪欲法のみ (temperature / top_p は受け取るが無視)。
   - 投機的サンプリング: 下書きを MTP の分布から引き、min(1, p/q) で受理する。デバイスで top-k を取ってホストで処理する案。
 
