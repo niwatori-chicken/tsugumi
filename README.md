@@ -120,6 +120,7 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
 | `TSUMI_CHUNKED_PREFILL=0` | (GQA を切ったとき) prefill で chunked SDPA を使わない |
 | `TSUMI_FUSED_GDN=0` | GDN 融合カーネルを使わず、元の op の並びで動かす |
 | `TSUMI_IMAGES=0` | 画像入力を切る (ViT を読み込まない。DRAM 0.52 GiB の節約) |
+| `TSUMI_CAPTURE_GUARD=1` | (デバッグ) リクエストや画像の符号化のたびに、トレース取得の後に新しくコンパイルしたプログラムや増えた DRAM がないかを調べ、あれば WARNING を出す (後のトレース再生でハングする原因になる) |
 | `TSUMI_VISION_DEVICE=0` | ViT を CPU で動かす (fp32、ホストの RAM 約 1.8GB、1024×1024 で約 14 秒) |
 | `TSUMI_IMAGE_MAX_PIXELS` / `TSUMI_IMAGE_MIN_PIXELS` | 画像を縮める上限 / 広げる下限のピクセル数 (既定 1,048,576 / 65,536)。上限を上げると起動時のウォームアップと DRAM の作業領域が増える |
 | `TSUMI_IMAGE_CACHE_TOKENS` | 符号化済みの画像を保持するトークン数 (既定 65,536、1 リクエストの画像はその半分まで) |

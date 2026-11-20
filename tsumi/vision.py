@@ -150,7 +150,7 @@ class VisionEncoder:
     on the device (tt: a tsumi.vision_tt.VisionTT, run under device_lock) or on the CPU (float32, HF model)."""
 
     def __init__(self, model_dir, max_pixels=None, min_pixels=None, threads=None, log=print, tt=None,
-                 device_lock=None, on_device_error=None):
+                 device_lock=None, on_device_error=None, after_device=None):
         from transformers import AutoConfig, AutoImageProcessor
         from transformers.initialization import no_init_weights
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
@@ -158,6 +158,7 @@ class VisionEncoder:
         t0 = time.time()
         cfg = AutoConfig.from_pretrained(model_dir).vision_config
         self.tt, self.device_lock, self.on_device_error = tt, device_lock, on_device_error
+        self.after_device = after_device
         self.model = None
         if tt is None:
             cfg._attn_implementation = "sdpa"
@@ -202,7 +203,10 @@ class VisionEncoder:
             self.tt.check(pv.shape[0])
             with self.device_lock:
                 try:
-                    return self.tt.forward(pv, g), hw
+                    out = self.tt.forward(pv, g)
+                    if self.after_device is not None:
+                        self.after_device("image encode")
+                    return out, hw
                 except Exception as e:
                     if self.on_device_error is not None:
                         self.on_device_error(e)

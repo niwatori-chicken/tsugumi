@@ -104,9 +104,13 @@ class Backend:
         if env("LARGE_PREFILL", "1") == "1":  # must come before capture_all
             with stage("large-T prefill and warm-up (compiles every chunk shape)"):
                 self.eng.init_large_prefill(int(env("LARGE_T", "1024")))
-        if self.vision_tt is not None:  # every image size bucket, compiled before the traces (tsumi/vision_tt.py)
+        # every image size bucket, compiled before the traces (tsumi/vision_tt.py); TSUMI_VISION_WARMUP=0 only to
+        # reproduce the hang (e.g. to check the capture guard)
+        if self.vision_tt is not None and env("VISION_WARMUP", "1") == "1":
             with stage("vision encoder warm-up"):
                 self.vision_tt.warmup(int(env("IMAGE_MAX_PIXELS", str(1 << 20))))
+        elif self.vision_tt is not None:
+            self.vision_tt.max_patches = 1 << 30
         with stage("trace capture"):
             self.eng.capture_all()
         self.gen = Generator(self.eng)
@@ -116,7 +120,7 @@ class Backend:
             from tsumi.vision import ImageTokens, VisionEncoder
             with stage("image preprocessing" + (" and CPU vision encoder" if self.vision_tt is None else "")):
                 self.vision = VisionEncoder(MODEL_DIR, log=log.info, tt=self.vision_tt, device_lock=self.lock,
-                                            on_device_error=self.fail)
+                                            on_device_error=self.fail, after_device=lambda w: self.check_capture(w))
             self.eng.images = ImageTokens(self.eng.n_embed, int(env("IMAGE_CACHE_TOKENS", "65536")))
         self.think_end = self.tok.convert_tokens_to_ids("</think>")
         self._force_ids = None
@@ -133,7 +137,33 @@ class Backend:
         self.active = None    # the running request: dict(id, prompt, generated, since)
         self.dead = None  # reason string once the device is considered hung
         self.backstop = int(env("HANG_BACKSTOP", "300"))
+        # debug (TSUMI_CAPTURE_GUARD=1): after each use of the device, warn when a program was compiled or DRAM stayed
+        # allocated after the trace capture: both have hung the device on a later trace replay (doc/11)
+        self.guard = None
+        if env("CAPTURE_GUARD", "0") == "1":
+            self.guard = dict(progs=self.dev.num_program_cache_entries(), dram=self._dram_used(), last=None)
+            log.info(f"capture guard: {self.guard['progs']} programs, {self.guard['dram'] / (1 << 20):.1f} MiB DRAM "
+                     f"after the trace capture")
         self.eng.progress = self._arm  # long prefills: re-armed per chunk, not only per generated token
+
+    def _dram_used(self):
+        import ttnn
+        v = ttnn.get_memory_view(self.dev, ttnn.BufferType.DRAM)
+        return v.total_bytes_allocated_per_bank * v.num_banks
+
+    def check_capture(self, where):
+        """Capture guard (debug): new programs / DRAM kept since the trace capture. Call with the device lock held."""
+        g = self.guard
+        if g is None or self.dead:
+            return
+        progs, dram = self.dev.num_program_cache_entries(), self._dram_used()
+        state = (progs - g["progs"], dram - g["dram"])
+        if state != g["last"] and (state[0] > 0 or state[1] > (1 << 20)):  # less DRAM than at the capture is fine
+            what = ([f"{state[0]} programs compiled"] if state[0] > 0 else []) + \
+                   ([f"{state[1] / (1 << 20):.1f} MiB more DRAM allocated"] if state[1] > (1 << 20) else [])
+            log.warning(f"capture guard ({where}): {' and '.join(what)} since the trace capture: risk of a hang on a "
+                        f"later trace replay (doc/11)")
+        g["last"] = state
 
     def _arm(self):
         faulthandler.dump_traceback_later(self.backstop, exit=True)
@@ -425,8 +455,12 @@ def make_app(backend):
             backend.waiting -= 1
 
     def release():
+        tag = (backend.active or {}).get("id", "?")
         backend.active = None
-        backend.lock.release()
+        try:
+            backend.check_capture(f"req {tag}")
+        finally:
+            backend.lock.release()
 
     def unavailable():
         return JSONResponse({"error": {"message": f"device error, server restarting: {backend.dead}",
