@@ -62,6 +62,18 @@
   - 手順: 単体カーネルとテスト → `tsumi/prefill.py` で環境変数で切り替え → PPL・needle・速度 → 既定化・マージ。
   - 上流への提案 (KV chain forwarding が causal / chunked では無効) の根拠にもなる。ユーザーが別途検証予定。
 
+- [ ] **4b. KV キャッシュの bfp8 化 → 最大文脈をモデル上限の 262,144 へ (ブランチを切って進める)**
+  - 今の KV は bf16、(16 attn + 1 MTP) 層 × K/V × 4 head × 256 = 68KiB/token。155,648 トークンで約 10.1GiB。
+  - bfp8 (1.0625 B/要素) なら 36.1KiB/token。**262,144 トークン (Qwen3.8-27B の上限) で約 9.0GiB** と、今の 155,648 トークン分より小さい。
+    残り約 1GiB は prefill の作業領域に回せる (max_seq と DRAM 断片化の問題、todo 6 も解消)。
+  - 長文脈のデコードも KV の読み出しが半分になる (124K で 34 tok/s、短い文脈は 47 tok/s)。
+  - 対応が要るもの:
+    - 自作カーネル 2 つ: `kernels/kv_write.cpp` (数行の書き込み → タイルの読み出し・書き直し)、`kernels/gqa_attn_reader.cpp` (bfp8 タイルの読み出し)。
+    - prefill 側: `paged_fill_cache`、chunked SDPA が bfp8 KV を受けるか確認 (tt_transformers は既定で bfp8 KV)。
+    - ホスト側のスナップショット / 会話切り替えは KV に触れないので影響なし。
+  - 確認: PPL・KL (bf16 KV と比較)、needle を 20 万トークン超で、品質ベンチの一部 (JCQA、MGSM)、デコード速度。
+  - 4 (prefill 用 attention カーネル) とは KV の読み方を共有するので、どちらを先にやるかで設計を合わせる。
+
 - [ ] **5. デコードの速度**
   - 本体の検証 1 回 56ms のうち、行列積以外が約 18ms。
   - 案: conv を GDN カーネルに取り込む (約 4ms)、GDN カーネルを 96 コアに分ける、MLP の gate/up の融合、
