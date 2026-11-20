@@ -4,7 +4,7 @@ only the second half is scored).  python scripts/eval_ppl.py IDS.pt OUT.pt [--pr
 IDS.pt: {name: LongTensor [N, C]}. Saves per chunk: target log-probs of scored positions and the top-K
 log-probs (values, indices) for KL against a reference (see ref_ppl.py)."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
 import argparse
 import math
 import time
@@ -12,8 +12,8 @@ import time
 import torch
 import ttnn
 
-import qe.paths as qe_paths
-from qe.model import Precision, Qwen35Engine
+import tsumi.paths as tsumi_paths
+from tsumi.model import Precision, Qwen35Engine
 
 
 def main():
@@ -32,7 +32,7 @@ def main():
     res = {}
     try:
         prec = Precision(a.prec, **dict(kv.split("=") for kv in a.set))
-        eng = Qwen35Engine(dev, qe_paths.MODEL, prec, f"{qe_paths.CACHE}/{a.cache or a.prec}", max_seq=C + 64,
+        eng = Qwen35Engine(dev, tsumi_paths.MODEL, prec, f"{tsumi_paths.CACHE}/{a.cache or a.prec}", max_seq=C + 64,
                            log=lambda *x: None)
         eng.init_spec(4, mtp=False)
         eng.init_prefill(32)

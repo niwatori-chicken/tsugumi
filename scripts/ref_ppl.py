@@ -6,15 +6,15 @@ the safetensors (the full model does not fit in host RAM). Same protocol and out
 All chunks go through layer i before layer i+1 is loaded; hidden states (N chunks x C x 5120 fp32) stay in RAM.
 """
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
 import argparse
 import math
 import time
 
 import torch
 
-import qe.paths as qe_paths
-from qe.model import LM_PREFIX, LazySD
+import tsumi.paths as tsumi_paths
+from tsumi.model import LM_PREFIX, LazySD
 
 
 def main():
@@ -32,9 +32,9 @@ def main():
     from transformers.models.qwen3_5.modeling_qwen3_5 import (Qwen3_5DecoderLayer, Qwen3_5RMSNorm,
                                                                Qwen3_5TextRotaryEmbedding)
 
-    cfg = AutoConfig.from_pretrained(qe_paths.MODEL).text_config
+    cfg = AutoConfig.from_pretrained(tsumi_paths.MODEL).text_config
     cfg._attn_implementation = "sdpa"
-    sd = LazySD(qe_paths.MODEL)
+    sd = LazySD(tsumi_paths.MODEL)
     data = torch.load(a.ids)
     names = list(data)
     ids = torch.cat([data[n] for n in names], 0)  # [N, C]

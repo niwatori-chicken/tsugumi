@@ -1,13 +1,14 @@
 """Needle test + speed at long context.  python scripts/longctx.py N_TOKENS"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
 import os, sys, time, random, glob
 import ttnn
-from qe.model import Precision, Qwen35Engine
-from qe.generator import Generator
+from tsumi.model import Precision, Qwen35Engine
+from tsumi.generator import Generator
 from transformers import AutoTokenizer
-import qe.paths as qe_paths
-MODEL = qe_paths.MODEL; CACHE = qe_paths.CACHE
+import tsumi.paths as tsumi_paths
+from tsumi.env import env
+MODEL = tsumi_paths.MODEL; CACHE = tsumi_paths.CACHE
 N = int(sys.argv[1])
 tok = AutoTokenizer.from_pretrained(MODEL)
 files = sorted(glob.glob(os.environ.get("TT_METAL_HOME", ".") + "/ttnn/cpp/ttnn/operations/**/*.hpp", recursive=True))
@@ -26,10 +27,10 @@ ids = ids if isinstance(ids, list) else ids["input_ids"]
 print(f"[prompt] {len(ids)} tokens", flush=True)
 dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
 try:
-    eng = Qwen35Engine(dev, MODEL, Precision("bfp4"), f"{CACHE}/bfp4", max_seq=int(os.environ.get("QE_MAX_SEQ", "163840")), log=lambda *a: None)
+    eng = Qwen35Engine(dev, MODEL, Precision("bfp4"), f"{CACHE}/bfp4", max_seq=int(env("MAX_SEQ", "163840")), log=lambda *a: None)
     eng.init_spec(4, mtp=True); eng.init_prefill(32)
-    if os.environ.get("QE_LARGE_PREFILL", "1") == "1":
-        eng.init_large_prefill(int(os.environ.get("QE_LARGE_T", "1024")))
+    if env("LARGE_PREFILL", "1") == "1":
+        eng.init_large_prefill(int(env("LARGE_T", "1024")))
     eng.capture_all()
     g = Generator(eng); st = {}; out = []; t0 = time.perf_counter(); t1 = None
     for t in g.generate(ids, max_new=int(sys.argv[2]) if len(sys.argv) > 2 else 60, stats=st):

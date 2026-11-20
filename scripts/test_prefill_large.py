@@ -1,18 +1,18 @@
 """Large-T prefill vs the T=32 path: next token, MTP draft, greedy continuation, timing.
   python scripts/test_prefill_large.py [N tokens] [t_max] [max_new]"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
 import sys, time, torch
 import ttnn
 from transformers import AutoTokenizer
-import qe.paths as qe_paths
-from qe.model import Precision, Qwen35Engine
-from qe.generator import Generator
+import tsumi.paths as tsumi_paths
+from tsumi.model import Precision, Qwen35Engine
+from tsumi.generator import Generator
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 2000
 TMAX = int(sys.argv[2]) if len(sys.argv) > 2 else 1024
 NEW = int(sys.argv[3]) if len(sys.argv) > 3 else 48
-tok = AutoTokenizer.from_pretrained(qe_paths.MODEL)
+tok = AutoTokenizer.from_pretrained(tsumi_paths.MODEL)
 text = open("/mnt/HDD/eval/ja_wiki.txt").read()
 body = tok.encode(text)[: N - 40]
 msgs = [{"role": "user", "content": tok.decode(body) + "\n\n上の文章を3文で要約してください。"}]
@@ -21,7 +21,7 @@ ids = ids if isinstance(ids, list) else ids["input_ids"]
 print("[prompt]", len(ids), flush=True)
 dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
 try:
-    eng = Qwen35Engine(dev, qe_paths.MODEL, Precision("bfp4"), f"{qe_paths.CACHE}/bfp4", max_seq=16384,
+    eng = Qwen35Engine(dev, tsumi_paths.MODEL, Precision("bfp4"), f"{tsumi_paths.CACHE}/bfp4", max_seq=16384,
                        log=lambda *a: None)
     eng.init_spec(4, mtp=True); eng.init_prefill(32); eng.init_large_prefill(TMAX)
     eng.capture_all(); eng.reset_spec()

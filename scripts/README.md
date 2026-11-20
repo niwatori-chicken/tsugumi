@@ -10,7 +10,7 @@
 
 - ttnn の venv
 - `TT_METAL_HOME`
-- `QE_MODEL_DIR` / `QE_CACHE_DIR`
+- `TSUMI_MODEL_DIR` / `TSUMI_CACHE_DIR`
 
 デバイスは 1 プロセスしか掴めないので、サーバーは止めてから実行してください。
 
@@ -21,7 +21,7 @@
 | `run_mtp.py --prompt "..."` | MTP 投機的デコード (貪欲法) で 1 プロンプト生成し、速度と位置ごとの採択率を表示 |
 | `run_spec_test.py` | T 行モード: chunked prefill と、1 行ずつ確定する貪欲デコード |
 | `run_gen.py` | T=1 の素のデコードで生成 (初期の経路) |
-| `longctx.py N [max_new] [質問]` | 長文脈の needle テストと速度。<br>`QE_MAX_SEQ`、`QE_LARGE_PREFILL`、`QE_LARGE_T` で設定を変える |
+| `longctx.py N [max_new] [質問]` | 長文脈の needle テストと速度。<br>`TSUMI_MAX_SEQ`、`TSUMI_LARGE_PREFILL`、`TSUMI_LARGE_T` で設定を変える |
 
 ## 正しさのテスト
 

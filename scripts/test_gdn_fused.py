@@ -1,6 +1,6 @@
 """Unit test: fused post-conv GDN kernel vs torch (random data). python scripts/test_gdn_fused.py T [steps]"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
 import sys
 import time
 
@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 import ttnn
 
-from qe.gdn_kernel import GDNFusedKernel
+from tsumi.gdn_kernel import GDNFusedKernel
 
 NK, NV, D = 16, 48, 128
 KD, VD = NK * D, NV * D

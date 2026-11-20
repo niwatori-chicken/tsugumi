@@ -4,7 +4,7 @@ python scripts/run_mtp.py [--T 4] [--max-new 200] [--prompt ...] [--no-trace] [-
 --compare: also run plain greedy (a=1 per step) and check the outputs are identical.
 """
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
 import argparse
 import faulthandler
 import signal
@@ -13,11 +13,11 @@ import time
 
 import ttnn
 
-from qe.model import Precision, Qwen35Engine
-import qe.paths as qe_paths
+from tsumi.model import Precision, Qwen35Engine
+import tsumi.paths as tsumi_paths
 
-MODEL = qe_paths.MODEL
-CACHE = qe_paths.CACHE
+MODEL = tsumi_paths.MODEL
+CACHE = tsumi_paths.CACHE
 EOS = (248046, 248044)
 
 

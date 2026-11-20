@@ -17,10 +17,11 @@ import time
 import torch
 import ttnn
 
+from .env import env
 from .page_copy import PageCopy
 
 DRAM = ttnn.DRAM_MEMORY_CONFIG
-_DEBUG = os.environ.get("QE_PREFILL_DEBUG", "0") == "1"
+_DEBUG = env("PREFILL_DEBUG", "0") == "1"
 
 
 def _dbg(dev, msg):
@@ -92,13 +93,13 @@ class LargePrefill:
 
     @classmethod
     def _mm(cls, x, lin, n=None):
-        """minimal_matmul on the decode weights; fp32 accumulation (env QE_PREFILL_MM_FP32=0: the decode config)."""
+        """minimal_matmul on the decode weights; fp32 accumulation (env TSUMI_PREFILL_MM_FP32=0: the decode config)."""
         f = lin.ck.math_fidelity
         ck = cls.MM_CK.get(f)
         if ck is None:
             import os
 
-            fp32 = os.environ.get("QE_PREFILL_MM_FP32", "1") == "1"
+            fp32 = env("PREFILL_MM_FP32", "1") == "1"
             ck = lin.ck if not fp32 else ttnn.WormholeComputeKernelConfig(
                 math_fidelity=f, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True)
             cls.MM_CK[f] = ck
@@ -184,7 +185,7 @@ class LargePrefill:
         o, fs = ttnn.transformer.chunk_gated_delta_rule(
             q, k, v, g2, b2, scale=m.scale, initial_state=self.state[i], output_final_state=True, chunk_size=32,
             eye=eye, tril=tril, ones=ones, masks=masks,
-            use_mcast=os.environ.get("QE_CGDR_MCAST", "1") == "1")
+            use_mcast=env("CGDR_MCAST", "1") == "1")
         _dbg(self.dev, 'cgdr done')
         for t in (q, k, v, g2, b2):
             ttnn.deallocate(t)

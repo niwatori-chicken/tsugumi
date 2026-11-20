@@ -8,12 +8,12 @@ Prompts follow llm-jp-eval's instructions for the JGLUE-style tasks. Per item: p
 Resumes: items already in OUT are skipped.
 """
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
 import argparse, json, random, re, time, unicodedata
 from collections import Counter
 
-_os.environ.setdefault("QE_MULTI_CONV", "0")  # every item is a fresh conversation
-_os.environ.setdefault("QE_SNAPSHOT", "0")
+_os.environ.setdefault("TSUMI_MULTI_CONV", "0")  # every item is a fresh conversation
+_os.environ.setdefault("TSUMI_SNAPSHOT", "0")
 D = "/mnt/HDD/eval/bench"
 
 
@@ -150,15 +150,15 @@ def main():
 
     import ttnn
     from transformers import AutoTokenizer
-    import qe.paths as qe_paths
-    from qe.model import Precision, Qwen35Engine
-    from qe.generator import Generator
+    import tsumi.paths as tsumi_paths
+    from tsumi.model import Precision, Qwen35Engine
+    from tsumi.generator import Generator
 
-    tok = AutoTokenizer.from_pretrained(qe_paths.MODEL)
+    tok = AutoTokenizer.from_pretrained(tsumi_paths.MODEL)
     dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
     try:
         prec = Precision(a.prec, **dict(kv.split("=") for kv in a.set))
-        eng = Qwen35Engine(dev, qe_paths.MODEL, prec, f"{qe_paths.CACHE}/{a.cache or a.prec}", max_seq=a.max_seq,
+        eng = Qwen35Engine(dev, tsumi_paths.MODEL, prec, f"{tsumi_paths.CACHE}/{a.cache or a.prec}", max_seq=a.max_seq,
                            log=lambda *x: None)
         eng.init_spec(4, mtp=True); eng.init_prefill(32); eng.init_large_prefill(1024); eng.capture_all()
         gen = Generator(eng)

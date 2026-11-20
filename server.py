@@ -14,11 +14,12 @@ import sys
 import threading
 import time
 import uuid
-import qe.paths as qe_paths
+import tsumi.paths as tsumi_paths
+from tsumi.env import env
 
 
-MODEL_DIR = qe_paths.MODEL
-CACHE = qe_paths.CACHE
+MODEL_DIR = tsumi_paths.MODEL
+CACHE = tsumi_paths.CACHE
 MODEL_NAME = "qwen3.8-27b-tt"
 
 
@@ -27,8 +28,8 @@ class Backend:
         import ttnn
         from transformers import AutoTokenizer
 
-        from qe.generator import Generator
-        from qe.model import Precision, Qwen35Engine
+        from tsumi.generator import Generator
+        from tsumi.model import Precision, Qwen35Engine
 
         self.tok = AutoTokenizer.from_pretrained(MODEL_DIR)
         self.dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
@@ -36,8 +37,8 @@ class Backend:
                                 log=lambda *a: None)
         self.eng.init_spec(T, mtp=True)
         self.eng.init_prefill(prefill_T)
-        if os.environ.get("QE_LARGE_PREFILL", "1") == "1":  # must come before capture_all
-            self.eng.init_large_prefill(int(os.environ.get("QE_LARGE_T", "1024")))
+        if env("LARGE_PREFILL", "1") == "1":  # must come before capture_all
+            self.eng.init_large_prefill(int(env("LARGE_T", "1024")))
         self.eng.capture_all()
         self.gen = Generator(self.eng)
         self.max_seq = max_seq

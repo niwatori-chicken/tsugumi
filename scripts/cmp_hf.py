@@ -3,7 +3,7 @@
 python scripts/cmp_hf.py --layers 4 [--prec mixed]
 """
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
 import argparse
 import json
 import sys
@@ -11,11 +11,11 @@ import sys
 import torch
 import ttnn
 
-from qe.model import LM_PREFIX, LazySD, Precision, Qwen35Engine
-import qe.paths as qe_paths
+from tsumi.model import LM_PREFIX, LazySD, Precision, Qwen35Engine
+import tsumi.paths as tsumi_paths
 
-MODEL = qe_paths.MODEL
-CACHE = qe_paths.CACHE
+MODEL = tsumi_paths.MODEL
+CACHE = tsumi_paths.CACHE
 
 
 def hf_logits(n_layers, ids):

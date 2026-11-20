@@ -7,7 +7,7 @@ Per language: PPL, its change vs the reference, mean KL(ref || run) over the ref
 and how often the argmax agrees with the reference.
 """
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
 import math
 import sys
 

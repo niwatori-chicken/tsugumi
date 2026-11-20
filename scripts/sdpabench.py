@@ -1,6 +1,6 @@
 """chunked SDPA: speed vs k_chunk at long context, and correctness when chunk start is not k_chunk-aligned."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
 import sys, time, torch, ttnn
 dev = ttnn.open_device(device_id=0, l1_small_size=24576)
 NH, NKV, HD, BS = 24, 4, 256, 64

@@ -1,21 +1,21 @@
 """Large-T attention (LargePrefill._attn) vs a torch fp32 reference with the dequantized weights (layer 3).
   python scripts/test_attn_large.py [T] [N]"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
 import json, sys, torch, ttnn
-import qe.paths as qe_paths
-from qe.attn import AttnDecode
-from qe.model import LazySD, Qwen35Engine
-from qe.prefill import LargePrefill
+import tsumi.paths as tsumi_paths
+from tsumi.attn import AttnDecode
+from tsumi.model import LazySD, Qwen35Engine
+from tsumi.prefill import LargePrefill
 
 T = int(sys.argv[1]) if len(sys.argv) > 1 else 1024
 N = int(sys.argv[2]) if len(sys.argv) > 2 else 2048
 dev = ttnn.open_device(device_id=0, trace_region_size=64 << 20, l1_small_size=24576)
 try:
-    tc = json.load(open(f"{qe_paths.MODEL}/config.json"))["text_config"]
-    sd = LazySD(qe_paths.MODEL)
+    tc = json.load(open(f"{tsumi_paths.MODEL}/config.json"))["text_config"]
+    sd = LazySD(tsumi_paths.MODEL)
     A = AttnDecode(dev, sd, "model.language_model.layers.3.self_attn.", tc, 4096, wdtype=ttnn.bfloat4_b,
-                   cache_prefix=f"{qe_paths.CACHE}/bfp4/L3.attn")
+                   cache_prefix=f"{tsumi_paths.CACHE}/bfp4/L3.attn")
     A.init_spec(4)
     e = Qwen35Engine.__new__(Qwen35Engine)
     e.HD, e.rope_dim, e.theta, e.H = 256, 64, 1e7, 5120

@@ -3,7 +3,7 @@
 python scripts/test_gdn_kernel.py T [steps] [--nofp32]
 """
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
 import sys
 import time
 
@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 import ttnn
 
-from qe.gdn_kernel import GDNRecKernel
+from tsumi.gdn_kernel import GDNRecKernel
 
 H, D = 48, 128
 

@@ -1,9 +1,9 @@
 """GQAAttention vs torch reference, with a shuffled page table (logical block b at physical perm[b]).
   python scripts/test_gqa.py [max_seq] [splits]"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
 import sys, time, torch, ttnn
-from qe.gqa_attn import GQAAttention
+from tsumi.gqa_attn import GQAAttention
 NH, NKV, HD, BS = 24, 4, 256, 64
 dev = ttnn.open_device(device_id=0, l1_small_size=24576)
 def ref(q, K, V, P0, T):

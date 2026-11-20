@@ -1,4 +1,6 @@
-# qe — Qwen3.8-27B を Tenstorrent P100A 1 枚で動かす B=1 推論エンジン
+# tsumi — Qwen3.8-27B を Tenstorrent P100A 1 枚で動かす B=1 推論エンジン
+
+名前はツミ (*Tachyspiza gularis*)、日本で一番小さいタカから。小さな構成で大きなモデルを速く動かす、という意味を込めています。
 
 27B の dense モデル (Gated DeltaNet 48 層 + full attention 16 層) を、Blackhole **P100A 1 枚 (28GB、448GB/s)** で
 バッチ 1 のまま速く動かすための、tt-metal / ttnn 上の小さな推論エンジンです。
@@ -20,21 +22,21 @@
 1 トークンあたりの時間の大半は重みの読み出しなので、(1) 読む量を減らし、(2) 1 回の読み出しで複数トークンを処理し、
 (3) 行列積以外の小さな op の固定費を削る、の 3 つで速くしています。
 
-- **bfp4 の DRAM シャーディング行列積** (`qe/ops.py`): 重みを 7 バンクに分けて流し読み。
+- **bfp4 の DRAM シャーディング行列積** (`tsumi/ops.py`): 重みを 7 バンクに分けて流し読み。
   ワーカー数 3・in0_block_w=2 で公称帯域の 93% (約 415GB/s)。全部 bfp4 で行列積だけ約 38ms/ステップ。
-- **GDN 融合カーネル** (`kernels/gdn_fused_*.cpp`、`qe/gdn_kernel.py`): conv 以降の
+- **GDN 融合カーネル** (`kernels/gdn_fused_*.cpp`、`tsumi/gdn_kernel.py`): conv 以降の
   L2 正規化 → T トークン分の DeltaNet 再帰 → gated RMSNorm を 1 本のカーネルで行う (値ヘッド 1 つに 1 コア)。
   各トークン後の状態をスロットに残すので、投機的デコードで「確定した位置」から次を再開できる。
 - **T 行モード** (`forward_spec`): T 行のトークンをまとめて流す。検証は T=4 (下書き 3 個)、prefill は T=32。
   conv の履歴はホストが書く 0/1 の選択行列との行列積でずらすので、トレースを固定したまま採択数に追従できる。
-- **MTP 投機的デコード** (`MTPHead`、`qe/generator.py`): 付属の MTP 層で 3 トークン先まで下書きし、本体で一括検証。
+- **MTP 投機的デコード** (`MTPHead`、`tsumi/generator.py`): 付属の MTP 層で 3 トークン先まで下書きし、本体で一括検証。
   下書き用には lm_head の bfp4 の複製を使う。
-- **GQA split-K アテンション** (`kernels/gqa_attn_*.cpp`、`gqa_comb_*.cpp`、`qe/gqa_attn.py`):
+- **GQA split-K アテンション** (`kernels/gqa_attn_*.cpp`、`gqa_comb_*.cpp`、`tsumi/gqa_attn.py`):
   KV ヘッド 4 × 区間 27 = 108 コアが、担当区間の KV を 1 回だけ読み、同じ KV ヘッドを使う 6 q ヘッド × T 行を
   まとめて計算 (online softmax)。部分結果を別の op で合成する。区間とチャンク数は実行時に位置から決まるのでトレース可能。
   12.4 万トークンの文脈で 4 行の検証が 1 層 1.7ms (DRAM 帯域の下限 1.27ms 付近)。
   ttnn の decode SDPA に T 行を「T ユーザー」として渡す方式 (5.6ms) や chunked SDPA (32 行で 15ms) の置き換え。
-- **大きい T の prefill** (`qe/prefill.py`): プロンプトは最大 1024 行ずつ、`minimal_matmul` (同じ bfp4 重み)、
+- **大きい T の prefill** (`tsumi/prefill.py`): プロンプトは最大 1024 行ずつ、`minimal_matmul` (同じ bfp4 重み)、
   チャンク並列の GDN (`ttnn.transformer.chunk_gated_delta_rule`)、自作の因果 conv カーネル (`kernels/conv_*.cpp`)、
   chunked SDPA で流す。終わったら GDN の状態と conv 履歴を T 行モードの形式に戻して、そのままデコードに入る。
 - **KV 書き込みカーネル** (`kernels/kv_write.cpp`): T 行の K/V をページ KV に競合なく書く。
@@ -53,8 +55,8 @@
 ```bash
 source /path/to/tt-metal/python_env/bin/activate      # ttnn が入っている環境
 export TT_METAL_HOME=/path/to/tt-metal PYTHONPATH=/path/to/tt-metal
-export QE_MODEL_DIR=/path/to/Qwen3.8-27B             # HF 形式のモデル
-export QE_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みのキャッシュ (初回に作られる、約 8 分)
+export TSUMI_MODEL_DIR=/path/to/Qwen3.8-27B             # HF 形式のモデル
+export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みのキャッシュ (初回に作られる、約 8 分)
 
 # OpenAI 互換サーバー (127.0.0.1:8010)
 python server.py --port 8010 [--max-seq 159744]
@@ -66,17 +68,17 @@ python server.py --port 8010 [--max-seq 159744]
 - 思考は `chat_template_kwargs.enable_thinking` (既定 false)。`<think>` の中身は `reasoning_content` に分ける。
 - 起動は約 20 秒 (キャッシュがページキャッシュにあるとき)。
 
-環境変数:
+環境変数 (旧名の `QE_...` も引き続き読めます):
 
 | 変数 | 意味 |
 |---|---|
-| `QE_MODEL_DIR` / `QE_CACHE_DIR` | モデルと変換済み重みの場所 (`qe/paths.py`) |
-| `QE_LARGE_PREFILL=0` / `QE_LARGE_T` | 大きい T の prefill を使わない (T=32 の旧経路) / 1 チャンクの最大行数 (既定 1024) |
-| `QE_MULTI_CONV=0` / `QE_MAX_CONVS` | 複数の会話を保持しない / 保持する会話数の上限 (既定 8、ホストに 1 会話約 180MB) |
-| `QE_SNAPSHOT=0` | 会話の再利用用の状態スナップショットを取らない |
-| `QE_GQA_ATTN=0` | 自作の GQA アテンションを使わず、ttnn の SDPA に戻す |
-| `QE_CHUNKED_PREFILL=0` | (GQA を切ったとき) prefill で chunked SDPA を使わない |
-| `QE_FUSED_GDN=0` | GDN 融合カーネルを使わず、元の op の並びで動かす |
+| `TSUMI_MODEL_DIR` / `TSUMI_CACHE_DIR` | モデルと変換済み重みの場所 (`tsumi/paths.py`) |
+| `TSUMI_LARGE_PREFILL=0` / `TSUMI_LARGE_T` | 大きい T の prefill を使わない (T=32 の旧経路) / 1 チャンクの最大行数 (既定 1024) |
+| `TSUMI_MULTI_CONV=0` / `TSUMI_MAX_CONVS` | 複数の会話を保持しない / 保持する会話数の上限 (既定 8、ホストに 1 会話約 180MB) |
+| `TSUMI_SNAPSHOT=0` | 会話の再利用用の状態スナップショットを取らない |
+| `TSUMI_GQA_ATTN=0` | 自作の GQA アテンションを使わず、ttnn の SDPA に戻す |
+| `TSUMI_CHUNKED_PREFILL=0` | (GQA を切ったとき) prefill で chunked SDPA を使わない |
+| `TSUMI_FUSED_GDN=0` | GDN 融合カーネルを使わず、元の op の並びで動かす |
 
 ## 制限
 
@@ -93,13 +95,13 @@ python server.py --port 8010 [--max-seq 159744]
 
 | ファイル | 内容 |
 |---|---|
-| `qe/model.py` | エンジン本体 (`Qwen35Engine`、`MTPHead`、T 行モード、トレース、prefill) |
-| `qe/generator.py` | MTP 投機的デコードの生成ループ |
-| `qe/ops.py` | DRAM シャーディングの bfp4/bfp8 行列積、重みの変換とキャッシュ |
-| `qe/gdn.py`、`qe/gdn_kernel.py` | Gated DeltaNet 層と融合カーネルの起動 |
-| `qe/attn.py`、`qe/gqa_attn.py`、`qe/kv_kernel.py` | attention 層、GQA split-K アテンション、KV 書き込み |
-| `qe/kvpager.py` | KV ブロックのプールとページ表 (複数の会話) |
-| `qe/prefill.py`、`qe/conv_kernel.py`、`qe/page_copy.py` | 大きい T の prefill、因果 conv カーネル、ページコピー |
+| `tsumi/model.py` | エンジン本体 (`Qwen35Engine`、`MTPHead`、T 行モード、トレース、prefill) |
+| `tsumi/generator.py` | MTP 投機的デコードの生成ループ |
+| `tsumi/ops.py` | DRAM シャーディングの bfp4/bfp8 行列積、重みの変換とキャッシュ |
+| `tsumi/gdn.py`、`tsumi/gdn_kernel.py` | Gated DeltaNet 層と融合カーネルの起動 |
+| `tsumi/attn.py`、`tsumi/gqa_attn.py`、`tsumi/kv_kernel.py` | attention 層、GQA split-K アテンション、KV 書き込み |
+| `tsumi/kvpager.py` | KV ブロックのプールとページ表 (複数の会話) |
+| `tsumi/prefill.py`、`tsumi/conv_kernel.py`、`tsumi/page_copy.py` | 大きい T の prefill、因果 conv カーネル、ページコピー |
 | `kernels/*.cpp` | 自作カーネル (generic_op で起動) |
 | `server.py` | OpenAI 互換サーバー |
 | `scripts/` | 開発用のテスト・計測・perplexity 評価 (使い方は [`scripts/README.md`](scripts/README.md)) |

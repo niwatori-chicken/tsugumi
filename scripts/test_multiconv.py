@@ -6,15 +6,15 @@
 Also prints reuse kind, switch time, TTFT and program cache growth after the trace capture.
   python scripts/test_multiconv.py"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import qe`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
 import faulthandler, time, ttnn
 faulthandler.dump_traceback_later(1500, exit=True)
 from transformers import AutoTokenizer
-import qe.paths as qe_paths
-from qe.model import Precision, Qwen35Engine
-from qe.generator import Generator
+import tsumi.paths as tsumi_paths
+from tsumi.model import Precision, Qwen35Engine
+from tsumi.generator import Generator
 
-tok = AutoTokenizer.from_pretrained(qe_paths.MODEL)
+tok = AutoTokenizer.from_pretrained(tsumi_paths.MODEL)
 enc = lambda m: (lambda x: x if isinstance(x, list) else x["input_ids"])(
     tok.apply_chat_template(m, add_generation_prompt=True, enable_thinking=False))
 wiki = open("/mnt/HDD/eval/ja_wiki.txt").read()
@@ -56,7 +56,7 @@ def run_schedule(gen, schedule, dev, base, label):
 
 def engine(max_seq):
     dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
-    eng = Qwen35Engine(dev, qe_paths.MODEL, Precision("bfp4"), f"{qe_paths.CACHE}/bfp4", max_seq=max_seq,
+    eng = Qwen35Engine(dev, tsumi_paths.MODEL, Precision("bfp4"), f"{tsumi_paths.CACHE}/bfp4", max_seq=max_seq,
                        log=lambda *a: None)
     eng.init_spec(4, mtp=True); eng.init_prefill(32); eng.init_large_prefill(1024); eng.capture_all()
     return dev, eng

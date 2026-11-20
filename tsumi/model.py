@@ -9,6 +9,7 @@ import ttnn
 from safetensors import safe_open
 
 from .attn import AttnDecode
+from .env import env
 from .gdn import GDNDecode, GDNWeights
 from .ops import DecodeLinear, has_cache
 
@@ -100,7 +101,7 @@ class SpecShared:
         self.cur_pos_rows = [ttnn.from_torch(torch.zeros(1, dtype=torch.int32), dtype=ttnn.int32, device=dev)
                              for _ in range(T)]
         self.gqa = None
-        if os.environ.get("QE_GQA_ATTN", "1") == "1":
+        if env("GQA_ATTN", "1") == "1":
             from .gqa_attn import GQAAttention
 
             self.gqa = GQAAttention(dev, T, HD=HD, block_size=block_size, nblocks=nb)
@@ -333,10 +334,10 @@ class Qwen35Engine:
         self.inv_freq = inv
         self.trace_id = None
         self.logits_out = None
-        self.fused_gdn = os.environ.get('QE_FUSED_GDN', '1') == '1'
-        # chunked SDPA prefill (needs aligned chunk starts); superseded by the GQA kernel (QE_GQA_ATTN=1)
-        self._chunked_prefill = os.environ.get('QE_CHUNKED_PREFILL', '1') == '1' and \
-            os.environ.get('QE_GQA_ATTN', '1') != '1'
+        self.fused_gdn = env('FUSED_GDN', '1') == '1'
+        # chunked SDPA prefill (needs aligned chunk starts); superseded by the GQA kernel (TSUMI_GQA_ATTN=1)
+        self._chunked_prefill = env('CHUNKED_PREFILL', '1') == '1' and \
+            env('GQA_ATTN', '1') != '1'
         self._kv_rowwise = False
 
     # ---- host-side step inputs ----
@@ -443,7 +444,7 @@ class Qwen35Engine:
         self.T_pre = None
         self.mtp = None
         if mtp:
-            mp = os.environ.get("QE_MTP_PREC", "bfp4")
+            mp = env("MTP_PREC", "bfp4")
             if mp == "bfp8":
                 prec = Precision("bfp4", mlp_gu="bfp8", mlp_down="bfp8", attn_qkvg="bfp8", attn_o="bfp8")
                 cache = self.cache_dir.rsplit("/", 1)[0] + "/mtp_bfp8"
@@ -635,7 +636,7 @@ class Qwen35Engine:
         return last, start + pos, draft
 
     def init_large_prefill(self, t_max=1024):
-        """Large-T prompt prefill (qe/prefill.py); used by prefill() for prompts of 64+ tokens."""
+        """Large-T prompt prefill (tsumi/prefill.py); used by prefill() for prompts of 64+ tokens."""
         from .prefill import LargePrefill
 
         self.large = LargePrefill(self, t_max=t_max)

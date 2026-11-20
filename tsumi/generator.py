@@ -5,6 +5,8 @@ Greedy (temperature 0) is exact: the output equals plain greedy decoding of the 
 import os
 import time
 
+from .env import env
+
 EOS_DEFAULT = (248046, 248044)
 IM_START = 248045
 
@@ -39,8 +41,8 @@ class Generator:
         self.eos = set(eos)
         self.im_start = im_start
         self.k = eng.T_dec - 1
-        self.multi = getattr(eng, "large", None) is not None and os.environ.get("QE_MULTI_CONV", "1") == "1"
-        self.max_convs = max_convs or int(os.environ.get("QE_MAX_CONVS", "8"))
+        self.multi = getattr(eng, "large", None) is not None and env("MULTI_CONV", "1") == "1"
+        self.max_convs = max_convs or int(env("MAX_CONVS", "8"))
         self.convs = []
         self.cur = None
         self.tick = 0
@@ -140,7 +142,7 @@ class Generator:
         self.cur.last_used = self.tick
         t_switch = time.perf_counter() - t0
         k = len(ids) - 1 - ids[::-1].index(self.im_start) if self.im_start in ids else -1
-        can_snap = getattr(eng, "large", None) is not None and os.environ.get("QE_SNAPSHOT", "1") == "1"
+        can_snap = getattr(eng, "large", None) is not None and env("SNAPSHOT", "1") == "1"
         if can_snap and k > start:
             eng.prefill(ids[start:k], start=start, with_mtp=True)
             t1 = time.perf_counter()
