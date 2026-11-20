@@ -2,13 +2,18 @@
 
     python server.py [--port 8010] [--max-seq 262144]
 
-Endpoints: POST /v1/chat/completions (stream or not), GET /v1/models, GET /health, GET / (a minimal chat web UI).
+Endpoints: POST /v1/chat/completions and /v1/completions (stream or not), POST /tokenize and /detokenize,
+GET /v1/models, GET /health, GET / (a minimal chat web UI).
 Decoding is greedy unless the request sets temperature > 0; then top_p, top_k (<= 64), min_p and seed apply
 (exact speculative sampling, tsumi/sampling.py). One request at a time.
 `chat_template_kwargs.enable_thinking` controls thinking (default: false); <think> content goes to
-`reasoning_content`. Other chat_template_kwargs (reasoning_effort, preserve_thinking) go to the template.
+`reasoning_content`. `thinking_budget` (or chat_template_kwargs.thinking_budget; default --thinking-budget) caps
+the thinking tokens: at the cap a closing sentence and </think> are inserted (THINK_FORCE), and max_tokens then
+counts the answer only. Other chat_template_kwargs (reasoning_effort, preserve_thinking) go to the template.
 Tool calling: `tools`, `tool_choice` (auto / none; required / a named function with thinking off), assistant
 `tool_calls` and `role: tool` messages in the history; calls are returned as `tool_calls` (tsumi/toolcall.py).
+`logprobs` / `top_logprobs` (<= 20; completions: logprobs = n): log-softmax over the device top-64 logits (a
+little too high; tokens outside it, only forced ones, get -9999); chat logprobs cover the content, not the thinking.
 
 Shutdown (SIGINT / SIGTERM): stop accepting requests, end a running generation at its next token, close the device.
 
@@ -38,6 +43,10 @@ CACHE = tsumi_paths.CACHE
 MODEL_NAMES = [os.path.basename(os.path.normpath(MODEL_DIR))]  # set from --served-model-name in main()
 log = get_logger()
 EXIT_HANG = 75
+# inserted when the thinking reaches its budget (the wording Qwen suggests for budget-capped thinking)
+THINK_FORCE = ("\n\nConsidering the limited time by the user, I have to give the solution based on the thinking "
+               "directly now.\n</think>\n\n")
+THINK_BUDGET = [None]  # server default (--thinking-budget); None = no cap
 # must be set before tt-metal reads its runtime options (first ttnn import)
 os.environ.setdefault("TT_METAL_OPERATION_TIMEOUT_SECONDS", "30")
 
@@ -90,6 +99,10 @@ class Backend:
         with stage("trace capture"):
             self.eng.capture_all()
         self.gen = Generator(self.eng)
+        self.think_end = self.tok.convert_tokens_to_ids("</think>")
+        self._force_ids = None
+        self._tok_cache = {}
+        self._byte_dec = byte_decoder()
         v = ttnn.get_memory_view(self.dev, ttnn.BufferType.DRAM)
         G = 1 << 30
         log.info(f"DRAM: used {v.total_bytes_allocated_per_bank * v.num_banks / G:.2f} GiB, "
@@ -134,10 +147,11 @@ class Backend:
         from tsumi.hang_kernel import run_hang_kernel
         run_hang_kernel(self.dev)
 
-    def _tokens(self, ids, max_new, stats, sampler=None):
+    def _tokens(self, ids, max_new, stats, sampler=None, think=None, row_cb=None):
         """Generator tokens; re-arms the backstop per token. Device errors go to fail() and are re-raised."""
         try:
-            for t in self.gen.generate(ids, max_new=max_new, stats=stats, sampler=sampler):
+            for t in self.gen.generate(ids, max_new=max_new, stats=stats, sampler=sampler, think=think,
+                                       row_cb=row_cb):
                 self._arm()
                 yield t
         except Exception as e:
@@ -151,9 +165,32 @@ class Backend:
             ids = ids["input_ids"]
         return ids
 
-    def stream(self, ids, max_new, sampler=None, stop_check=None):
-        """Yields (text_delta, done_info). Text is decoded incrementally (only the last few tokens are re-decoded,
-        so long replies stay O(n)); incomplete UTF-8 is held back."""
+    def think_budget(self, budget):
+        """ThinkBudget for a request (tsumi/generator.py): THINK_FORCE text then </think>."""
+        from tsumi.generator import ThinkBudget
+        if self._force_ids is None:
+            self._force_ids = self.tok.encode(THINK_FORCE, add_special_tokens=False)
+        return ThinkBudget(budget, self.think_end, self._force_ids)
+
+    def token_info(self, t):
+        """(text, bytes) of one token, cached."""
+        r = self._tok_cache.get(t)
+        if r is None:
+            piece = self.tok.convert_ids_to_tokens(t)
+            try:  # byte-level BPE pieces map back to the raw bytes
+                b = bytes(self._byte_dec[c] for c in piece)
+            except (KeyError, TypeError):  # special tokens
+                b = (piece or "").encode()
+            r = self._tok_cache[t] = (b.decode("utf-8", errors="replace"), list(b))
+        return r
+
+    def stream(self, ids, max_new, sampler=None, stop_check=None, think=None, rows=False):
+        """Yields (text_delta, done_info, token rows). Text is decoded incrementally (only the last few tokens are
+        re-decoded, so long replies stay O(n)); incomplete UTF-8 is held back. With rows=True, the token rows of each
+        delta are (token, top-k logits, top-k ids) of the tokens it covers (for logprobs), else []."""
+        import collections
+        rowq = collections.deque() if rows else None
+        pending = []
         out = []
         stats = {}
         t0 = time.perf_counter()
@@ -162,22 +199,27 @@ class Backend:
         prefix_off = read_off = 0  # decode out[prefix_off:] and emit what goes beyond out[prefix_off:read_off]
         stopped = False
         self._arm()
-        toks = self._tokens(ids, max_new, stats, sampler)
+        toks = self._tokens(ids, max_new, stats, sampler, think,
+                            (lambda v, i: rowq.append((v, i))) if rows else None)
         try:
             for t in toks:
+                row = rowq.popleft() if rows else None
                 if t_first is None:
                     t_first = time.perf_counter()
                 if t in self.gen.eos:
                     eos = True
                     continue  # let the generator finish so it records the committed state
                 out.append(t)
+                if rows:
+                    pending.append((t,) + row)
                 prefix = self.tok.decode(out[prefix_off:read_off])
                 text = self.tok.decode(out[prefix_off:])
                 if text.endswith("\ufffd") or len(text) <= len(prefix):
                     continue
                 if self.active is not None:
                     self.active["generated"] = len(out)
-                yield text[len(prefix):], None
+                yield text[len(prefix):], None, pending
+                pending = []
                 prefix_off, read_off = read_off, len(out)
                 if self.stopping or (stop_check is not None and stop_check()):  # stop string / shutdown
                     stopped = True
@@ -187,16 +229,30 @@ class Backend:
             faulthandler.cancel_dump_traceback_later()
         prefix = self.tok.decode(out[prefix_off:read_off])
         text = self.tok.decode(out[prefix_off:])
-        if len(text) > len(prefix):
-            yield text[len(prefix):], None
+        if len(text) > len(prefix) or pending:
+            yield text[len(prefix):], None, pending
         dt = time.perf_counter() - (t_first or t0)
         steps = max(stats.get("steps", 0), 1)
-        yield "", dict(prompt_tokens=len(ids), completion_tokens=len(out), reused=stats.get("reused", 0),
+        th = dict(think_tokens=stats.get("think_tokens", 0), think_forced=stats.get("think_forced", False)) \
+            if think is not None else {}
+        yield "", dict(**th,prompt_tokens=len(ids), completion_tokens=len(out), reused=stats.get("reused", 0),
                        reuse=stats.get("reuse"), switched=stats.get("switched", False),
                        ttft=(t_first or t0) - t0, decode_tps=len(out) / dt if dt > 0 else 0.0,
                        tokens_per_step=(stats.get("accepted", 0) + steps) / steps,
                        ngram_steps=stats.get("ngram_steps", 0), steps=stats.get("steps", 0),
-                       finish="stop" if eos or stopped else "length", total=time.perf_counter() - t0)
+                       finish="stop" if eos or stopped else "length", total=time.perf_counter() - t0), []
+
+
+def byte_decoder():
+    """Inverse of the GPT-2 byte-level BPE alphabet (piece character -> byte)."""
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+    cs, n = list(bs), 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return {chr(c): b for b, c in zip(bs, cs)}
 
 
 class StopMatcher:
@@ -266,6 +322,8 @@ def log_done(tag, info, ncalls=0):
         if info.get("reused") else "no reuse"
     ng = f", n-gram {info['ngram_steps']}/{info['steps']} steps" if info.get("ngram_steps") else ""
     fin = "tool_calls" if ncalls else info["finish"]
+    if "think_tokens" in info:
+        ng += f", thinking {info['think_tokens']} tok" + (" (budget reached)" if info["think_forced"] else "")
     log.info(f"req {tag}: done, {fin}; prompt {info['prompt_tokens']} ({reuse}), ttft {info['ttft']:.2f}s, "
              f"{info['completion_tokens']} tok {info['decode_tps']:.1f} tok/s {info['tokens_per_step']:.2f} tok/step"
              f"{ng}" + (f", {ncalls} tool call{'s' if ncalls > 1 else ''}" if ncalls else "") +
@@ -338,6 +396,133 @@ def make_app(backend):
         return {"object": "list", "data": [{"id": n, "object": "model", "created": started, "owned_by": "tsumi",
                                             "meta": meta} for n in MODEL_NAMES]}
 
+    def bad_request(msg):
+        return JSONResponse({"error": {"message": msg, "type": "invalid_request_error"}}, status_code=400)
+
+    def logprob_entries(rows, top_n):
+        """Chat-format logprobs for (token, top-k logits, top-k ids) rows. The softmax is taken over the device
+        top-k (64) only, so the values are slightly too high; a token outside it (a forced one) gets -9999."""
+        import torch
+        res = []
+        for t, v, i in rows:
+            lp = v.double() - torch.logsumexp(v.double(), 0)
+            hit = (i == t).nonzero()
+            text, b = backend.token_info(t)
+            e = dict(token=text, logprob=float(lp[hit[0, 0]]) if len(hit) else -9999.0, bytes=b)
+            e["top_logprobs"] = [dict(token=backend.token_info(int(i[j]))[0], logprob=float(lp[j]),
+                                      bytes=backend.token_info(int(i[j]))[1]) for j in range(min(top_n, len(i)))]
+            res.append(e)
+        return res
+
+    def common(body, ids, tag, params, max_default):
+        """Shared request checks: (max_new, sampler factory, stops, think budget, error response or None)."""
+        max_new = int(body.get("max_tokens") or body.get("max_completion_tokens") or max_default)
+        temperature = float(body.get("temperature") or 0.0)
+        try:
+            if temperature > 0:
+                Sampler(temperature, body.get("top_p"), body.get("top_k"), body.get("min_p"), body.get("seed"))
+        except (TypeError, ValueError) as e:
+            return None, None, None, None, bad_request(f"sampling parameters: {e}")
+        room = backend.max_seq - len(ids) - 8
+        if room < 1:
+            return None, None, None, None, bad_request(f"prompt too long ({len(ids)} tokens)")
+        think = params.pop("_think", None)
+        if think is not None:  # answer tokens + thinking (budget, forced tokens, one step of overshoot) must fit
+            room -= len(think.force) + 8
+            think.budget = max(0, min(think.budget, room - 1))
+            room -= think.budget
+        max_new = max(1, min(max_new, room))
+
+        def make_sampler():  # per request; None = greedy
+            if temperature <= 0:
+                return None
+            return Sampler(temperature, body.get("top_p"), body.get("top_k"), body.get("min_p"), body.get("seed"))
+
+        stops = body.get("stop")
+        p = [f"prompt {len(ids)} tok", f"max {max_new}"] + params.pop("_pre", [])
+        if think is not None:
+            p.append(f"thinking budget {think.budget}")
+        if temperature > 0:
+            p.append(f"temp {temperature}")
+        p += params.pop("_post", [])
+        if stops:
+            p.append(f"stop {len([stops] if isinstance(stops, str) else stops)}")
+        if body.get("logprobs"):
+            p.append("logprobs")
+        if body.get("stream"):
+            p.append("stream")
+        ignored = [k for k in ("presence_penalty", "frequency_penalty", "response_format", "logit_bias", "echo",
+                               "suffix", "best_of") if body.get(k) not in (None, False, 0, 1, [], "")] + \
+            (["n"] if (body.get("n") or 1) > 1 else [])
+        busy = backend.lock.locked()
+        log.info(f"req {tag}: {', '.join(p)}" + (f" (waiting: busy, {backend.waiting} ahead)" if busy else "") +
+                 (f"; ignored parameters: {', '.join(ignored)}" if ignored else ""))
+        return max_new, make_sampler, stops, think, None
+
+    def usage(info):
+        return dict(prompt_tokens=info["prompt_tokens"], completion_tokens=info["completion_tokens"],
+                    total_tokens=info["prompt_tokens"] + info["completion_tokens"])
+
+    def error_event():
+        return "data: " + json.dumps({"error": {"message": f"device error: {backend.dead}"}}) + "\n\n"
+
+    def streaming(req, tag, n_prompt, gen):
+        """SSE response for a blocking generator of SSE strings that runs with the device lock held."""
+        async def agen():
+            """Runs the blocking generator in worker threads, one chunk at a time, so the event loop stays free.
+            When the client disconnects, Starlette cancels this task: the finally closes the generator, which
+            ends the generation where it is and releases the device lock (left suspended, it would hold the
+            lock until garbage collection)."""
+            if not await acquire(req, tag, n_prompt):
+                return
+            it = gen()
+            step_lock = threading.Lock()  # held while a worker thread runs one step of `it`
+
+            def step():
+                with step_lock:
+                    return next(it, None)
+
+            def cleanup():  # close the generation (records its committed state), then free the device
+                with step_lock:
+                    try:
+                        it.close()
+                    finally:
+                        release()
+
+            done = False
+            try:
+                while True:
+                    c = await run_in_threadpool(step)
+                    if c is None:
+                        done = True
+                        break
+                    yield c
+            finally:
+                if step_lock.acquire(blocking=False):  # no step running: clean up now
+                    step_lock.release()
+                    cleanup()
+                else:  # cancelled (shutdown) while a worker thread is still in a step: clean up after it
+                    threading.Thread(target=cleanup, daemon=True).start()
+                if not done:
+                    log.info(f"req {tag}: " + ("stopped for shutdown" if backend.stopping
+                                               else "client disconnected, generation stopped"))
+
+        return StreamingResponse(agen(), media_type="text/event-stream")
+
+    async def blocking(req, tag, n_prompt, run):
+        """Runs run() in a worker thread with the device lock held: (result, None) or (None, error response)."""
+        if not await acquire(req, tag, n_prompt):
+            return None, JSONResponse({"error": {"message": "client disconnected"}}, status_code=499)
+        try:
+            res = await run_in_threadpool(run)
+        finally:
+            release()
+        return (None, unavailable()) if res is None else (res, None)
+
+    def top_n(body, key, limit=20):
+        v = body.get(key)
+        return max(0, min(int(v or 0), limit))
+
     @app.post("/v1/chat/completions")
     async def chat(req: Request):
         if backend.dead:
@@ -347,6 +532,13 @@ def make_app(backend):
         model_name = body.get("model") if body.get("model") in MODEL_NAMES else MODEL_NAMES[0]
         kw = dict(body.get("chat_template_kwargs") or {})
         thinking = bool(kw.pop("enable_thinking", False))
+        tb = body.get("thinking_budget", kw.pop("thinking_budget", None))
+        if tb is None:
+            tb = THINK_BUDGET[0]
+        try:
+            think = backend.think_budget(int(tb)) if thinking and tb is not None and int(tb) >= 0 else None
+        except (TypeError, ValueError):
+            return bad_request(f"thinking_budget: expected an integer, got {tb!r}")
         tool_choice = body.get("tool_choice") or "auto"
         tools = body.get("tools") or None
         if tool_choice == "none":
@@ -354,50 +546,28 @@ def make_app(backend):
         # tool_choice "required" / a named function: start the reply inside a call (thinking off only; with
         # thinking on the reply starts in <think>, so it is treated as "auto")
         forced = forced_prefix(tool_choice) if tools and not thinking else ""
-        max_new = int(body.get("max_tokens") or body.get("max_completion_tokens") or 2048)
         try:  # in a worker thread: a long prompt takes ~1 s to tokenize
             ids = await run_in_threadpool(backend.encode, prepare_messages(body.get("messages", [])), thinking,
                                           tools, kw)
         except Exception as e:  # template errors (bad roles, no user message, ...)
-            return JSONResponse({"error": {"message": f"chat template: {e}", "type": "invalid_request_error"}},
-                                status_code=400)
+            return bad_request(f"chat template: {e}")
         if forced:
             ids = ids + backend.tok.encode(forced, add_special_tokens=False)
-        max_new = max(1, min(max_new, backend.max_seq - len(ids) - 8))
-        if len(ids) + 8 >= backend.max_seq:
-            return JSONResponse({"error": {"message": f"prompt too long ({len(ids)} tokens)"}}, status_code=400)
         rid = "chatcmpl-" + uuid.uuid4().hex[:24]
         tag = rid[-6:]
-        params = [f"prompt {len(ids)} tok", f"max {max_new}"] + (["thinking"] if thinking else []) + \
-            ([f"temp {body.get('temperature')}"] if (body.get("temperature") or 0) > 0 else []) + \
-            ([f"tools {len(tools)}"] if tools else []) + (["stream"] if body.get("stream") else [])
-        stops = body.get("stop")
-        if stops:
-            params.append(f"stop {len([stops] if isinstance(stops, str) else stops)}")
-        ignored = [k for k in ("presence_penalty", "frequency_penalty", "logprobs", "response_format", "n",
-                               "logit_bias") if body.get(k) not in (None, False, 0, 1, [], "") or
-                   (k == "n" and (body.get("n") or 1) > 1)]
-        busy = backend.lock.locked()
-        log.info(f"req {tag}: {', '.join(params)}" +
-                 (f" (waiting: busy, {backend.waiting} ahead)" if busy else "") +
-                 (f"; ignored parameters: {', '.join(ignored)}" if ignored else ""))
+        params = {"_pre": ["thinking"] if thinking and think is None else [], "_think": think,
+                  "_post": [f"tools {len(tools)}"] if tools else []}
+        max_new, make_sampler, stops, think, err = common(body, ids, tag, params, 2048)
+        if err is not None:
+            return err
+        want_lp = bool(body.get("logprobs"))
+        ntop = top_n(body, "top_logprobs")
         created = int(time.time())
-        temperature = float(body.get("temperature") or 0.0)
-        try:
-            if temperature > 0:
-                Sampler(temperature, body.get("top_p"), body.get("top_k"), body.get("min_p"), body.get("seed"))
-        except (TypeError, ValueError) as e:
-            return JSONResponse({"error": {"message": f"sampling parameters: {e}", "type": "invalid_request_error"}},
-                                status_code=400)
-
-        def make_sampler():  # per request; None = greedy
-            if temperature <= 0:
-                return None
-            return Sampler(temperature, body.get("top_p"), body.get("top_k"), body.get("min_p"), body.get("seed"))
 
         def events():
-            """(field, value) pairs: reasoning_content / content text, tool_call dicts, then ("done", info).
-            Stop strings apply to the content (not to the thinking)."""
+            """(field, value) pairs: reasoning_content / content text, tool_call dicts, logprobs entry lists, then
+            ("done", info). Stop strings apply to the content (not to the thinking); logprobs cover the content
+            tokens (not the thinking)."""
             sp = ThinkSplitter(thinking)  # the template opens <think> itself when thinking is enabled
             tp = ToolStreamParser(tools, prefix=forced) if tools else None
             sm = StopMatcher(stops)
@@ -407,7 +577,8 @@ def make_app(backend):
                 if txt:
                     yield from (tp.feed(txt) if tp else [("content", txt)])
 
-            for delta, done in backend.stream(ids, max_new, make_sampler(), stop_check=lambda: sm.hit):
+            for delta, done, rows in backend.stream(ids, max_new, make_sampler(), stop_check=lambda: sm.hit,
+                                                    think=think, rows=want_lp):
                 if done:
                     yield from content("")
                     if tp:
@@ -419,25 +590,24 @@ def make_app(backend):
                         yield from content(txt)
                     else:
                         yield field, txt
+                if rows and not sp.in_think and not sm.hit:
+                    rows = [r for r in rows if r[0] != backend.think_end]
+                    if rows:
+                        yield "logprobs", logprob_entries(rows, ntop)
 
-        def usage(info):
-            return dict(prompt_tokens=info["prompt_tokens"], completion_tokens=info["completion_tokens"],
-                        total_tokens=info["prompt_tokens"] + info["completion_tokens"])
-
-        def chunk(delta, finish=None, usage=None, timings=None):
+        def chunk(delta, finish=None, usage=None, timings=None, logprobs=None):
             d = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": model_name,
                  "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+            if logprobs is not None:
+                d["choices"][0]["logprobs"] = {"content": logprobs}
             if usage:
                 d["usage"] = usage
             if timings:
                 d["timings"] = timings  # non-standard (prompt reuse, TTFT, decode speed); the web UI shows it
             return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
 
-        def error_event():
-            return "data: " + json.dumps({"error": {"message": f"device error: {backend.dead}"}}) + "\n\n"
-
         if body.get("stream"):
-            def gen():  # runs with the device lock held (taken by agen)
+            def gen():  # runs with the device lock held (taken by streaming())
                 if backend.dead:
                     yield error_event()
                     return
@@ -450,6 +620,8 @@ def make_app(backend):
                         elif field == "tool_call":
                             yield chunk({"tool_calls": [dict(index=ncalls, **v)]})
                             ncalls += 1
+                        elif field == "logprobs":
+                            yield chunk({}, logprobs=v)
                         else:
                             yield chunk({field: v})
                 except Exception:
@@ -459,82 +631,183 @@ def make_app(backend):
                 yield "data: [DONE]\n\n"
                 log_done(tag, info, ncalls)
 
-            async def agen():
-                """Runs the blocking generator in worker threads, one chunk at a time, so the event loop stays free.
-                When the client disconnects, Starlette cancels this task: the finally closes the generator, which
-                ends the generation where it is and releases the device lock (left suspended, it would hold the
-                lock until garbage collection)."""
-                if not await acquire(req, tag, len(ids)):
-                    return
-                it = gen()
-                step_lock = threading.Lock()  # held while a worker thread runs one step of `it`
-
-                def step():
-                    with step_lock:
-                        return next(it, None)
-
-                def cleanup():  # close the generation (records its committed state), then free the device
-                    with step_lock:
-                        try:
-                            it.close()
-                        finally:
-                            release()
-
-                done = False
-                try:
-                    while True:
-                        c = await run_in_threadpool(step)
-                        if c is None:
-                            done = True
-                            break
-                        yield c
-                finally:
-                    if step_lock.acquire(blocking=False):  # no step running: clean up now
-                        step_lock.release()
-                        cleanup()
-                    else:  # cancelled (shutdown) while a worker thread is still in a step: clean up after it
-                        threading.Thread(target=cleanup, daemon=True).start()
-                    if not done:
-                        log.info(f"req {tag}: " + ("stopped for shutdown" if backend.stopping
-                                                   else "client disconnected, generation stopped"))
-
-            return StreamingResponse(agen(), media_type="text/event-stream")
+            return streaming(req, tag, len(ids), gen)
 
         def run():  # blocking, in a worker thread, with the device lock held
             if backend.dead:
                 return None
             parts = {"content": "", "reasoning_content": ""}
-            calls, info = [], None
+            calls, lps, info = [], [], None
             try:
                 for field, v in events():
                     if field == "done":
                         info = v
                     elif field == "tool_call":
                         calls.append(v)
+                    elif field == "logprobs":
+                        lps += v
                     else:
                         parts[field] += v
             except Exception:
                 return None
-            return parts, calls, info
+            return parts, calls, lps, info
 
-        if not await acquire(req, tag, len(ids)):
-            return JSONResponse({"error": {"message": "client disconnected"}}, status_code=499)
-        try:
-            res = await run_in_threadpool(run)
-        finally:
-            release()
-        if res is None:
-            return unavailable()
-        parts, calls, info = res
+        res, err = await blocking(req, tag, len(ids), run)
+        if err is not None:
+            return err
+        parts, calls, lps, info = res
         log_done(tag, info, len(calls))
         msg = {"role": "assistant", "content": parts["content"] if parts["content"] or not calls else None}
         if parts["reasoning_content"]:
             msg["reasoning_content"] = parts["reasoning_content"]
         if calls:
             msg["tool_calls"] = calls
+        choice = {"index": 0, "message": msg, "finish_reason": "tool_calls" if calls else info["finish"]}
+        if want_lp:
+            choice["logprobs"] = {"content": lps}
         return {"id": rid, "object": "chat.completion", "created": created, "model": model_name,
-                "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls" if calls else info["finish"]}],
+                "choices": [choice], "usage": usage(info), "timings": info}
+
+    def prompt_ids(body, key="prompt"):
+        """A text prompt or a list of token ids (or a one-element list of either) -> token ids."""
+        p = body.get(key)
+        if isinstance(p, list) and len(p) == 1 and isinstance(p[0], (str, list)):
+            p = p[0]
+        if isinstance(p, str):
+            return backend.tok.encode(p, add_special_tokens=False)
+        if isinstance(p, list) and p and all(isinstance(x, int) for x in p):
+            return list(p)
+        raise ValueError(f"`{key}`: expected one string or one list of token ids")
+
+    @app.post("/v1/completions")
+    async def completions(req: Request):
+        """Plain text completion (no chat template): the prompt is continued as is."""
+        if backend.dead:
+            return unavailable()
+        body = await req.json()
+        model_name = body.get("model") if body.get("model") in MODEL_NAMES else MODEL_NAMES[0]
+        try:
+            ids = await run_in_threadpool(prompt_ids, body)
+        except ValueError as e:
+            return bad_request(str(e))
+        rid = "cmpl-" + uuid.uuid4().hex[:24]
+        tag = rid[-6:]
+        max_new, make_sampler, stops, _, err = common(body, ids, tag, {"_pre": ["completions"]}, 16)
+        if err is not None:
+            return err
+        nlp = body.get("logprobs")
+        nlp = None if nlp is None or nlp is False else max(0, min(int(nlp), 20))
+        created = int(time.time())
+
+        def legacy(rows, offset):
+            """Completions-format logprobs (tokens, token_logprobs, top_logprobs, text_offset)."""
+            es = logprob_entries(rows, nlp)
+            out = dict(tokens=[e["token"] for e in es], token_logprobs=[e["logprob"] for e in es],
+                       top_logprobs=[{x["token"]: x["logprob"] for x in e["top_logprobs"]} for e in es],
+                       text_offset=[])
+            for e in es:
+                out["text_offset"].append(offset)
+                offset += len(e["token"])
+            return out
+
+        def events():
+            """("text", str, logprobs or None) ..., then ("done", info, None)."""
+            sm = StopMatcher(stops)
+            off = 0
+            for delta, done, rows in backend.stream(ids, max_new, make_sampler(), stop_check=lambda: sm.hit,
+                                                    rows=nlp is not None):
+                txt = sm.finish() if done else sm.feed(delta)
+                lp = legacy(rows, off) if rows and not sm.hit else None
+                if txt or lp:
+                    yield "text", txt, lp
+                    off += len(txt)
+                if done:
+                    yield "done", done, None
+                    return
+
+        def chunk(text, finish=None, lp=None, info=None):
+            d = {"id": rid, "object": "text_completion", "created": created, "model": model_name,
+                 "choices": [{"index": 0, "text": text, "logprobs": lp, "finish_reason": finish}]}
+            if info is not None:
+                d["usage"], d["timings"] = usage(info), info
+            return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
+
+        if body.get("stream"):
+            def gen():
+                if backend.dead:
+                    yield error_event()
+                    return
+                info = None
+                try:
+                    for kind, v, lp in events():
+                        if kind == "done":
+                            info = v
+                        else:
+                            yield chunk(v, lp=lp)
+                except Exception:
+                    yield error_event()
+                    return
+                yield chunk("", finish=info["finish"], info=info)
+                yield "data: [DONE]\n\n"
+                log_done(tag, info)
+
+            return streaming(req, tag, len(ids), gen)
+
+        def run():
+            if backend.dead:
+                return None
+            text, lps, info = "", None, None
+            try:
+                for kind, v, lp in events():
+                    if kind == "done":
+                        info = v
+                        continue
+                    text += v
+                    if lp is not None:
+                        if lps is None:
+                            lps = lp
+                        else:
+                            for k in lps:
+                                lps[k] += lp[k]
+            except Exception:
+                return None
+            if nlp is not None and lps is None:
+                lps = dict(tokens=[], token_logprobs=[], top_logprobs=[], text_offset=[])
+            return text, lps, info
+
+        res, err = await blocking(req, tag, len(ids), run)
+        if err is not None:
+            return err
+        text, lps, info = res
+        log_done(tag, info)
+        return {"id": rid, "object": "text_completion", "created": created, "model": model_name,
+                "choices": [{"index": 0, "text": text, "logprobs": lps, "finish_reason": info["finish"]}],
                 "usage": usage(info), "timings": info}
+
+    @app.post("/tokenize")
+    async def tokenize(req: Request):
+        """vLLM-style: {"prompt": text} or {"messages": [...], "add_generation_prompt": true,
+        "chat_template_kwargs": {...}, "tools": [...]} -> {"count", "max_model_len", "tokens"}."""
+        body = await req.json()
+        try:
+            if "messages" in body:
+                kw = dict(body.get("chat_template_kwargs") or {})
+                thinking = bool(kw.pop("enable_thinking", False))
+                ids = await run_in_threadpool(backend.encode, prepare_messages(body["messages"]), thinking,
+                                              body.get("tools") or None, kw)
+            else:
+                ids = await run_in_threadpool(prompt_ids, body)
+        except Exception as e:
+            return bad_request(str(e))
+        return {"count": len(ids), "max_model_len": backend.max_seq, "tokens": ids}
+
+    @app.post("/detokenize")
+    async def detokenize(req: Request):
+        body = await req.json()
+        t = body.get("tokens")
+        if not isinstance(t, list) or not all(isinstance(x, int) for x in t):
+            return bad_request("`tokens`: expected a list of token ids")
+        return {"prompt": backend.tok.decode(t)}
     return app
 
 
@@ -545,8 +818,12 @@ def main():
     ap.add_argument("--max-seq", type=int, default=262144)  # the model limit; bfp8 KV (9 GiB) leaves ~1.8 GiB free
     ap.add_argument("--served-model-name", default=env("SERVED_MODEL_NAME", ""),
                     help="name(s) in the API, comma separated (default: the model directory name, e.g. Qwen3.8-27B)")
+    ap.add_argument("--thinking-budget", type=int, default=int(env("THINKING_BUDGET", "-1")),
+                    help="default cap on thinking tokens when a request sets none (-1: no cap)")
     a = ap.parse_args()
     import uvicorn
+
+    THINK_BUDGET[0] = a.thinking_budget if a.thinking_budget >= 0 else None
 
     names = [n.strip() for n in a.served_model_name.split(",") if n.strip()]
     if names:
@@ -586,6 +863,7 @@ def log_settings(a):
         ("model", MODEL_DIR), ("served as", ", ".join(MODEL_NAMES)), ("weights cache", CACHE),
         ("listen", f"{a.host}:{a.port}"),
         ("max_seq", f"{a.max_seq} tokens"),
+        ("thinking", "no default budget" if a.thinking_budget < 0 else f"default budget {a.thinking_budget} tokens"),
         ("KV cache", g("KV_DTYPE", "bfp8")),
         ("prefill", f"large T {g('LARGE_T', '1024')} (on={g('LARGE_PREFILL', '1')}), SDPA {g('PREFILL_SDPA', 'hifi2')}"),
         ("drafts", f"MTP (vocab {'63,168' if g('DRAFT_VOCAB', '1') == '1' else 'full'}), n-gram {ngram}, "

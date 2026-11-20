@@ -101,18 +101,19 @@
 
 - [ ] **5c. サーバーの API・運用の穴** (2026-11-20 洗い出し、重要度順)
   - [x] `finish_reason` が常に stop / tool_calls だった → max_tokens で打ち切ったら `length` に (2026-11-20)。
-  - [x] `stop` (停止文字列) に対応 (2026-11-20)。`presence_penalty` などは無視 (todo 8)。`n > 1`・`logprobs`・`response_format` (JSON 固定) は未対応
+  - [x] `stop` (停止文字列) に対応 (2026-11-20)。`presence_penalty` などは無視 (todo 8)。`logprobs` / `top_logprobs` は上位 64 での近似で対応 (2026-11-20)。`n > 1`・`response_format` (JSON 固定)・`logit_bias` は未対応
     (無視したパラメータはログに出す)。
   - [x] 待ち行列の見える化 (2026-11-20): `/health` に busy・待ち数・処理中のリクエスト。待っている間に切断したリクエストは生成しない
     (ロックの獲得を非同期にして 0.25 秒ごとに切断を確認)。
   - 認証なし (`--host 0.0.0.0` で同じネットワークの誰でも使える)。`--api-key` (Bearer) を付ける。
     → 自宅 LAN と個人の Tailscale で使う間は後回し、公開・リリースのときに入れる (2026-11-20 ユーザー判断)。
-  - thinking オンだと max_tokens に思考のトークンも含まれ、答えの前に切れることがある。思考の上限 (thinking budget) を別に持つ。
+  - [x] thinking オンだと max_tokens に思考のトークンも含まれ、答えの前に切れることがある → `thinking_budget` で思考の上限を別に持つ
+    (上限で締めの一文と `</think>` を差し込み、max_tokens は答えだけを数える。2026-11-20)。
   - [x] 長いプロンプトのトークン化がイベントループを止めていた → スレッドで実行 (2026-11-20)。
   - [x] 終了時 (SIGTERM / Ctrl-C) にデバイスを閉じずに落ちていた → 生成を次のトークンで止め、デバイスを閉じて終了コード 0 (2026-11-20)。
   - [x] モデル名が固定だった → 既定はモデルのディレクトリ名、`--served-model-name` (`TSUMI_SERVED_MODEL_NAME`、カンマで別名) で上書き。
     リクエストの `model` は検証しない (別名なら返す)。`/v1/models` に量子化・最大文脈 (2026-11-20)。
-  - `/v1/completions` (旧形式) と `/tokenize` 系はなし。
+  - [x] `/v1/completions` (旧形式、logprobs は旧形式) と `/tokenize`・`/detokenize` (vLLM 形式) を追加 (2026-11-20)。
 
 - [ ] **2c. 画像入力 (マルチモーダル)** (2026-11-20 調査)
   - モデルは 27 層 ViT (hidden 1152、約 4 億パラメータ、bf16 0.8GB) + 2×2 マージで 5120 次元の埋め込み。deepstack なし
