@@ -66,11 +66,17 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
 
 サーバー:
 
-- `POST /v1/chat/completions` (stream 対応)、`GET /v1/models`、`GET /health`。1 リクエストずつ処理。
+- `POST /v1/chat/completions`・`POST /v1/completions` (テンプレートなしの続き書き、プロンプトは文字列かトークン ID 列。どちらも stream 対応)、
+  `POST /tokenize`・`/detokenize` (vLLM 形式)、`GET /v1/models`、`GET /health`。1 リクエストずつ処理。
 - **Web UI**: ブラウザで `http://127.0.0.1:8010/` を開くと、試し用の最小限のチャット画面 (`webui/index.html`)。
   thinking、温度、最大トークン数、system プロンプトを切り替えられ、応答ごとに応答開始までの時間と tok/s を表示する。
   別のマシンから開くときは `--host 0.0.0.0`。
 - 思考は `chat_template_kwargs.enable_thinking` (既定 false)。`<think>` の中身は `reasoning_content` に分ける。
+- 思考の上限: `thinking_budget` (トークン数。`chat_template_kwargs` 内でも可、既定は `--thinking-budget` / `TSUMI_THINKING_BUDGET`、
+  -1 で上限なし)。上限に達すると「時間がないのでここまでの考えで答える」旨の一文と `</think>` を差し込んで答えに移る
+  (ステップの切れ目で判定するので最大 7 トークン超える)。上限を指定したときは `max_tokens` は答えの分だけを数える。
+- `logprobs` / `top_logprobs` (20 まで、completions は `logprobs: n`): デバイスの上位 64 の logits での log-softmax なので
+  少し高めに出る (64 の外は差し込んだトークンだけで -9999)。chat では本文のトークンだけ (思考は含まない)。
 - サンプリング: `temperature` > 0 で `top_p`、`top_k` (64 まで)、`min_p`、`seed` が効く。`temperature` がなければ貪欲法。
   MTP の投機的デコードのまま厳密 (1 トークンずつ引いたのと同じ分布)。Qwen の推奨は thinking オフで 0.7 / 0.8 / 20、オンで 0.6 / 0.95 / 20。
 - ツール呼び出し: `tools` / `tool_choice` / 履歴の `tool_calls` と `role: tool` に対応 (OpenAI 形式、ストリーミングも)。

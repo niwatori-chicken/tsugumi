@@ -621,6 +621,7 @@ class Qwen35Engine:
     def _pick_row(self, r):
         """Token for row r of the last top-k: greedy or the active sampler."""
         v, i = self.last_topk
+        self.last_pick_row = r  # for logprobs of the first token after a prefill
         return self._greedy(v[r], i[r]) if self.sampler is None else self.sampler(v[r], i[r])
 
     @staticmethod

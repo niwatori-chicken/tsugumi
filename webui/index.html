@@ -55,6 +55,7 @@
 <header>
   <b>tsumi</b>
   <label><input type="checkbox" id="think"> thinking</label>
+  <label title="思考のトークン数の上限 (空欄 = サーバーの既定)">思考上限 <input type="number" id="tbudget" min="0" step="256" placeholder="なし"></label>
   <label>temperature <input type="number" id="temp" min="0" max="2" step="0.1" value="0"></label>
   <label>top_p <input type="number" id="topp" min="0" max="1" step="0.05" value="0.95"></label>
   <label>max tokens <input type="number" id="maxtok" min="1" step="256" value="4096"></label>
@@ -79,7 +80,7 @@ const store = {     // remembered settings (per browser; failures are ignored)
   get(k, d) { try { const v = localStorage.getItem("tsumi." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set(k, v) { try { localStorage.setItem("tsumi." + k, JSON.stringify(v)); } catch {} },
 };
-for (const [id, prop] of [["think", "checked"], ["temp", "value"], ["topp", "value"], ["maxtok", "value"], ["sys", "value"]]) {
+for (const [id, prop] of [["think", "checked"], ["temp", "value"], ["topp", "value"], ["maxtok", "value"], ["sys", "value"], ["tbudget", "value"]]) {
   $(id)[prop] = store.get(id, $(id)[prop]);
   $(id).addEventListener("change", () => store.set(id, $(id)[prop]));
 }
@@ -139,6 +140,8 @@ async function send() {
   const msgs = ($("sys").value.trim() ? [{ role: "system", content: $("sys").value.trim() }] : []).concat(history);
   const req = { messages: msgs, stream: true, max_tokens: parseInt($("maxtok").value) || 4096,
                 chat_template_kwargs: { enable_thinking: $("think").checked } };
+  const tb = parseInt($("tbudget").value);
+  if ($("think").checked && tb >= 0) req.thinking_budget = tb;
   if (temp > 0) Object.assign(req, { temperature: temp, top_p: parseFloat($("topp").value) || 1, top_k: 20 });
 
   ctrl = new AbortController();
@@ -190,7 +193,8 @@ async function send() {
     if (timings) {
       s.textContent = `応答開始 ${timings.ttft.toFixed(2)}s · ${timings.decode_tps.toFixed(1)} tok/s · ` +
         `${timings.completion_tokens} トークン · プロンプト ${timings.prompt_tokens} (再利用 ${timings.reused}) · ` +
-        `${timings.tokens_per_step.toFixed(2)} トークン/ステップ`;
+        `${timings.tokens_per_step.toFixed(2)} トークン/ステップ` +
+        (timings.think_tokens !== undefined ? ` · 思考 ${timings.think_tokens}${timings.think_forced ? " (上限で打ち切り)" : ""}` : "");
     } else if (tFirst !== null) {
       s.textContent = `中断 · 応答開始 ${((tFirst - t0) / 1000).toFixed(2)}s`;
     }

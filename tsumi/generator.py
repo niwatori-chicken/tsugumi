@@ -45,6 +45,18 @@ class NGramIndex:
         return [], 0
 
 
+class ThinkBudget:
+    """Cap on the thinking: after `budget` tokens inside <think> (the reply starts there), the tokens `force`
+    (a closing sentence and </think>, ending with `end`) are inserted and the model goes on with the answer. The
+    check runs between steps, so the thinking can run up to one step (T_verify - 1 tokens) past the budget. With a
+    budget, max_new counts the answer tokens only (after `end`)."""
+
+    def __init__(self, budget, end, force):
+        self.budget, self.end, self.force = max(int(budget), 0), int(end), list(force)
+        if self.end not in self.force:
+            raise ValueError("the forced tokens must contain the end-of-thinking token")
+
+
 class Conversation:
     """One conversation's slot: its KV blocks (in the shared pool), the tokens in its state, the GDN state saved
     when it was switched out, and the snapshot at the start of its last assistant turn."""
@@ -201,31 +213,55 @@ class Generator:
         self.processed = list(ids)
         return nxt, draft, eng._mtp_last_rows, info
 
-    def generate(self, ids, max_new=512, stats=None, sampler=None):
+    def generate(self, ids, max_new=512, stats=None, sampler=None, think=None, row_cb=None):
         """Yields generated token ids (speculative with MTP drafts).
 
+        think: a ThinkBudget (the reply starts inside <think>). row_cb(values, indices): called before each yielded
+        token with the main model's top-k logits of the row that predicted it (for logprobs).
         sampler=None is greedy. With a sampler (tsumi/sampling.py), every verified row is sampled from the main
         model's top-k and a draft is accepted when the sample equals it. The drafts are deterministic (MTP argmax),
         so this is exact speculative sampling: the output has the same distribution as sampling token by token."""
         self.eng.sampler = sampler
         try:
-            yield from self._generate(ids, max_new, stats)
+            yield from self._generate(ids, max_new, stats, think, row_cb)
         finally:
             self.eng.sampler = None
             self.eng.use_T(self.eng.T_dec)  # a step may have left the engine in the T_verify mode
 
-    def _generate(self, ids, max_new, stats):
+    def _generate(self, ids, max_new, stats, think=None, row_cb=None):
         eng, k = self.eng, self.k
         cur, d, last_rows, info = self._prefill(ids)
         if stats is not None:
             stats.update(info)
             stats.setdefault("steps", 0)
             stats.setdefault("accepted", 0)
+            if think is not None:
+                stats.update(think_tokens=0, think_forced=False)
         p = len(ids)
         a_prev = eng._a_prev
+        # limits: without a think budget max_new counts every token; with one, the answer tokens after </think>
+        # (the thinking is bounded by the budget, the forced tokens and one step of overshoot)
+        st = dict(n=0, think=think is not None, n_think=0, n_ans=0)
+        queue = []  # forced tokens still to insert (think budget)
+
+        def account(t):
+            """Counts the token just yielded; True when generation must stop."""
+            st["n"] += 1
+            if st["think"]:
+                st["n_think"] += 1
+                if t == think.end:
+                    st["think"] = False
+            elif think is not None:
+                st["n_ans"] += 1
+            if t in self.eos:
+                return True
+            return (st["n_ans"] if think is not None else st["n"]) >= max_new
+
+        if row_cb is not None:
+            v, i = eng.last_topk
+            row_cb(v[eng.last_pick_row], i[eng.last_pick_row])
         yield cur
-        n_out = 1
-        if cur in self.eos:
+        if account(cur):
             return
         ng = None
         if self.ngram_n:
@@ -240,59 +276,78 @@ class Generator:
         kl = (TV or eng.T_dec) - 1  # drafts in an n-gram step
 
         def plan(d1, q, row):
-            """Drafts for the next step and the mode to verify them in: the prompt-lookup proposal if the context's
-            suffix repeats an earlier stretch (>= ngram_min tokens), else d1 + MTP chained drafts (T_dec mode)."""
+            """Drafts for the next step and how to verify them: forced tokens (think budget) are accepted whatever
+            the model predicts; else the prompt-lookup proposal if the context's suffix repeats an earlier stretch
+            (>= ngram_min tokens), else d1 + MTP chained drafts (T_dec mode). Returns (drafts, mode T, kind)."""
+            if think is not None and st["think"] and not queue and st["n_think"] >= think.budget:
+                queue.extend(think.force)
+                if stats is not None:
+                    stats["think_forced"] = True
+            if queue:
+                take = queue[:kl]
+                return take, (TV or eng.T_dec), "forced"
             if ng is not None:
                 prop, m = ng.propose(kl)
                 if prop and m >= self.ngram_min:
-                    return prop + [prop[-1]] * (kl - len(prop)), (TV or eng.T_dec), True
+                    return prop + [prop[-1]] * (kl - len(prop)), (TV or eng.T_dec), "ngram"
             ds = [d1]
             for j in range(1, k):
                 am = eng.mtp.run([ds[-1]], q, [row if j == 1 else 0])
                 ds.append(am[0])
                 q += 1
-            return ds, eng.T_dec, False
+            return ds, eng.T_dec, "mtp"
 
-        drafts, Tm, from_ng = plan(d, p + 1, last_rows - 1)
-        while n_out < max_new:
+        drafts, Tm, kind = plan(d, p + 1, last_rows - 1)
+        while True:
             eng.use_T(Tm)
             kk = len(drafts)
             y = eng.run_spec([cur] + drafts, p, a_prev)
             if eng.sampler is not None:
                 y = [eng._pick_row(r) for r in range(kk + 1)]
-            n = 0
-            while n < kk and drafts[n] == y[n]:
-                n += 1
-            new = drafts[:n] + [y[n]]
+            if kind == "forced":  # all inserted; the token after them is the next forced one or the model's
+                n = kk
+                del queue[:kk]
+                new = drafts + [queue.pop(0) if queue else y[n]]
+            else:
+                n = 0
+                while n < kk and drafts[n] == y[n]:
+                    n += 1
+                new = drafts[:n] + [y[n]]
             if stats is not None:
                 stats["steps"] += 1
-                stats["accepted"] += n
-                if from_ng:
+                if kind != "forced":
+                    stats["accepted"] += n
+                if kind == "ngram":
                     stats["ngram_steps"] += 1
                     stats["ngram_accepted"] += n
             # committed to the main state: cur + drafts[:n]
             self.processed += [cur] + drafts[:n]
             stop = False
-            for t in new:
+            for j, t in enumerate(new):
+                if row_cb is not None:
+                    v, i = eng.last_topk
+                    row_cb(v[j], i[j])
                 try:
                     yield t
                 except GeneratorExit:  # the consumer stopped (client disconnected): same state as a normal stop
                     eng._a_prev = n + 1
                     raise
-                n_out += 1
-                if t in self.eos or n_out >= max_new:
+                if account(t):
                     stop = True
                     break
             if stop:
                 # the main state holds cur + drafts[:n]; the next prompt must re-feed from there
                 eng._a_prev = n + 1
+                if stats is not None and think is not None:
+                    stats["think_tokens"] = st["n_think"]
                 return
+            if stats is not None and think is not None:
+                stats["think_tokens"] = st["n_think"]
             if ng is not None:
                 ng.extend(new)
             am = eng.mtp.run(new, p + 1, list(range(n + 1)))  # always (in this step's mode): fills the MTP KV
             eng.use_T(eng.T_dec)
-            drafts, Tm, from_ng = plan(am[n], p + n + 2, n)
-            cur = y[n]
+            drafts, Tm, kind = plan(am[n], p + n + 2, n)
+            cur = new[-1]
             p = p + n + 1
             a_prev = n + 1
-        eng._a_prev = a_prev
