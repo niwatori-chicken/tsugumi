@@ -72,7 +72,8 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
   thinking、温度、最大トークン数、system プロンプトを切り替えられ、応答ごとに応答開始までの時間と tok/s を表示する。
   別のマシンから開くときは `--host 0.0.0.0`。
 - **画像入力**: `messages` の content に OpenAI 形式の `{"type": "image_url", "image_url": {"url": ...}}` (data: URL の base64、
-  または http(s) の URL)。ViT (27 層、約 4 億パラメータ) は今は CPU で動かす (fp32、1024×1024 で約 13 秒)。画像は
+  または http(s) の URL)。ViT (27 層、約 4.6 億パラメータ) はデバイスで動かす (重み bfp8 で DRAM 0.52 GiB、1024×1024 で
+  0.17 秒。`TSUMI_VISION_DEVICE=0` で CPU、約 14 秒)。画像は
   100 万ピクセル (`TSUMI_IMAGE_MAX_PIXELS`) 以下に縮めて、32×32 ピクセルごとに 1 トークン (最大 1,024 トークン)。
   同じ画像 (バイト列のハッシュ) は 2 回目から符号化しない (ホストに 65,536 トークンぶん保持) し、会話の再利用も効く。
   画像トークンにはそれぞれの画像専用の仮想 ID (248,320 以上) を振るので、トークン数が同じ別の画像を誤って再利用しない。
@@ -118,14 +119,14 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
 | `TSUMI_GQA_ATTN=0` | 自作の GQA アテンションを使わず、ttnn の SDPA に戻す |
 | `TSUMI_CHUNKED_PREFILL=0` | (GQA を切ったとき) prefill で chunked SDPA を使わない |
 | `TSUMI_FUSED_GDN=0` | GDN 融合カーネルを使わず、元の op の並びで動かす |
-| `TSUMI_IMAGES=0` | 画像入力を切る (ViT を読み込まない。ホストの RAM 約 1.6GB と起動 2 秒の節約) |
-| `TSUMI_IMAGE_MAX_PIXELS` / `TSUMI_IMAGE_MIN_PIXELS` | 画像を縮める上限 / 広げる下限のピクセル数 (既定 1,048,576 / 65,536) |
+| `TSUMI_IMAGES=0` | 画像入力を切る (ViT を読み込まない。DRAM 0.52 GiB の節約) |
+| `TSUMI_VISION_DEVICE=0` | ViT を CPU で動かす (fp32、ホストの RAM 約 1.8GB、1024×1024 で約 14 秒) |
+| `TSUMI_IMAGE_MAX_PIXELS` / `TSUMI_IMAGE_MIN_PIXELS` | 画像を縮める上限 / 広げる下限のピクセル数 (既定 1,048,576 / 65,536)。上限を上げると起動時のウォームアップと DRAM の作業領域が増える |
 | `TSUMI_IMAGE_CACHE_TOKENS` | 符号化済みの画像を保持するトークン数 (既定 65,536、1 リクエストの画像はその半分まで) |
 | `TSUMI_IMAGE_FETCH=0` | http(s) の画像 URL を取りに行かない (data: URL だけ受け付ける) |
 
 ## 制限
 
-- 画像の ViT は CPU で動かすので、新しい画像は 1 枚 3〜14 秒かかります (同じ画像の 2 回目からはかかりません)。
 - 全部 bfp4 の perplexity は bf16 比で日本語 +5%、英語 +7% (llama.cpp の IQ3_XXS 並み、Q4_0 は +2〜3%)。
   実務的なタスクでの品質は未評価。
 - 会話の続きは再利用します (前回のプロンプト + 返答、またはアシスタントのターン開始位置の状態スナップショットから差分だけ prefill)。
@@ -143,7 +144,7 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
 | `tsumi/ops.py` | DRAM シャーディングの bfp4/bfp8 行列積、重みの変換とキャッシュ |
 | `tsumi/gdn.py`、`tsumi/gdn_kernel.py` | Gated DeltaNet 層と融合カーネルの起動 |
 | `tsumi/attn.py`、`tsumi/gqa_attn.py`、`tsumi/kv_kernel.py` | attention 層、GQA split-K アテンション、KV 書き込み |
-| `tsumi/vision.py` | 画像入力 (CPU の ViT、画像トークンの仮想 ID と M-RoPE の位置) |
+| `tsumi/vision.py`、`tsumi/vision_tt.py` | 画像入力 (前処理、画像トークンの仮想 ID と M-RoPE の位置、デバイスの ViT) |
 | `tsumi/kvpager.py` | KV ブロックのプールとページ表 (複数の会話) |
 | `tsumi/prefill.py`、`tsumi/conv_kernel.py`、`tsumi/page_copy.py` | 大きい T の prefill、因果 conv カーネル、ページコピー |
 | `kernels/*.cpp` | 自作カーネル (generic_op で起動) |

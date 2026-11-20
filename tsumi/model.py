@@ -354,6 +354,7 @@ class Qwen35Engine:
         self.n_embed = self.embed.shape[0]
         self.images = None  # tsumi.vision.ImageTokens: embeddings of virtual image token ids (>= n_embed)
         self.mrope = []  # M-RoPE spans of the images in the current sequence (ImageTokens.layout)
+        self.progress = None  # called after each large-prefill chunk (the server re-arms its hang backstop)
         log(f"model loaded in {time.time() - t0:.0f}s")
 
         # per-step device inputs (fixed addresses for trace)

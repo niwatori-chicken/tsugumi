@@ -28,6 +28,8 @@
 | スクリプト | 内容 |
 |---|---|
 | `cmp_hf.py` | 先頭 N 層 (+ 最終ノルム + lm_head) のロジットを HF (CPU fp32) と比較 |
+| `test_vision_tt.py [WxH ...]` | デバイスの ViT を HF の CPU 版 (fp32) と比較 (PCC、速度、DRAM)。`VT_BF16=1` で重みを bf16 に |
+| `test_vision_order.py [--no-warmup]` | サーバーと同じ構成 (トレースあり) で画像の符号化と生成を交互に。`--no-warmup` はハングの再現 |
 | `cmp_hf_mm.py` | 画像入力: M-RoPE の位置と cos/sin を HF と比較、画像入りのプロンプトで先頭 N 層のロジットを HF と比較 |
 | `test_gdn.py` | GDN のデコード (T=1) を HF の逐次再帰と比較 (乱数の重み) |
 | `test_gdn_kernel.py` | GDN の再帰カーネル (自作) を torch fp32 と比較 |
