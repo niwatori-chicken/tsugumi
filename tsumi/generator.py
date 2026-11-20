@@ -209,7 +209,11 @@ class Generator:
             self.processed += [cur] + drafts[:n]
             stop = False
             for t in new:
-                yield t
+                try:
+                    yield t
+                except GeneratorExit:  # the consumer stopped (client disconnected): same state as a normal stop
+                    eng._a_prev = n + 1
+                    raise
                 n_out += 1
                 if t in self.eos or n_out >= max_new:
                     stop = True

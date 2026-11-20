@@ -2,7 +2,7 @@
 
     python server.py [--port 8010] [--max-seq 262144]
 
-Endpoints: POST /v1/chat/completions (stream or not), GET /v1/models, GET /health.
+Endpoints: POST /v1/chat/completions (stream or not), GET /v1/models, GET /health, GET / (a minimal chat web UI).
 Decoding is greedy unless the request sets temperature > 0; then top_p, top_k (<= 64), min_p and seed apply
 (exact speculative sampling, tsumi/sampling.py). One request at a time.
 `chat_template_kwargs.enable_thinking` controls thinking (default: false); <think> content goes to
@@ -159,9 +159,14 @@ class ThinkSplitter:
 
 def make_app(backend):
     from fastapi import FastAPI, Request
-    from fastapi.responses import JSONResponse, StreamingResponse
+    from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+    from starlette.concurrency import run_in_threadpool
 
     app = FastAPI()
+
+    @app.get("/")
+    def webui():  # minimal chat page (webui/index.html)
+        return FileResponse(os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui", "index.html"))
 
     @app.get("/health")
     def health():
@@ -251,11 +256,13 @@ def make_app(backend):
             return dict(prompt_tokens=info["prompt_tokens"], completion_tokens=info["completion_tokens"],
                         total_tokens=info["prompt_tokens"] + info["completion_tokens"])
 
-        def chunk(delta, finish=None, usage=None):
+        def chunk(delta, finish=None, usage=None, timings=None):
             d = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": MODEL_NAME,
                  "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
             if usage:
                 d["usage"] = usage
+            if timings:
+                d["timings"] = timings  # non-standard (prompt reuse, TTFT, decode speed); the web UI shows it
             return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
 
         def error_event():
@@ -281,27 +288,49 @@ def make_app(backend):
                     except Exception:
                         yield error_event()
                         return
-                    yield chunk({}, finish="tool_calls" if ncalls else "stop", usage=usage(info))
+                    yield chunk({}, finish="tool_calls" if ncalls else "stop", usage=usage(info), timings=info)
                     yield "data: [DONE]\n\n"
                     print(f"[req] {info} tool_calls={ncalls}", flush=True)
 
-            return StreamingResponse(gen(), media_type="text/event-stream")
+            async def agen():
+                """Runs the blocking generator in worker threads, one chunk at a time, so the event loop stays free.
+                When the client disconnects, Starlette cancels this task: the finally closes the generator, which
+                ends the generation where it is and releases the device lock (left suspended, it would hold the
+                lock until garbage collection)."""
+                it = gen()
+                try:
+                    while True:
+                        c = await run_in_threadpool(next, it, None)  # waits for the running step if cancelled
+                        if c is None:
+                            break
+                        yield c
+                finally:
+                    it.close()
 
-        with backend.lock:
-            if backend.dead:
-                return unavailable()
-            parts = {"content": "", "reasoning_content": ""}
-            calls, info = [], None
-            try:
-                for field, v in events():
-                    if field == "done":
-                        info = v
-                    elif field == "tool_call":
-                        calls.append(v)
-                    else:
-                        parts[field] += v
-            except Exception:
-                return unavailable()
+            return StreamingResponse(agen(), media_type="text/event-stream")
+
+        def run():  # blocking: in a worker thread, not on the event loop
+            with backend.lock:
+                if backend.dead:
+                    return None
+                parts = {"content": "", "reasoning_content": ""}
+                calls, info = [], None
+                try:
+                    for field, v in events():
+                        if field == "done":
+                            info = v
+                        elif field == "tool_call":
+                            calls.append(v)
+                        else:
+                            parts[field] += v
+                except Exception:
+                    return None
+            return parts, calls, info
+
+        res = await run_in_threadpool(run)
+        if res is None:
+            return unavailable()
+        parts, calls, info = res
         print(f"[req] {info} tool_calls={len(calls)}", flush=True)
         msg = {"role": "assistant", "content": parts["content"] if parts["content"] or not calls else None}
         if parts["reasoning_content"]:
