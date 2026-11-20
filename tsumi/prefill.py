@@ -48,7 +48,12 @@ class LargePrefill:
                                                        fp32_dest_acc_en=True, packer_l1_acc=False)
         self.fp32_ck = self.sel_ck
         self.norm_ck = self.sel_ck  # default rms_norm config: ~1% error per row
-        self.sdpa_ck = ttnn.WormholeComputeKernelConfig(math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False,
+        # SDPA: "hifi4" = q/k chunk 128, HiFi4 (KV-bandwidth bound at long context); "hifi2" = q chunk 256, HiFi2
+        # (KV read halved, 22% faster at 32K-123K)
+        self.sdpa_mode = env("PREFILL_SDPA", "hifi2")
+        fid = {"hifi4": ttnn.MathFidelity.HiFi4, "hifi2": ttnn.MathFidelity.HiFi2}[self.sdpa_mode]
+        self.sdpa_qmax = 256 if self.sdpa_mode == "hifi2" else 128
+        self.sdpa_ck = ttnn.WormholeComputeKernelConfig(math_fidelity=fid, math_approx_mode=False,
                                                         fp32_dest_acc_en=True, packer_l1_acc=False)
         g = self.dev.compute_with_storage_grid_size()
         self.grid = (g.x, g.y)
@@ -337,6 +342,11 @@ class LargePrefill:
                 e.reset_spec()
                 e.prefill_spec([0] * 64, start=0, with_mtp=mtp)
                 self.run([0] * n, start=64, with_mtp=mtp)
+                if n == T and T > self.sdpa_qmax // 2 and self.sdpa_qmax > 128:
+                    # start % 256 == 128: q chunk 128 instead of 256 (a separate SDPA program for T >= 256)
+                    e.reset_spec()
+                    e.prefill_spec([0] * 128, start=0, with_mtp=mtp)
+                    self.run([0] * n, start=128, with_mtp=mtp)
             T *= 2
         e.reset_spec()  # a prompt spanning two chunks (the previous chunk's last rows feed the next chunk's MTP)
         self.run([0] * (self.t_max + self.t_min), start=0, with_mtp=mtp)
@@ -365,11 +375,12 @@ class LargePrefill:
         return T
 
     def _sdpa_cfg(self, T, pos):
-        c = 128
-        while c > 32 and (T % c or pos % c):
-            c //= 2
+        def fit(c):
+            while c > 32 and (T % c or pos % c):
+                c //= 2
+            return c
         return ttnn.SDPAProgramConfig(compute_with_storage_grid_size=self.grid, exp_approx_mode=False,
-                                      q_chunk_size=c, k_chunk_size=c)
+                                      q_chunk_size=fit(self.sdpa_qmax), k_chunk_size=fit(128))
 
     def _chunk(self, toks, pos, prev_hid, with_mtp):
         """Rows toks at positions pos.. (pos % 64 == 0). Returns (final-normed hidden [1,1,T,H], T, n)."""

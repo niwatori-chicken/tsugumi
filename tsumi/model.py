@@ -260,6 +260,8 @@ class Qwen35Engine:
         rp = tc.get("rope_parameters", {})
         self.theta = rp.get("rope_theta", tc.get("rope_theta", 1e7))
         self.layer_types = tc["layer_types"][: n_layers or tc["num_hidden_layers"]]
+        # page tables are int32 rows of max_seq/64 entries and must be a multiple of 32 bytes: round to 512 tokens
+        max_seq = -(-max_seq // 512) * 512
         self.max_seq = max_seq
         self.eps = tc["rms_norm_eps"]
         sd = LazySD(model_dir)
