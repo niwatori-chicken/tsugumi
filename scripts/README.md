@@ -88,3 +88,5 @@
 | `compare_ppl.py REF.pt RUN.pt ...` | PPL、基準との KL (上位 K 語で近似)、top-1 一致率 |
 
 結果と経緯は `../../doc/11-b1-qwen38-27b-engine.md` にあります。
+
+- `translate_md.py`: translate a Markdown article (en -> ja) block by block with the PLaMo 3 Translate server (port 8000); keeps code, comments, placeholders; `--bilingual` keeps the English as comments.
