@@ -134,6 +134,8 @@
 
 - [ ] **2d. 公開前の品質評価 (記事とリポジトリのリリースの前提、2026-11-21 ユーザー判断)**
   - LLM as a judge のベンチ (候補: Japanese MT-Bench、ELYZA-tasks-100。採点に使う LLM と費用はユーザーと決める)。
+    - [x] Gemini Decision 1 で採点 (2026-11-21、無料枠): ELYZA 4.18 / 5、MT-Bench 8.46 / 10 (1 ターン目 8.62、
+      2 ターン目 8.29)。壊した回答での確認では、どれもはっきり減点された (doc/11)。
   - ツール呼び出し・エージェント利用のベンチ (候補: BFCL、τ-bench / τ²-bench)。
     - [x] BFCL v4 (2026-11-21、thinking なし): non_live 84.3 / live 77.9 / multi_turn 58.1。bf16 のサードパーティ計測
       (85.8 / 78.3 / 60.2) と同水準 (doc/11)。irrelevance (-15pt) と parallel (-9.5pt) の差は thinking の有無の可能性。
