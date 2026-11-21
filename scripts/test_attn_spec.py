@@ -1,18 +1,18 @@
 """Attention layer: T=1 sequential decode vs T-row paged path on the same inputs (layer 3 real weights)."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import sys
 
 import torch
 import ttnn
 
-from tsumi.attn import AttnDecode
-from tsumi.model import LazySD, SpecShared, Qwen35Engine
+from tsugumi.attn import AttnDecode
+from tsugumi.model import LazySD, SpecShared, Qwen35Engine
 import json
-import tsumi.paths as tsumi_paths
+import tsugumi.paths as tsugumi_paths
 
-MODEL = tsumi_paths.MODEL
-CACHE = tsumi_paths.CACHE + "/bfp4"
+MODEL = tsugumi_paths.MODEL
+CACHE = tsugumi_paths.CACHE + "/bfp4"
 
 
 def pcc(a, b):
@@ -29,7 +29,7 @@ def main():
         at = AttnDecode(dev, sd, "model.language_model.layers.3.self_attn.", tc, 1024, wdtype=ttnn.bfloat4_b,
                         cache_prefix=f"{CACHE}/L3.attn")
         at.init_spec(T, chunked=len(sys.argv) > 3 and sys.argv[3] == "chunked")
-        from tsumi.kvpager import KVPager
+        from tsugumi.kvpager import KVPager
         import random
         pager = KVPager(dev, 1024 // 64)
         random.Random(0).shuffle(pager.free)  # non-identity logical -> physical blocks

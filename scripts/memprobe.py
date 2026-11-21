@@ -1,13 +1,13 @@
 """Load the server configuration with a given max_seq and report DRAM usage.  python scripts/memprobe.py 131072 [--no-large]"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import sys, time
 import ttnn
-from tsumi.model import Precision, Qwen35Engine
-from tsumi.generator import Generator
+from tsugumi.model import Precision, Qwen35Engine
+from tsugumi.generator import Generator
 from transformers import AutoTokenizer
-import tsumi.paths as tsumi_paths
-MODEL = tsumi_paths.MODEL; CACHE = tsumi_paths.CACHE
+import tsugumi.paths as tsugumi_paths
+MODEL = tsugumi_paths.MODEL; CACHE = tsugumi_paths.CACHE
 ms = int(sys.argv[1])
 dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
 def mem(tag):

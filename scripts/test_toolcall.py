@@ -1,10 +1,10 @@
-"""Tool-call parsing (tsumi/toolcall.py), host only: whole text vs. every split into streamed pieces, type
+"""Tool-call parsing (tsugumi/toolcall.py), host only: whole text vs. every split into streamed pieces, type
 conversion, unterminated calls, and a template round trip (parsed calls rendered back give the same text).
   python scripts/test_toolcall.py"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import json
-from tsumi.toolcall import ToolStreamParser, prepare_messages, forced_prefix
+from tsugumi.toolcall import ToolStreamParser, prepare_messages, forced_prefix
 
 TOOLS = [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {
     "city": {"type": "string"}, "days": {"type": "integer"}, "detail": {"type": "boolean"},
@@ -61,8 +61,8 @@ ok &= got == ("", [("run", {"cmd": "ls -la\n  echo \"a<b\""})])
 
 # round trip through the template: arguments come back from clients as JSON strings
 from transformers import AutoTokenizer
-import tsumi.paths as tsumi_paths
-tok = AutoTokenizer.from_pretrained(tsumi_paths.MODEL)
+import tsugumi.paths as tsugumi_paths
+tok = AutoTokenizer.from_pretrained(tsugumi_paths.MODEL)
 content, calls = run(CASES[2][1], [CASES[2][1]])
 p = ToolStreamParser(TOOLS)
 ev = p.feed(CASES[2][1]) + p.finish()

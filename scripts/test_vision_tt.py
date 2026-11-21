@@ -1,8 +1,8 @@
-"""Device ViT (tsumi/vision_tt.py) against the HF CPU encoder (fp32): image-token embeddings, speed, DRAM.
+"""Device ViT (tsugumi/vision_tt.py) against the HF CPU encoder (fp32): image-token embeddings, speed, DRAM.
 
   python scripts/test_vision_tt.py [WxH ...]   (default: 320x256 640x480 1024x1024 1000x333)"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import io
 import random
 import sys
@@ -12,9 +12,9 @@ import torch
 import ttnn
 from PIL import Image, ImageDraw
 
-import tsumi.paths as tsumi_paths
-from tsumi.vision import VisionEncoder
-from tsumi.vision_tt import VisionTT
+import tsugumi.paths as tsugumi_paths
+from tsugumi.vision import VisionEncoder
+from tsugumi.vision_tt import VisionTT
 
 
 def image(w, h, seed=0):
@@ -25,20 +25,20 @@ def image(w, h, seed=0):
         x, y = rnd.randrange(w), rnd.randrange(h)
         d.rectangle([x, y, x + rnd.randrange(10, w // 3), y + rnd.randrange(10, h // 3)],
                     fill=tuple(rnd.randrange(256) for _ in range(3)))
-    d.text((10, 10), "tsumi vision 2026", fill="black")
+    d.text((10, 10), "tsugumi vision 2026", fill="black")
     b = io.BytesIO()
     im.save(b, "PNG")
     return b.getvalue()
 
 
 sizes = [tuple(map(int, a.split("x"))) for a in sys.argv[1:]] or [(320, 256), (640, 480), (1024, 1024), (1000, 333)]
-cpu = VisionEncoder(tsumi_paths.MODEL)
+cpu = VisionEncoder(tsugumi_paths.MODEL)
 dev = ttnn.open_device(device_id=0, trace_region_size=64 << 20, l1_small_size=24576)
 G = 1 << 30
 mem = lambda: ttnn.get_memory_view(dev, ttnn.BufferType.DRAM)
 try:
     m0 = mem()
-    vt = VisionTT(dev, tsumi_paths.MODEL, f"{tsumi_paths.CACHE}/bfp4",
+    vt = VisionTT(dev, tsugumi_paths.MODEL, f"{tsugumi_paths.CACHE}/bfp4",
                   wdtype=ttnn.bfloat16 if _os.environ.get("VT_BF16") else ttnn.bfloat8_b)
     m1 = mem()
     print(f"DRAM for the weights: {(m1.total_bytes_allocated_per_bank - m0.total_bytes_allocated_per_bank) * m1.num_banks / G:.3f} GiB")

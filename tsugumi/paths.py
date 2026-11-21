@@ -1,4 +1,4 @@
-"""Model / weight-cache locations. Override with TSUMI_MODEL_DIR and TSUMI_CACHE_DIR."""
+"""Model / weight-cache locations. Override with TSUGUMI_MODEL_DIR and TSUGUMI_CACHE_DIR."""
 import os
 
 from .env import env

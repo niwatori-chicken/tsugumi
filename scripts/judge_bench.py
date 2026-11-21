@@ -1,5 +1,5 @@
 """LLM-as-a-judge benchmarks: Japanese MT-Bench (80 questions x 2 turns) and ELYZA-tasks-100, through any
-OpenAI-compatible server (tsumi, llama-server), judged by Gemini.
+OpenAI-compatible server (tsugumi, llama-server), judged by Gemini.
 
   python scripts/judge_bench.py gen BENCH ANSWERS.jsonl --api http://127.0.0.1:8010 [--think] [--max-tokens N]
   python scripts/judge_bench.py judge BENCH ANSWERS.jsonl JUDGED.jsonl [--judge gemini-4-hydrogen]

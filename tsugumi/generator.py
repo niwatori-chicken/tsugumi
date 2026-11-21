@@ -163,7 +163,7 @@ class Generator:
         saved GDN state); no match starts a new conversation (the others keep their KV until evicted)."""
         eng = self.eng
         t0 = time.perf_counter()
-        eng.set_sequence(ids)  # M-RoPE positions of the image tokens (virtual ids, tsumi/vision.py)
+        eng.set_sequence(ids)  # M-RoPE positions of the image tokens (virtual ids, tsugumi/vision.py)
         cands = [self.cur] + [c for c in self.convs if c is not self.cur] if self.multi else [self.cur]
         best, (start, how) = self.cur, (0, "none")
         for c in cands:
@@ -219,7 +219,7 @@ class Generator:
 
         think: a ThinkBudget (the reply starts inside <think>). row_cb(values, indices): called before each yielded
         token with the main model's top-k logits of the row that predicted it (for logprobs).
-        sampler=None is greedy. With a sampler (tsumi/sampling.py), every verified row is sampled from the main
+        sampler=None is greedy. With a sampler (tsugumi/sampling.py), every verified row is sampled from the main
         model's top-k and a draft is accepted when the sample equals it. The drafts are deterministic (MTP argmax),
         so this is exact speculative sampling: the output has the same distribution as sampling token by token."""
         self.eng.sampler = sampler

@@ -2,16 +2,16 @@
 add programs to the program cache (a program compiled after the capture can allocate buffers that a trace replay
 overwrites, which hung the engine). Also checks the replies stay sane.  python scripts/test_prefill_cache.py"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import faulthandler, random, time, torch, ttnn
 faulthandler.dump_traceback_later(900, exit=True)
-import tsumi.paths as tsumi_paths
-from tsumi.model import Precision, Qwen35Engine
-from tsumi.generator import Generator
+import tsugumi.paths as tsugumi_paths
+from tsugumi.model import Precision, Qwen35Engine
+from tsugumi.generator import Generator
 
 dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
 try:
-    eng = Qwen35Engine(dev, tsumi_paths.MODEL, Precision("bfp4"), f"{tsumi_paths.CACHE}/bfp4", max_seq=16384, log=lambda *a: None)
+    eng = Qwen35Engine(dev, tsugumi_paths.MODEL, Precision("bfp4"), f"{tsugumi_paths.CACHE}/bfp4", max_seq=16384, log=lambda *a: None)
     eng.init_spec(4, mtp=True, verify_T=8); eng.init_prefill(32); eng.init_verify(8)  # server configuration
     t0 = time.perf_counter(); eng.init_large_prefill(1024); print(f"[warmup] {time.perf_counter() - t0:.1f}s", flush=True)
     eng.capture_all()

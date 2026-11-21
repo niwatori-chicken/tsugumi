@@ -1,8 +1,8 @@
 """Speed: GQAAttention vs current ops at long context.  python scripts/bench_gqa.py [P0]"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import sys, time, torch, ttnn
-from tsumi.gqa_attn import GQAAttention
+from tsugumi.gqa_attn import GQAAttention
 NH, NKV, HD, BS = 24, 4, 256, 64
 P0 = int(sys.argv[1]) if len(sys.argv) > 1 else 123904
 maxseq = 131072; nb = maxseq // BS

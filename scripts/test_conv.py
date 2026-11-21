@@ -1,8 +1,8 @@
 """CausalConvKernel vs torch (bf16 inputs, fp64 ref). python scripts/test_conv.py"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import time, torch, ttnn
-from tsumi.conv_kernel import CausalConvKernel
+from tsugumi.conv_kernel import CausalConvKernel
 C = 10240
 dev = ttnn.open_device(device_id=0, l1_small_size=24576, trace_region_size=64 << 20)
 try:

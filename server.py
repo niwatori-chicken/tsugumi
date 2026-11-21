@@ -5,20 +5,20 @@
 Endpoints: POST /v1/chat/completions and /v1/completions (stream or not), POST /tokenize and /detokenize,
 GET /v1/models, GET /health, GET / (a minimal chat web UI).
 Decoding is greedy unless the request sets temperature > 0; then top_p, top_k (<= 64), min_p and seed apply
-(exact speculative sampling, tsumi/sampling.py). One request at a time.
+(exact speculative sampling, tsugumi/sampling.py). One request at a time.
 `chat_template_kwargs.enable_thinking` controls thinking (default: false); <think> content goes to
 `reasoning_content`. `thinking_budget` (or chat_template_kwargs.thinking_budget; default --thinking-budget) caps
 the thinking tokens: at the cap a closing sentence and </think> are inserted (THINK_FORCE), and max_tokens then
 counts the answer only. Other chat_template_kwargs (reasoning_effort, preserve_thinking) go to the template.
 Tool calling: `tools`, `tool_choice` (auto / none; required / a named function with thinking off), assistant
-`tool_calls` and `role: tool` messages in the history; calls are returned as `tool_calls` (tsumi/toolcall.py).
-Images: OpenAI `image_url` content parts (data: URL or http(s)); the ViT runs on the device (tsumi/vision_tt.py,
-TSUMI_VISION_DEVICE=0: on the CPU) under the device lock, and
+`tool_calls` and `role: tool` messages in the history; calls are returned as `tool_calls` (tsugumi/toolcall.py).
+Images: OpenAI `image_url` content parts (data: URL or http(s)); the ViT runs on the device (tsugumi/vision_tt.py,
+TSUGUMI_VISION_DEVICE=0: on the CPU) under the device lock, and
 each image becomes its own virtual token ids, so conversation reuse tells images apart.
 `logprobs` / `top_logprobs` (<= 20; completions: logprobs = n): log-softmax over the device top-64 logits (a
 little too high; tokens outside it, only forced ones, get -9999); chat logprobs cover the content, not the thinking.
 
-Authentication: with --api-key / TSUMI_API_KEY (comma separated) or --api-key-file (one key per line), every
+Authentication: with --api-key / TSUGUMI_API_KEY (comma separated) or --api-key-file (one key per line), every
 endpoint except GET / (the web UI page) and GET /health needs `Authorization: Bearer <key>` (OpenAI clients send it
 from their api_key setting); others get 401. Without keys the server is open, as before (fine on 127.0.0.1).
 
@@ -26,7 +26,7 @@ Shutdown (SIGINT / SIGTERM): stop accepting requests, end a running generation a
 
 Hang handling: a device wait that makes no progress for TT_METAL_OPERATION_TIMEOUT_SECONDS (default here 30)
 raises; the request gets an error, /health turns 503 and the process exits with code 75 (EXIT_HANG). A
-faulthandler backstop (TSUMI_HANG_BACKSTOP seconds without a new token, default 300) kills the process if a
+faulthandler backstop (TSUGUMI_HANG_BACKSTOP seconds without a new token, default 300) kills the process if a
 wait hangs without raising. run_server.sh resets the device and restarts the server after either.
 """
 import argparse
@@ -39,15 +39,15 @@ import threading
 import time
 import uuid
 import faulthandler
-import tsumi.paths as tsumi_paths
-from tsumi.env import env
-from tsumi.log import get_logger
-from tsumi.sampling import Sampler
-from tsumi.toolcall import ToolStreamParser, forced_prefix, prepare_messages
+import tsugumi.paths as tsugumi_paths
+from tsugumi.env import env
+from tsugumi.log import get_logger
+from tsugumi.sampling import Sampler
+from tsugumi.toolcall import ToolStreamParser, forced_prefix, prepare_messages
 
 
-MODEL_DIR = tsumi_paths.MODEL
-CACHE = tsumi_paths.CACHE
+MODEL_DIR = tsugumi_paths.MODEL
+CACHE = tsugumi_paths.CACHE
 MODEL_NAMES = [os.path.basename(os.path.normpath(MODEL_DIR))]  # set from --served-model-name in main()
 log = get_logger()
 EXIT_HANG = 75
@@ -64,8 +64,8 @@ class Backend:
         import ttnn
         from transformers import AutoTokenizer
 
-        from tsumi.generator import Generator
-        from tsumi.model import Precision, Qwen35Engine
+        from tsugumi.generator import Generator
+        from tsugumi.model import Precision, Qwen35Engine
 
         t_all = time.perf_counter()
 
@@ -97,7 +97,7 @@ class Backend:
                                     log=eng_log)
         self.vision_tt = None
         if env("IMAGES", "1") == "1" and env("VISION_DEVICE", "1") == "1":  # before the traces (persistent buffers)
-            from tsumi.vision_tt import VisionTT
+            from tsugumi.vision_tt import VisionTT
             with stage("vision encoder weights (bfp8, ~0.5 GiB)"):
                 self.vision_tt = VisionTT(self.dev, MODEL_DIR, f"{CACHE}/bfp4", log=log.info)
         tv = int(env("VERIFY_T", "8"))  # longer verify mode for prompt-lookup drafts (0 = off)
@@ -109,7 +109,7 @@ class Backend:
         if env("LARGE_PREFILL", "1") == "1":  # must come before capture_all
             with stage("large-T prefill and warm-up (compiles every chunk shape)"):
                 self.eng.init_large_prefill(int(env("LARGE_T", "1024")))
-        # every image size bucket, compiled before the traces (tsumi/vision_tt.py); TSUMI_VISION_WARMUP=0 only to
+        # every image size bucket, compiled before the traces (tsugumi/vision_tt.py); TSUGUMI_VISION_WARMUP=0 only to
         # reproduce the hang (e.g. to check the capture guard)
         if self.vision_tt is not None and env("VISION_WARMUP", "1") == "1":
             with stage("vision encoder warm-up"):
@@ -122,7 +122,7 @@ class Backend:
         self.lock = threading.Lock()
         self.vision = None
         if env("IMAGES", "1") == "1":  # image input; the embeddings are looked up by virtual token ids
-            from tsumi.vision import ImageTokens, VisionEncoder
+            from tsugumi.vision import ImageTokens, VisionEncoder
             with stage("image preprocessing" + (" and CPU vision encoder" if self.vision_tt is None else "")):
                 self.vision = VisionEncoder(MODEL_DIR, log=log.info, tt=self.vision_tt, device_lock=self.lock,
                                             on_device_error=self.fail, after_device=lambda w: self.check_capture(w))
@@ -142,7 +142,7 @@ class Backend:
         self.active = None    # the running request: dict(id, prompt, generated, since)
         self.dead = None  # reason string once the device is considered hung
         self.backstop = int(env("HANG_BACKSTOP", "300"))
-        # debug (TSUMI_CAPTURE_GUARD=1): after each use of the device, warn when a program was compiled or DRAM stayed
+        # debug (TSUGUMI_CAPTURE_GUARD=1): after each use of the device, warn when a program was compiled or DRAM stayed
         # allocated after the trace capture: both have hung the device on a later trace replay (doc/11)
         self.guard = None
         if env("CAPTURE_GUARD", "0") == "1":
@@ -198,7 +198,7 @@ class Backend:
             faulthandler.cancel_dump_traceback_later()
 
     def debug_hang(self):
-        from tsumi.hang_kernel import run_hang_kernel
+        from tsugumi.hang_kernel import run_hang_kernel
         run_hang_kernel(self.dev)
 
     def _tokens(self, ids, max_new, stats, sampler=None, think=None, row_cb=None):
@@ -222,7 +222,7 @@ class Backend:
         return self._expand_images(ids, messages, images, embed)
 
     def _expand_images(self, ids, messages, info, embed):
-        from tsumi.vision import IMAGE_PAD, image_sources, load_image
+        from tsugumi.vision import IMAGE_PAD, image_sources, load_image
 
         srcs = image_sources(messages)
         if ids.count(IMAGE_PAD) != len(srcs):
@@ -230,7 +230,7 @@ class Backend:
         if not srcs:
             return ids
         if self.vision is None:
-            raise ValueError("image input is off (TSUMI_IMAGES=0)")
+            raise ValueError("image input is off (TSUGUMI_IMAGES=0)")
         reg, t0 = self.eng.images, time.perf_counter()
         out, k, enc, ntok = [], 0, 0, 0
         for t in ids:
@@ -254,14 +254,14 @@ class Backend:
             ntok += len(vids)
         if embed and ntok > reg.max_tokens // 2:
             raise ValueError(f"images: {ntok} tokens in one request (limit {reg.max_tokens // 2}, "
-                             f"TSUMI_IMAGE_CACHE_TOKENS / 2)")
+                             f"TSUGUMI_IMAGE_CACHE_TOKENS / 2)")
         if info is not None:
             info.update(n=len(srcs), tokens=ntok, encoded=enc, seconds=time.perf_counter() - t0)
         return out
 
     def think_budget(self, budget):
-        """ThinkBudget for a request (tsumi/generator.py): THINK_FORCE text then </think>."""
-        from tsumi.generator import ThinkBudget
+        """ThinkBudget for a request (tsugumi/generator.py): THINK_FORCE text then </think>."""
+        from tsugumi.generator import ThinkBudget
         if self._force_ids is None:
             self._force_ids = self.tok.encode(THINK_FORCE, add_special_tokens=False)
         return ThinkBudget(budget, self.think_end, self._force_ids)
@@ -523,8 +523,8 @@ def make_app(backend, api_keys=()):
     @app.get("/v1/models")
     def models():
         meta = dict(weights="bfp4", kv_cache=env("KV_DTYPE", "bfp8"), max_seq=backend.max_seq,
-                    model_dir=MODEL_DIR, engine="tsumi (Tenstorrent P100A)")
-        return {"object": "list", "data": [{"id": n, "object": "model", "created": started, "owned_by": "tsumi",
+                    model_dir=MODEL_DIR, engine="tsugumi (Tenstorrent P100A)")
+        return {"object": "list", "data": [{"id": n, "object": "model", "created": started, "owned_by": "tsugumi",
                                             "meta": meta} for n in MODEL_NAMES]}
 
     def bad_request(msg):
@@ -957,9 +957,9 @@ def main():
     ap.add_argument("--thinking-budget", type=int, default=int(env("THINKING_BUDGET", "-1")),
                     help="default cap on thinking tokens when a request sets none (-1: no cap)")
     ap.add_argument("--api-key", default=env("API_KEY", ""),
-                    help="require Authorization: Bearer <key>; several keys comma separated (env TSUMI_API_KEY)")
+                    help="require Authorization: Bearer <key>; several keys comma separated (env TSUGUMI_API_KEY)")
     ap.add_argument("--api-key-file", default=env("API_KEY_FILE", ""),
-                    help="file with one API key per line (env TSUMI_API_KEY_FILE)")
+                    help="file with one API key per line (env TSUGUMI_API_KEY_FILE)")
     a = ap.parse_args()
     import uvicorn
     api_keys = load_api_keys(a.api_key, a.api_key_file)
@@ -998,7 +998,7 @@ def main():
 
 
 def log_settings(a):
-    """The settings in effect (TSUMI_* / QE_* environment, flags), one line each."""
+    """The settings in effect (TSUGUMI_* / TSUMI_* / QE_* environment, flags), one line each."""
     g = lambda k, d: env(k, d)
     ngram = "off" if g("NGRAM", "3") == "0" else f"when >= {g('NGRAM_MIN', '6')} tokens repeat"
     items = [

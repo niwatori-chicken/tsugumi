@@ -1,18 +1,18 @@
 """T-row mode test: chunked prefill + plain greedy decode where each step commits 1 row (a=1).
 Compares against the T=1 engine output text. python scripts/run_spec_test.py [--layers N] [--T 4]"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import argparse
 import sys
 import time
 
 import ttnn
 
-from tsumi.model import Precision, Qwen35Engine
-import tsumi.paths as tsumi_paths
+from tsugumi.model import Precision, Qwen35Engine
+import tsugumi.paths as tsugumi_paths
 
-MODEL = tsumi_paths.MODEL
-CACHE = tsumi_paths.CACHE
+MODEL = tsugumi_paths.MODEL
+CACHE = tsugumi_paths.CACHE
 
 
 def main():

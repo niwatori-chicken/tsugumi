@@ -1,4 +1,4 @@
-"""Sampling (tsumi/sampling.py + Generator(sampler=...)).
+"""Sampling (tsugumi/sampling.py + Generator(sampler=...)).
 
   1. seed: the same seed gives the same text, other seeds differ.
   2. exactness of speculative sampling: tokens 2 and 3 sampled with MTP drafts (several tokens per verify step) vs.
@@ -7,18 +7,18 @@
   3. speed and accepted drafts per step: greedy vs temperature 0.7 / 1.0.
   python scripts/test_sampling.py [N=300]      (EXACT_PROMPT=... for another prompt in part 2)"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import collections, faulthandler, random, sys, time
 import ttnn
 from transformers import AutoTokenizer
-import tsumi.paths as tsumi_paths
-from tsumi.model import Precision, Qwen35Engine
-from tsumi.generator import Generator
-from tsumi.sampling import Sampler
+import tsugumi.paths as tsugumi_paths
+from tsugumi.model import Precision, Qwen35Engine
+from tsugumi.generator import Generator
+from tsugumi.sampling import Sampler
 
 faulthandler.dump_traceback_later(3600, exit=True)
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 300
-tok = AutoTokenizer.from_pretrained(tsumi_paths.MODEL)
+tok = AutoTokenizer.from_pretrained(tsugumi_paths.MODEL)
 
 
 def enc(text):
@@ -33,7 +33,7 @@ def tv(a, b):
 
 dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
 try:
-    eng = Qwen35Engine(dev, tsumi_paths.MODEL, Precision("bfp4"), f"{tsumi_paths.CACHE}/bfp4", max_seq=16384,
+    eng = Qwen35Engine(dev, tsugumi_paths.MODEL, Precision("bfp4"), f"{tsugumi_paths.CACHE}/bfp4", max_seq=16384,
                        log=lambda *a: None)
     eng.init_spec(4, mtp=True); eng.init_prefill(32); eng.init_large_prefill(1024); eng.capture_all()
     gen = Generator(eng)
