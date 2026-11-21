@@ -139,6 +139,13 @@
     (採点 LLM や設定の違いは注記する)。結果は記事の第 1 部の表と第 4 部へ。
   - llama.cpp Q4_K_M との同条件比較は保留 (2026-11-21): CPU で 1.9 tok/s、MT-Bench だけで 30〜40 時間かかる。
     7 問分の回答は /mnt/HDD/eval/quality/judge/gguf_Q4_K_M/ に残してある。
+  - 公表値 (2026-11-21 調査): Qwen 公式のモデルカードに BFCL・MT-Bench・ELYZA はない。BFCL v4 のサードパーティ計測
+    (github.com/teacher57/qwen3.8-27b-bfcl-train、bf16、vLLM、FC、thinking あり、temperature 0.001、1 回):
+    non_live 85.8 / live 80.5 (README の値。件数から計算すると 78.3) / multi_turn 60.2 (base 72.5、miss_func 53.0、
+    miss_param 51.5、long_context 64.0) / irrelevance 79.2 / live_irrelevance 74.9。
+    tsumi の実行は thinking なし・greedy なので、比べるときはこの違いを注記する。
+    MT-Bench・ELYZA の Qwen3.8-27B の公表値は見つからなかった。採点 LLM が違うと点数がずれるので、
+    絶対値を見て、回答を読んで確かめる。
 
 - [ ] **6. 大きい T の prefill の細かい改善**
   - slice と要素ごとの op が 1 チャンクで約 250ms。融合する。
