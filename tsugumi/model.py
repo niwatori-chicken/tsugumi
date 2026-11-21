@@ -162,7 +162,7 @@ class MTPHead:
         self.out = None
         self.traces = {}
         # draft lm_head: bfp4 copy of the shared lm_head (half the bytes of the bfp8 verify head), by default only the
-        # rows of the reduced draft vocabulary (tsumi/draft_vocab.pt, 63,168 frequent tokens: 1/4 of the bytes; the
+        # rows of the reduced draft vocabulary (tsugumi/draft_vocab.pt, 63,168 frequent tokens: 1/4 of the bytes; the
         # draft index is mapped back on the host). The main model verifies over the full vocabulary either way.
         self.lm_chunks = []
         self.vocab_map = None
@@ -352,7 +352,7 @@ class Qwen35Engine:
         del lm
         self.embed = sd[LM_PREFIX + "embed_tokens.weight"].to(torch.bfloat16)  # host-side lookup
         self.n_embed = self.embed.shape[0]
-        self.images = None  # tsumi.vision.ImageTokens: embeddings of virtual image token ids (>= n_embed)
+        self.images = None  # tsugumi.vision.ImageTokens: embeddings of virtual image token ids (>= n_embed)
         self.mrope = []  # M-RoPE spans of the images in the current sequence (ImageTokens.layout)
         self.progress = None  # called after each large-prefill chunk (the server re-arms its hang backstop)
         log(f"model loaded in {time.time() - t0:.0f}s")
@@ -377,7 +377,7 @@ class Qwen35Engine:
         self.trace_id = None
         self.logits_out = None
         self.fused_gdn = env('FUSED_GDN', '1') == '1'
-        # chunked SDPA prefill (needs aligned chunk starts); superseded by the GQA kernel (TSUMI_GQA_ATTN=1)
+        # chunked SDPA prefill (needs aligned chunk starts); superseded by the GQA kernel (TSUGUMI_GQA_ATTN=1)
         self._chunked_prefill = env('CHUNKED_PREFILL', '1') == '1' and \
             env('GQA_ATTN', '1') != '1'
         self._kv_rowwise = False
@@ -759,7 +759,7 @@ class Qwen35Engine:
         return last, start + pos, draft
 
     def init_large_prefill(self, t_max=1024):
-        """Large-T prompt prefill (tsumi/prefill.py); used by prefill() for prompts of 64+ tokens."""
+        """Large-T prompt prefill (tsugumi/prefill.py); used by prefill() for prompts of 64+ tokens."""
         from .prefill import LargePrefill
 
         self.large = LargePrefill(self, t_max=t_max)

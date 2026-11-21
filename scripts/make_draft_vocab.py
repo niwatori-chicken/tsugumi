@@ -1,4 +1,4 @@
-"""Build the reduced draft vocabulary (tsumi/draft_vocab.pt): the N most frequent tokens of a mixed corpus.
+"""Build the reduced draft vocabulary (tsugumi/draft_vocab.pt): the N most frequent tokens of a mixed corpus.
 
 The MTP draft head only proposes tokens from this set (its lm_head is 4x smaller at the default 63,168 tokens); the main model still verifies
 over the full vocabulary, so outputs do not change, only how often a draft is right.
@@ -9,15 +9,15 @@ Python and C++ sources, the model's own answers from the attn8 / mixed benchmark
 answers (MGSM-ja, HumanEval, GPQA reasoning summaries, JSQuAD) and ja_eval / en_eval. Prints the share of
 held-out tokens inside the set (an upper bound on how often the drafts could still be right)."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import collections, csv, glob, json, os, random, sys
 import torch
 from transformers import AutoTokenizer
-import tsumi.paths as tsumi_paths
+import tsugumi.paths as tsugumi_paths
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 63168
 E = "/mnt/HDD/eval"
-tok = AutoTokenizer.from_pretrained(tsumi_paths.MODEL)
+tok = AutoTokenizer.from_pretrained(tsugumi_paths.MODEL)
 
 
 def jsonl(path, key):
@@ -98,6 +98,6 @@ for name, texts in [("ja_eval + en_eval", held)] + list(held_by.items()):
     t = [i for s in texts for i in tok.encode(s, add_special_tokens=False)]
     if t:
         print(f"  held out {name}: {len(t)} tokens, in set {100 * sum(i in S for i in t) / len(t):.2f}%")
-out = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tsumi", "draft_vocab.pt")
+out = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tsugumi", "draft_vocab.pt")
 torch.save(torch.tensor(ids, dtype=torch.int32), out)
 print("wrote", out)

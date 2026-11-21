@@ -7,18 +7,18 @@ Runs the step eagerly (same kernels as the trace; the device times per op are th
 not) after two warm-up runs, so the profiled region is exactly one main step and one MTP step. Also prints the
 traced time of the same step for comparison."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import sys, time
 import ttnn
-import tsumi.paths as tsumi_paths
-from tsumi.model import Precision, Qwen35Engine
+import tsugumi.paths as tsugumi_paths
+from tsugumi.model import Precision, Qwen35Engine
 
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 T = int(args[0]) if args else 4
 P0 = int(args[1]) if len(args) > 1 else 300
 dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
 try:
-    eng = Qwen35Engine(dev, tsumi_paths.MODEL, Precision("bfp4"), f"{tsumi_paths.CACHE}/bfp4", max_seq=4096,
+    eng = Qwen35Engine(dev, tsugumi_paths.MODEL, Precision("bfp4"), f"{tsugumi_paths.CACHE}/bfp4", max_seq=4096,
                        log=lambda *a: None)
     eng.init_spec(T, mtp=True)
     eng.reset_spec()

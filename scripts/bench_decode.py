@@ -5,16 +5,16 @@
 the prompt ids and generated tokens (greedy output does not depend on the drafts: for offline simulations).
 Prompts: Japanese / English prose, code, a tool-free chat answer, with and without thinking. Prints per prompt the
 decode rate and tokens per verify step, then the total (tokens / decode time) and the mean of per-prompt rates.
-Settings come from the environment like the server (TSUMI_KV_DTYPE, TSUMI_DRAFT_VOCAB, ...)."""
+Settings come from the environment like the server (TSUGUMI_KV_DTYPE, TSUGUMI_DRAFT_VOCAB, ...)."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import sys, time
 import ttnn
 from transformers import AutoTokenizer
-import tsumi.paths as tsumi_paths
-from tsumi.model import Precision, Qwen35Engine
-from tsumi.generator import Generator
-from tsumi.env import env
+import tsugumi.paths as tsugumi_paths
+from tsugumi.model import Precision, Qwen35Engine
+from tsugumi.generator import Generator
+from tsugumi.env import env
 
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 MAX_NEW = int(args[0]) if args else 256
@@ -30,7 +30,7 @@ PROMPTS = [
     ("think en", "A train leaves at 9:40 and arrives at 13:15. How long is the trip in minutes?", True),
 ]
 _here = _os.path.dirname(_os.path.abspath(__file__))
-_kv = open(_os.path.join(_here, "..", "tsumi", "kvpager.py")).read()
+_kv = open(_os.path.join(_here, "..", "tsugumi", "kvpager.py")).read()
 _ja = open("/mnt/HDD/eval/ja_eval.txt").read()[:900]
 _en = open("/mnt/HDD/eval/en_eval.txt").read()[:1500]
 COPY = [  # copy-heavy replies (code edits, rewrites): where prompt-lookup drafts help
@@ -44,10 +44,10 @@ if "--copy" in sys.argv:
     PROMPTS = COPY
 elif "--all" in sys.argv:
     PROMPTS = PROMPTS + COPY
-tok = AutoTokenizer.from_pretrained(tsumi_paths.MODEL)
+tok = AutoTokenizer.from_pretrained(tsugumi_paths.MODEL)
 dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
 try:
-    eng = Qwen35Engine(dev, tsumi_paths.MODEL, Precision("bfp4"), f"{tsumi_paths.CACHE}/bfp4", max_seq=16384,
+    eng = Qwen35Engine(dev, tsugumi_paths.MODEL, Precision("bfp4"), f"{tsugumi_paths.CACHE}/bfp4", max_seq=16384,
                        log=lambda *a: None)
     tv = int(env("VERIFY_T", "8"))
     eng.init_spec(4, mtp=True, verify_T=tv or None); eng.init_prefill(32)

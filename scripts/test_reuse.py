@@ -1,22 +1,22 @@
 """Conversation reuse: 3 turns (thinking off / on) through Generator; reuse kind, TTFT, snapshot time,
 and the reply with reuse vs from scratch.  python scripts/test_reuse.py"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import faulthandler, sys, time, torch, ttnn
 faulthandler.dump_traceback_later(90, repeat=True, file=sys.stderr)
 from transformers import AutoTokenizer
-import tsumi.paths as tsumi_paths
-from tsumi.model import Precision, Qwen35Engine
-from tsumi.generator import Generator
+import tsugumi.paths as tsugumi_paths
+from tsugumi.model import Precision, Qwen35Engine
+from tsugumi.generator import Generator
 
-tok = AutoTokenizer.from_pretrained(tsumi_paths.MODEL)
+tok = AutoTokenizer.from_pretrained(tsugumi_paths.MODEL)
 enc = lambda m, th: (lambda x: x if isinstance(x, list) else x["input_ids"])(
     tok.apply_chat_template(m, add_generation_prompt=True, enable_thinking=th))
 doc = open("/mnt/HDD/eval/ja_wiki.txt").read()[:5000]
 turns = [doc + "\n\nこの文章の要点を1文で。", "標高は何メートル？", "最後に噴火したのはいつ？"]
 dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
 try:
-    eng = Qwen35Engine(dev, tsumi_paths.MODEL, Precision("bfp4"), f"{tsumi_paths.CACHE}/bfp4", max_seq=16384, log=lambda *a: None)
+    eng = Qwen35Engine(dev, tsugumi_paths.MODEL, Precision("bfp4"), f"{tsugumi_paths.CACHE}/bfp4", max_seq=16384, log=lambda *a: None)
     eng.init_spec(4, mtp=True); eng.init_prefill(32); eng.init_large_prefill(1024); eng.capture_all()
     gen = Generator(eng)
     base = dev.num_program_cache_entries()

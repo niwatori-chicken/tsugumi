@@ -14,7 +14,7 @@ _L1 = ttnn.L1_MEMORY_CONFIG
 
 
 def kv_dtype():
-    """KV cache format (TSUMI_KV_DTYPE): bf16 (68 KiB/token over 17 layers) or bfp8 (36 KiB/token)."""
+    """KV cache format (TSUGUMI_KV_DTYPE): bf16 (68 KiB/token over 17 layers) or bfp8 (36 KiB/token)."""
     return {"bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b}[env("KV_DTYPE", "bfp8")]
 
 

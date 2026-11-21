@@ -1,6 +1,6 @@
 """GDN decode: correctness vs HF torch recurrent reference (random weights) and traced timing."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import sys
 import time
 
@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 import ttnn
 
-from tsumi.gdn import GDNDecode, GDNWeights
+from tsugumi.gdn import GDNDecode, GDNWeights
 
 CFG = dict(linear_num_key_heads=16, linear_num_value_heads=48, linear_key_head_dim=128, linear_value_head_dim=128,
            linear_conv_kernel_dim=4)

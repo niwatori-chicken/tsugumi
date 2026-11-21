@@ -1,6 +1,6 @@
-# tsumi — Qwen3.8-27B を Tenstorrent P100A 1 枚で動かす B=1 推論エンジン
+# tsugumi — Qwen3.8-27B を Tenstorrent P100A 1 枚で動かす B=1 推論エンジン
 
-名前はツミ (*Tachyspiza gularis*)、日本で一番小さいタカから。小さな構成で大きなモデルを速く動かす、という意味を込めています。
+名前はツグミ (*Turdus eunomus*) から。冬になるとシベリアから海を越えて日本に渡ってくる、身近な小さな鳥です。[[AUTHOR: 名前の由来の一文を確認]]
 
 27B の dense モデル (Gated DeltaNet 48 層 + full attention 16 層) を、Blackhole **P100A 1 枚 (28GB、448GB/s)** で
 バッチ 1 のまま速く動かすための、tt-metal / ttnn 上の小さな推論エンジンです。
@@ -24,21 +24,21 @@
 1 トークンあたりの時間の大半は重みの読み出しなので、(1) 読む量を減らし、(2) 1 回の読み出しで複数トークンを処理し、
 (3) 行列積以外の小さな op の固定費を削る、の 3 つで速くしています。
 
-- **bfp4 の DRAM シャーディング行列積** (`tsumi/ops.py`): 重みを 7 バンクに分けて流し読み。
+- **bfp4 の DRAM シャーディング行列積** (`tsugumi/ops.py`): 重みを 7 バンクに分けて流し読み。
   ワーカー数 3・in0_block_w=2 で公称帯域の 93% (約 415GB/s)。全部 bfp4 で行列積だけ約 38ms/ステップ。
-- **GDN 融合カーネル** (`kernels/gdn_fused_*.cpp`、`tsumi/gdn_kernel.py`): conv 以降の
+- **GDN 融合カーネル** (`kernels/gdn_fused_*.cpp`、`tsugumi/gdn_kernel.py`): conv 以降の
   L2 正規化 → T トークン分の DeltaNet 再帰 → gated RMSNorm を 1 本のカーネルで行う (値ヘッド 1 つに 1 コア)。
   各トークン後の状態をスロットに残すので、投機的デコードで「確定した位置」から次を再開できる。
 - **T 行モード** (`forward_spec`): T 行のトークンをまとめて流す。検証は T=4 (下書き 3 個)、prefill は T=32。
   conv の履歴はホストが書く 0/1 の選択行列との行列積でずらすので、トレースを固定したまま採択数に追従できる。
-- **MTP 投機的デコード** (`MTPHead`、`tsumi/generator.py`): 付属の MTP 層で 3 トークン先まで下書きし、本体で一括検証。
+- **MTP 投機的デコード** (`MTPHead`、`tsugumi/generator.py`): 付属の MTP 層で 3 トークン先まで下書きし、本体で一括検証。
   下書き用には lm_head の bfp4 の複製を使う。
-- **GQA split-K アテンション** (`kernels/gqa_attn_*.cpp`、`gqa_comb_*.cpp`、`tsumi/gqa_attn.py`):
+- **GQA split-K アテンション** (`kernels/gqa_attn_*.cpp`、`gqa_comb_*.cpp`、`tsugumi/gqa_attn.py`):
   KV ヘッド 4 × 区間 27 = 108 コアが、担当区間の KV を 1 回だけ読み、同じ KV ヘッドを使う 6 q ヘッド × T 行を
   まとめて計算 (online softmax)。部分結果を別の op で合成する。区間とチャンク数は実行時に位置から決まるのでトレース可能。
   12.4 万トークンの文脈で 4 行の検証が 1 層 1.7ms (DRAM 帯域の下限 1.27ms 付近)。
   ttnn の decode SDPA に T 行を「T ユーザー」として渡す方式 (5.6ms) や chunked SDPA (32 行で 15ms) の置き換え。
-- **大きい T の prefill** (`tsumi/prefill.py`): プロンプトは最大 1024 行ずつ、`minimal_matmul` (同じ bfp4 重み)、
+- **大きい T の prefill** (`tsugumi/prefill.py`): プロンプトは最大 1024 行ずつ、`minimal_matmul` (同じ bfp4 重み)、
   チャンク並列の GDN (`ttnn.transformer.chunk_gated_delta_rule`)、自作の因果 conv カーネル (`kernels/conv_*.cpp`)、
   chunked SDPA で流す。終わったら GDN の状態と conv 履歴を T 行モードの形式に戻して、そのままデコードに入る。
 - **KV 書き込みカーネル** (`kernels/kv_write.cpp`): T 行の K/V をページ KV に競合なく書く。
@@ -61,8 +61,8 @@
 ```bash
 source /path/to/tt-metal/python_env/bin/activate      # ttnn が入っている環境
 export TT_METAL_HOME=/path/to/tt-metal PYTHONPATH=/path/to/tt-metal
-export TSUMI_MODEL_DIR=/path/to/Qwen3.8-27B             # HF 形式のモデル
-export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みのキャッシュ (初回に作られる、約 8 分)
+export TSUGUMI_MODEL_DIR=/path/to/Qwen3.8-27B             # HF 形式のモデル
+export TSUGUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みのキャッシュ (初回に作られる、約 8 分)
 
 # OpenAI 互換サーバー (127.0.0.1:8010)。run_server.sh はハング時にデバイスをリセットして再起動する
 ./run_server.sh --port 8010 [--max-seq 262144]     # または python server.py ...
@@ -83,9 +83,9 @@ base URL を `http://127.0.0.1:8010/v1` にして使えます。
 既定では認証はなく、127.0.0.1 だけで待ち受けます。`--host 0.0.0.0` などでネットワークに出すときは、API キーを設定してください。
 
 ```bash
-export TSUMI_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')   # または --api-key KEY
+export TSUGUMI_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')   # または --api-key KEY
 ./run_server.sh --host 0.0.0.0 --port 8010
-# 複数のキー: TSUMI_API_KEY=key1,key2、またはファイルに 1 行 1 キー: --api-key-file keys.txt (TSUMI_API_KEY_FILE)
+# 複数のキー: TSUGUMI_API_KEY=key1,key2、またはファイルに 1 行 1 キー: --api-key-file keys.txt (TSUGUMI_API_KEY_FILE)
 ```
 
 - キーを設定すると、`GET /` (Web UI のページ) と `GET /health` 以外は `Authorization: Bearer <キー>` が必要になり、
@@ -105,13 +105,13 @@ export TSUMI_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32
   別のマシンから開くときは `--host 0.0.0.0` (API キーの設定を推奨、上の「認証」)。
 - **画像入力**: `messages` の content に OpenAI 形式の `{"type": "image_url", "image_url": {"url": ...}}` (data: URL の base64、
   または http(s) の URL)。ViT (27 層、約 4.6 億パラメータ) はデバイスで動かす (重み bfp8 で DRAM 0.52 GiB、1024×1024 で
-  0.17 秒。`TSUMI_VISION_DEVICE=0` で CPU、約 14 秒)。画像は
-  100 万ピクセル (`TSUMI_IMAGE_MAX_PIXELS`) 以下に縮めて、32×32 ピクセルごとに 1 トークン (最大 1,024 トークン)。
+  0.17 秒。`TSUGUMI_VISION_DEVICE=0` で CPU、約 14 秒)。画像は
+  100 万ピクセル (`TSUGUMI_IMAGE_MAX_PIXELS`) 以下に縮めて、32×32 ピクセルごとに 1 トークン (最大 1,024 トークン)。
   同じ画像 (バイト列のハッシュ) は 2 回目から符号化しない (ホストに 65,536 トークンぶん保持) し、会話の再利用も効く。
   画像トークンにはそれぞれの画像専用の仮想 ID (248,320 以上) を振るので、トークン数が同じ別の画像を誤って再利用しない。
   Web UI は「画像」ボタン・貼り付け・ドラッグ&ドロップで添付できる。動画は未対応。
 - 思考は `chat_template_kwargs.enable_thinking` (既定 false)。`<think>` の中身は `reasoning_content` に分ける。
-- 思考の上限: `thinking_budget` (トークン数。`chat_template_kwargs` 内でも可、既定は `--thinking-budget` / `TSUMI_THINKING_BUDGET`、
+- 思考の上限: `thinking_budget` (トークン数。`chat_template_kwargs` 内でも可、既定は `--thinking-budget` / `TSUGUMI_THINKING_BUDGET`、
   -1 で上限なし)。上限に達すると「時間がないのでここまでの考えで答える」旨の一文と `</think>` を差し込んで答えに移る
   (ステップの切れ目で判定するので最大 7 トークン超える)。上限を指定したときは `max_tokens` は答えの分だけを数える。
 - `logprobs` / `top_logprobs` (20 まで、completions は `logprobs: n`): デバイスの上位 64 の logits での log-softmax なので
@@ -119,51 +119,51 @@ export TSUMI_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32
 - サンプリング: `temperature` > 0 で `top_p`、`top_k` (64 まで)、`min_p`、`seed` が効く。`temperature` がなければ貪欲法。
   MTP の投機的デコードのまま厳密 (1 トークンずつ引いたのと同じ分布)。Qwen の推奨は thinking オフで 0.7 / 0.8 / 20、オンで 0.6 / 0.95 / 20。
 - ツール呼び出し: `tools` / `tool_choice` / 履歴の `tool_calls` と `role: tool` に対応 (OpenAI 形式、ストリーミングも)。
-  モデルが出す `<tool_call>` の XML を `tool_calls` に変換する (`tsumi/toolcall.py`)。
+  モデルが出す `<tool_call>` の XML を `tool_calls` に変換する (`tsugumi/toolcall.py`)。
   `tool_choice` は auto / none。required と関数名の指定は thinking オフのときだけ効く (応答の先頭を `<tool_call>` にする)。
 - 起動は約 40 秒 (重みがページキャッシュにあるとき。再起動直後は 2〜3 分)。
-- ログ: `時刻 レベル [tsumi] 本文` の形式で標準出力に出す。起動時は設定の一覧と段階ごとの所要時間・DRAM の空き、
+- ログ: `時刻 レベル [tsugumi] 本文` の形式で標準出力に出す。起動時は設定の一覧と段階ごとの所要時間・DRAM の空き、
   リクエストごとに受付 (プロンプト長、パラメータ、無視したパラメータ) と完了 (再利用、応答開始、tok/s、終了理由) の 2 行。
-  `TSUMI_LOG_LEVEL=DEBUG` で詳しく。`run_server.sh` は tt-metal / ttnn のログを warning 以上に絞る (`TT_LOGGER_LEVEL`、`LOGURU_LEVEL`)。
+  `TSUGUMI_LOG_LEVEL=DEBUG` で詳しく。`run_server.sh` は tt-metal / ttnn のログを warning 以上に絞る (`TT_LOGGER_LEVEL`、`LOGURU_LEVEL`)。
 - `finish_reason` は `stop` / `length` (max_tokens で打ち切り) / `tool_calls`。`stop` (停止文字列、4 つまで) は応答本文に効き、思考には効かない。
-- モデル名: 既定はモデルのディレクトリ名 (`Qwen3.8-27B`)。`--served-model-name tsumi,gpt-4o` (または `TSUMI_SERVED_MODEL_NAME`) で上書き、
+- モデル名: 既定はモデルのディレクトリ名 (`Qwen3.8-27B`)。`--served-model-name tsugumi,gpt-4o` (または `TSUGUMI_SERVED_MODEL_NAME`) で上書き、
   カンマで別名。リクエストの `model` は何でも受け付ける (別名ならそれを返す)。`/v1/models` の `meta` に量子化と最大文脈。
 - 終了 (SIGTERM / Ctrl-C): 受け付けを止め、生成中なら次のトークンで終えて応答を閉じ、デバイスを閉じて終わる (1 秒前後)。
 - `GET /health` は処理中かどうか・待ちの数・処理中のリクエスト (生成済みトークン数、経過秒) を返す。待っている間にクライアントが
   切断したリクエストは、順番が来ても生成しない。
 - ハング検知: デバイスの処理が 30 秒進まないと (`TT_METAL_OPERATION_TIMEOUT_SECONDS`)、そのリクエストに 503 を返し、
-  `/health` も 503 にして終了コード 75 で終わる。トークンが 300 秒出ないとき (`TSUMI_HANG_BACKSTOP`) も強制終了する。
+  `/health` も 503 にして終了コード 75 で終わる。トークンが 300 秒出ないとき (`TSUGUMI_HANG_BACKSTOP`) も強制終了する。
   `run_server.sh` はそれを見て `tt-smi -r 0` を 2 回 → 再起動する (約 1.5 分で復帰。10 分に 3 回を超えたら諦める)。
 
-環境変数 (旧名の `QE_...` も引き続き読めます):
+環境変数 (旧名の `TSUMI_...`・`QE_...` も引き続き読めます):
 
 | 変数 | 意味 |
 |---|---|
-| `TSUMI_MODEL_DIR` / `TSUMI_CACHE_DIR` | モデルと変換済み重みの場所 (`tsumi/paths.py`) |
-| `TSUMI_NGRAM=0` / `TSUMI_NGRAM_MIN` | n-gram 下書き (プロンプト参照) を使わない / 使う条件の一致長 (既定 6 トークン) |
-| `TSUMI_VERIFY_T` | n-gram 下書きを検証する長いモードの行数 (既定 8、0 で T=4 のまま) |
-| `TSUMI_DRAFT_VOCAB=0` | MTP の下書きを全語彙で出す (既定は頻出 63,168 語、`tsumi/draft_vocab.pt`) |
-| `TSUMI_KV_DTYPE=bf16` | KV キャッシュを bf16 にする (既定 bfp8。bf16 では max_seq 155,648 まで) |
-| `TSUMI_PREFILL_SDPA=hifi4` | prefill の attention を q chunk 128 + HiFi4 に戻す (既定は 256 + HiFi2) |
-| `TSUMI_LARGE_PREFILL=0` / `TSUMI_LARGE_T` | 大きい T の prefill を使わない (T=32 の旧経路) / 1 チャンクの最大行数 (既定 1024) |
-| `TSUMI_MULTI_CONV=0` / `TSUMI_MAX_CONVS` | 複数の会話を保持しない / 保持する会話数の上限 (既定 8、ホストに 1 会話約 180MB) |
-| `TSUMI_SNAPSHOT=0` | 会話の再利用用の状態スナップショットを取らない |
-| `TSUMI_GQA_ATTN=0` | 自作の GQA アテンションを使わず、ttnn の SDPA に戻す |
-| `TSUMI_CHUNKED_PREFILL=0` | (GQA を切ったとき) prefill で chunked SDPA を使わない |
-| `TSUMI_FUSED_GDN=0` | GDN 融合カーネルを使わず、元の op の並びで動かす |
-| `TSUMI_IMAGES=0` | 画像入力を切る (ViT を読み込まない。DRAM 0.52 GiB の節約) |
-| `TSUMI_CAPTURE_GUARD=1` | (デバッグ) リクエストや画像の符号化のたびに、トレース取得の後に新しくコンパイルしたプログラムや増えた DRAM がないかを調べ、あれば WARNING を出す (後のトレース再生でハングする原因になる) |
-| `TSUMI_VISION_DEVICE=0` | ViT を CPU で動かす (fp32、ホストの RAM 約 1.8GB、1024×1024 で約 14 秒) |
-| `TSUMI_IMAGE_MAX_PIXELS` / `TSUMI_IMAGE_MIN_PIXELS` | 画像を縮める上限 / 広げる下限のピクセル数 (既定 1,048,576 / 65,536)。上限を上げると起動時のウォームアップと DRAM の作業領域が増える |
-| `TSUMI_IMAGE_CACHE_TOKENS` | 符号化済みの画像を保持するトークン数 (既定 65,536、1 リクエストの画像はその半分まで) |
-| `TSUMI_IMAGE_FETCH=0` | http(s) の画像 URL を取りに行かない (data: URL だけ受け付ける) |
+| `TSUGUMI_MODEL_DIR` / `TSUGUMI_CACHE_DIR` | モデルと変換済み重みの場所 (`tsugumi/paths.py`) |
+| `TSUGUMI_NGRAM=0` / `TSUGUMI_NGRAM_MIN` | n-gram 下書き (プロンプト参照) を使わない / 使う条件の一致長 (既定 6 トークン) |
+| `TSUGUMI_VERIFY_T` | n-gram 下書きを検証する長いモードの行数 (既定 8、0 で T=4 のまま) |
+| `TSUGUMI_DRAFT_VOCAB=0` | MTP の下書きを全語彙で出す (既定は頻出 63,168 語、`tsugumi/draft_vocab.pt`) |
+| `TSUGUMI_KV_DTYPE=bf16` | KV キャッシュを bf16 にする (既定 bfp8。bf16 では max_seq 155,648 まで) |
+| `TSUGUMI_PREFILL_SDPA=hifi4` | prefill の attention を q chunk 128 + HiFi4 に戻す (既定は 256 + HiFi2) |
+| `TSUGUMI_LARGE_PREFILL=0` / `TSUGUMI_LARGE_T` | 大きい T の prefill を使わない (T=32 の旧経路) / 1 チャンクの最大行数 (既定 1024) |
+| `TSUGUMI_MULTI_CONV=0` / `TSUGUMI_MAX_CONVS` | 複数の会話を保持しない / 保持する会話数の上限 (既定 8、ホストに 1 会話約 180MB) |
+| `TSUGUMI_SNAPSHOT=0` | 会話の再利用用の状態スナップショットを取らない |
+| `TSUGUMI_GQA_ATTN=0` | 自作の GQA アテンションを使わず、ttnn の SDPA に戻す |
+| `TSUGUMI_CHUNKED_PREFILL=0` | (GQA を切ったとき) prefill で chunked SDPA を使わない |
+| `TSUGUMI_FUSED_GDN=0` | GDN 融合カーネルを使わず、元の op の並びで動かす |
+| `TSUGUMI_IMAGES=0` | 画像入力を切る (ViT を読み込まない。DRAM 0.52 GiB の節約) |
+| `TSUGUMI_CAPTURE_GUARD=1` | (デバッグ) リクエストや画像の符号化のたびに、トレース取得の後に新しくコンパイルしたプログラムや増えた DRAM がないかを調べ、あれば WARNING を出す (後のトレース再生でハングする原因になる) |
+| `TSUGUMI_VISION_DEVICE=0` | ViT を CPU で動かす (fp32、ホストの RAM 約 1.8GB、1024×1024 で約 14 秒) |
+| `TSUGUMI_IMAGE_MAX_PIXELS` / `TSUGUMI_IMAGE_MIN_PIXELS` | 画像を縮める上限 / 広げる下限のピクセル数 (既定 1,048,576 / 65,536)。上限を上げると起動時のウォームアップと DRAM の作業領域が増える |
+| `TSUGUMI_IMAGE_CACHE_TOKENS` | 符号化済みの画像を保持するトークン数 (既定 65,536、1 リクエストの画像はその半分まで) |
+| `TSUGUMI_IMAGE_FETCH=0` | http(s) の画像 URL を取りに行かない (data: URL だけ受け付ける) |
 
 ## 制限
 
 - 全部 bfp4 の perplexity は bf16 比で日本語 +5%、英語 +7% (llama.cpp の IQ3_XXS 並み、Q4_0 は +2〜3%)。
   タスクでの品質 (ゼロショット、貪欲法、thinking なし。リリース前の内部確認で、モデルの性能の主張ではありません):
 
-  | ベンチマーク | tsumi (全部 bfp4) |
+  | ベンチマーク | tsugumi (全部 bfp4) |
   |---|---|
   | JCommonsenseQA (1,119 問) | 95.3% (同じスクリプトの llama.cpp Q4_K_M: 95.0%) |
   | JSQuAD (500 問) F1 | 0.933 |
@@ -185,14 +185,14 @@ export TSUMI_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32
 
 | ファイル | 内容 |
 |---|---|
-| `tsumi/model.py` | エンジン本体 (`Qwen35Engine`、`MTPHead`、T 行モード、トレース、prefill) |
-| `tsumi/generator.py` | MTP 投機的デコードの生成ループ |
-| `tsumi/ops.py` | DRAM シャーディングの bfp4/bfp8 行列積、重みの変換とキャッシュ |
-| `tsumi/gdn.py`、`tsumi/gdn_kernel.py` | Gated DeltaNet 層と融合カーネルの起動 |
-| `tsumi/attn.py`、`tsumi/gqa_attn.py`、`tsumi/kv_kernel.py` | attention 層、GQA split-K アテンション、KV 書き込み |
-| `tsumi/vision.py`、`tsumi/vision_tt.py` | 画像入力 (前処理、画像トークンの仮想 ID と M-RoPE の位置、デバイスの ViT) |
-| `tsumi/kvpager.py` | KV ブロックのプールとページ表 (複数の会話) |
-| `tsumi/prefill.py`、`tsumi/conv_kernel.py`、`tsumi/page_copy.py` | 大きい T の prefill、因果 conv カーネル、ページコピー |
+| `tsugumi/model.py` | エンジン本体 (`Qwen35Engine`、`MTPHead`、T 行モード、トレース、prefill) |
+| `tsugumi/generator.py` | MTP 投機的デコードの生成ループ |
+| `tsugumi/ops.py` | DRAM シャーディングの bfp4/bfp8 行列積、重みの変換とキャッシュ |
+| `tsugumi/gdn.py`、`tsugumi/gdn_kernel.py` | Gated DeltaNet 層と融合カーネルの起動 |
+| `tsugumi/attn.py`、`tsugumi/gqa_attn.py`、`tsugumi/kv_kernel.py` | attention 層、GQA split-K アテンション、KV 書き込み |
+| `tsugumi/vision.py`、`tsugumi/vision_tt.py` | 画像入力 (前処理、画像トークンの仮想 ID と M-RoPE の位置、デバイスの ViT) |
+| `tsugumi/kvpager.py` | KV ブロックのプールとページ表 (複数の会話) |
+| `tsugumi/prefill.py`、`tsugumi/conv_kernel.py`、`tsugumi/page_copy.py` | 大きい T の prefill、因果 conv カーネル、ページコピー |
 | `kernels/*.cpp` | 自作カーネル (generic_op で起動) |
 | `server.py` | OpenAI 互換サーバー |
 | `run_server.sh` | サーバーの起動とハング後の自動復帰 (デバイスのリセット → 再起動) |

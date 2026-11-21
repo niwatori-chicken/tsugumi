@@ -2,7 +2,7 @@
 accuracy vs a token-by-token torch recurrence (with an initial state) and trace timing per T.
   python scripts/bench_cgdr.py [T ...]"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import sys, time, torch, ttnn
 
 Nk, Nv, D = 16, 48, 128

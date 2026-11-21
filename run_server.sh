@@ -5,7 +5,7 @@
 # (tt-smi -r 0 twice, waiting after each) and the server is started again. Gives up after MAX_RESTARTS restarts
 # within RESTART_WINDOW seconds. Ctrl-C / SIGTERM stops the server and this script.
 #   TT_SMI (default: tt-smi on PATH, else ~/venv-tt-smi/bin/tt-smi), MAX_RESTARTS (3), RESTART_WINDOW (600),
-#   TT_LOGGER_LEVEL (tt-metal, default warn here), LOGURU_LEVEL (ttnn Python, default WARNING), TSUMI_LOG_LEVEL (server, INFO)
+#   TT_LOGGER_LEVEL (tt-metal, default warn here), LOGURU_LEVEL (ttnn Python, default WARNING), TSUGUMI_LOG_LEVEL (server, INFO)
 cd "$(dirname "$0")"
 export TT_LOGGER_LEVEL=${TT_LOGGER_LEVEL:-warn}  # tt-metal (spdlog level names: warn, not warning)
 export LOGURU_LEVEL=${LOGURU_LEVEL:-WARNING}  # ttnn (Python)

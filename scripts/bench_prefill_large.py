@@ -1,14 +1,14 @@
 """Large-T prefill: time per component (synchronized) for one chunk. python scripts/bench_prefill_large.py [T] [P0]"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import sys, time, collections, torch, ttnn
-import tsumi.paths as tsumi_paths
-from tsumi.model import Precision, Qwen35Engine
+import tsugumi.paths as tsugumi_paths
+from tsugumi.model import Precision, Qwen35Engine
 T = int(sys.argv[1]) if len(sys.argv) > 1 else 1024
 P0 = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
 try:
-    eng = Qwen35Engine(dev, tsumi_paths.MODEL, Precision("bfp4"), f"{tsumi_paths.CACHE}/bfp4", max_seq=max(4096, P0 + T + 64),
+    eng = Qwen35Engine(dev, tsugumi_paths.MODEL, Precision("bfp4"), f"{tsugumi_paths.CACHE}/bfp4", max_seq=max(4096, P0 + T + 64),
                        log=lambda *a: None)
     eng.init_spec(4, mtp=True); eng.init_large_prefill(max(T, 64)); eng.reset_spec()
     lp = eng.large

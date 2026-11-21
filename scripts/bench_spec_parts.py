@@ -1,16 +1,16 @@
 """Per-component device time in T-row mode (each part traced alone)."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import sys
 import torch
 import ttnn
 
 from bench_parts import timeit
-from tsumi.model import Precision, Qwen35Engine
-import tsumi.paths as tsumi_paths
+from tsugumi.model import Precision, Qwen35Engine
+import tsugumi.paths as tsugumi_paths
 
-MODEL = tsumi_paths.MODEL
-CACHE = tsumi_paths.CACHE
+MODEL = tsugumi_paths.MODEL
+CACHE = tsugumi_paths.CACHE
 _L1 = ttnn.L1_MEMORY_CONFIG
 
 

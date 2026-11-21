@@ -1,12 +1,12 @@
-"""Logging for the server and tools: `YYYY-MM-DD HH:MM:SS.mmm LEVEL [tsumi] message` on stdout.
-Level from TSUMI_LOG_LEVEL (default INFO; DEBUG adds per-layer loading and per-request details)."""
+"""Logging for the server and tools: `YYYY-MM-DD HH:MM:SS.mmm LEVEL [tsugumi] message` on stdout.
+Level from TSUGUMI_LOG_LEVEL (default INFO; DEBUG adds per-layer loading and per-request details)."""
 import logging
 import sys
 
 from .env import env
 
 
-def get_logger(name="tsumi"):
+def get_logger(name="tsugumi"):
     lg = logging.getLogger(name)
     if not lg.handlers:
         h = logging.StreamHandler(sys.stdout)

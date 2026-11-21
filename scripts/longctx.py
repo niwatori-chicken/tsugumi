@@ -1,14 +1,14 @@
 """Needle test + speed at long context.  python scripts/longctx.py N_TOKENS"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import os, sys, time, random, glob
 import ttnn
-from tsumi.model import Precision, Qwen35Engine
-from tsumi.generator import Generator
+from tsugumi.model import Precision, Qwen35Engine
+from tsugumi.generator import Generator
 from transformers import AutoTokenizer
-import tsumi.paths as tsumi_paths
-from tsumi.env import env
-MODEL = tsumi_paths.MODEL; CACHE = tsumi_paths.CACHE
+import tsugumi.paths as tsugumi_paths
+from tsugumi.env import env
+MODEL = tsugumi_paths.MODEL; CACHE = tsugumi_paths.CACHE
 N = int(sys.argv[1])
 tok = AutoTokenizer.from_pretrained(MODEL)
 files = sorted(glob.glob(os.environ.get("TT_METAL_HOME", ".") + "/ttnn/cpp/ttnn/operations/**/*.hpp", recursive=True))

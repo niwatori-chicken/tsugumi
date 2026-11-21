@@ -2,9 +2,9 @@
   python scripts/mmlarge.py [M ...]
 Compares: dram-sharded program (per_core_M = M/32), minimal_matmul (default config), ttnn.linear (auto)."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import math, sys, time, torch, ttnn
-from tsumi.ops import DecodeLinear
+from tsugumi.ops import DecodeLinear
 
 Ms = [int(a) for a in sys.argv[1:]] or [32, 128, 256, 512, 1024]
 SHAPES = {  # name: (K, N)

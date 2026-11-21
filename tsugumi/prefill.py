@@ -98,7 +98,7 @@ class LargePrefill:
 
     @classmethod
     def _mm(cls, x, lin, n=None):
-        """minimal_matmul on the decode weights; fp32 accumulation (env TSUMI_PREFILL_MM_FP32=0: the decode config)."""
+        """minimal_matmul on the decode weights; fp32 accumulation (env TSUGUMI_PREFILL_MM_FP32=0: the decode config)."""
         f = lin.ck.math_fidelity
         ck = cls.MM_CK.get(f)
         if ck is None:

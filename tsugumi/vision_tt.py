@@ -30,7 +30,7 @@ ROWS = 128  # SDPA chunk
 BUCKET = 512  # patch rows padded to a multiple of this: few shapes, all compiled by warmup() before the traces
 
 
-_DBG = os.environ.get("TSUMI_VIT_DEBUG") == "1"
+_DBG = os.environ.get("TSUGUMI_VIT_DEBUG") == "1"
 
 
 def _dbg(dev, msg):

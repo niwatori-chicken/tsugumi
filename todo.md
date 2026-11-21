@@ -17,7 +17,7 @@
     公式の generator も、途中から再開する prefill を別にウォームアップしている (`_warmup_prefill_resumed_sweep`)。
   - 確認: 開始位置を変えて何度も prefill し、プログラムキャッシュの数が増えないこと。会話を長く続けても止まらないこと。
 
-- [x] **1b. 複数の会話の切り替え (サブエージェント用)** — 2026-11-19 完了。会話ごとに KV ブロックを分ける方式 (`tsumi/kvpager.py`)。切り替え 85〜125ms、単独と出力一致
+- [x] **1b. 複数の会話の切り替え (サブエージェント用)** — 2026-11-19 完了。会話ごとに KV ブロックを分ける方式 (`tsugumi/kvpager.py`)。切り替え 85〜125ms、単独と出力一致
   - 状態が 1 本しかないので、本体とサブエージェントを交互に流すと毎回全部 prefill し直しになる。
   - 案: 会話ごとに KV のページを分ける (GQA カーネルと KV 書き込みカーネルは恒等ページ表が前提なので対応が必要)。
     または、切り替え時に KV と状態をホストに退避する (KV は 68KiB/トークン、3 万トークンで約 2GB)。
@@ -97,7 +97,7 @@
     DRAM の使用量・空き。
   - リクエストごと: 時刻、プロンプト長、再利用 (種類とトークン数)、応答開始までの時間、生成トークン数、tok/s、確定トークン/ステップ、
     終了理由 (stop / 長さ / ツール呼び出し / 切断 / エラー) を 1 行で。
-  - Python の `logging` でレベル付き (`TSUMI_LOG_LEVEL`)、tt-metal 自体のログとは分けて読めるように。`run_server.sh` の再起動も同じ形式で。
+  - Python の `logging` でレベル付き (`TSUGUMI_LOG_LEVEL`)、tt-metal 自体のログとは分けて読めるように。`run_server.sh` の再起動も同じ形式で。
 
 - [ ] **5c. サーバーの API・運用の穴** (2026-11-20 洗い出し、重要度順)
   - [x] `finish_reason` が常に stop / tool_calls だった → max_tokens で打ち切ったら `length` に (2026-11-20)。
@@ -106,14 +106,14 @@
   - [x] 待ち行列の見える化 (2026-11-20): `/health` に busy・待ち数・処理中のリクエスト。待っている間に切断したリクエストは生成しない
     (ロックの獲得を非同期にして 0.25 秒ごとに切断を確認)。
   - [x] 認証なし (`--host 0.0.0.0` で同じネットワークの誰でも使える)。`--api-key` (Bearer) を付ける。
-    → 2026-11-22 対応: `--api-key` / `TSUMI_API_KEY` (カンマ区切りで複数) / `--api-key-file`。`GET /`・`GET /health`
+    → 2026-11-22 対応: `--api-key` / `TSUGUMI_API_KEY` (カンマ区切りで複数) / `--api-key-file`。`GET /`・`GET /health`
     以外は Bearer が必要 (401)、`/health` はキーなしだと詳細を出さない。Web UI は 401 でキーを聞いてブラウザに保存。
     キーの比較は定数時間。TLS は扱わない (README: リバースプロキシの後ろに置く)。
   - [x] thinking オンだと max_tokens に思考のトークンも含まれ、答えの前に切れることがある → `thinking_budget` で思考の上限を別に持つ
     (上限で締めの一文と `</think>` を差し込み、max_tokens は答えだけを数える。2026-11-20)。
   - [x] 長いプロンプトのトークン化がイベントループを止めていた → スレッドで実行 (2026-11-20)。
   - [x] 終了時 (SIGTERM / Ctrl-C) にデバイスを閉じずに落ちていた → 生成を次のトークンで止め、デバイスを閉じて終了コード 0 (2026-11-20)。
-  - [x] モデル名が固定だった → 既定はモデルのディレクトリ名、`--served-model-name` (`TSUMI_SERVED_MODEL_NAME`、カンマで別名) で上書き。
+  - [x] モデル名が固定だった → 既定はモデルのディレクトリ名、`--served-model-name` (`TSUGUMI_SERVED_MODEL_NAME`、カンマで別名) で上書き。
     リクエストの `model` は検証しない (別名なら返す)。`/v1/models` に量子化・最大文脈 (2026-11-20)。
   - [x] `/v1/completions` (旧形式、logprobs は旧形式) と `/tokenize`・`/detokenize` (vLLM 形式) を追加 (2026-11-20)。
 
@@ -121,10 +121,10 @@
   - [x] CPU の ViT (HF 実装、fp32) → 画像トークンに仮想 ID (画像ごと) → prefill で埋め込みを差し替え、M-RoPE の位置を渡す →
     サーバーの `image_url` (data: / http(s)) → Web UI の添付 (2026-11-20)。HF と位置・cos/sin が一致、8 層の logits の PCC 0.999。
     仮想 ID なので会話の再利用はトークン ID の比較のまま画像を区別できる (ハッシュの別管理は不要だった)。
-  - [x] ViT をデバイスへ (2026-11-20、ブランチ `vit-device`、`tsumi/vision_tt.py`): 1024×1024 で CPU 14.2 秒 → **0.17 秒**。
+  - [x] ViT をデバイスへ (2026-11-20、ブランチ `vit-device`、`tsugumi/vision_tt.py`): 1024×1024 で CPU 14.2 秒 → **0.17 秒**。
     重み bfp8 で DRAM 0.52 GiB (空き 1.74 → 1.19 GiB)、CPU の fp32 版との PCC 0.9987〜0.9995。パッチ数を 512 刻みに
     そろえ、全バケットをトレースの取得前にコンパイルする (トレース後に初めて動かしたプログラムは、次のトレース再生の後に
-    ハングした)。CPU 版は `TSUMI_VISION_DEVICE=0`。
+    ハングした)。CPU 版は `TSUGUMI_VISION_DEVICE=0`。
   - [ ] 動画 (`video_url`、フレームごとの時間位置)。必要になったら。
   - モデルは 27 層 ViT (hidden 1152、約 4 億パラメータ、bf16 0.8GB) + 2×2 マージで 5120 次元の埋め込み。deepstack なし
     (`deepstack_visual_indexes` が空) なので、画像トークンの埋め込みを差し替えるだけ。位置は M-RoPE (t, h, w、interleaved、
@@ -149,7 +149,7 @@
     (github.com/teacher57/qwen3.8-27b-bfcl-train、bf16、vLLM、FC、thinking あり、temperature 0.001、1 回):
     non_live 85.8 / live 80.5 (README の値。件数から計算すると 78.3) / multi_turn 60.2 (base 72.5、miss_func 53.0、
     miss_param 51.5、long_context 64.0) / irrelevance 79.2 / live_irrelevance 74.9。
-    tsumi の実行は thinking なし・greedy なので、比べるときはこの違いを注記する。
+    tsugumi の実行は thinking なし・greedy なので、比べるときはこの違いを注記する。
     MT-Bench・ELYZA の Qwen3.8-27B の公表値は見つからなかった。採点 LLM が違うと点数がずれるので、
     絶対値を見て、回答を読んで確かめる。
 

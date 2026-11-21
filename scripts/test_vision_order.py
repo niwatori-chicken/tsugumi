@@ -5,7 +5,7 @@ Without the warm-up (ViT programs first compiled after the trace capture) the se
 hung the device (2026-11-20).
 Finds which step hangs (TT_METAL_OPERATION_TIMEOUT_SECONDS=30 turns a hang into an exception)."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import os
 os.environ.setdefault("TT_METAL_OPERATION_TIMEOUT_SECONDS", "30")
 import io
@@ -16,11 +16,11 @@ import ttnn
 from PIL import Image, ImageDraw
 from transformers import AutoTokenizer
 
-import tsumi.paths as P
-from tsumi.generator import Generator
-from tsumi.model import Precision, Qwen35Engine
-from tsumi.vision import IMAGE_PAD, ImageTokens, VisionEncoder
-from tsumi.vision_tt import VisionTT
+import tsugumi.paths as P
+from tsugumi.generator import Generator
+from tsugumi.model import Precision, Qwen35Engine
+from tsugumi.vision import IMAGE_PAD, ImageTokens, VisionEncoder
+from tsugumi.vision_tt import VisionTT
 
 
 def img(color, size=(512, 384)):

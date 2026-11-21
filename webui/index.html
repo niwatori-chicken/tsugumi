@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>tsumi chat</title>
+<title>tsugumi chat</title>
 <style>
   :root {
     --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e3e2dd;
@@ -61,7 +61,7 @@
 </head>
 <body>
 <header>
-  <b>tsumi</b>
+  <b>tsugumi</b>
   <label><input type="checkbox" id="think"> thinking</label>
   <label title="思考のトークン数の上限 (空欄 = サーバーの既定)">思考上限 <input type="number" id="tbudget" min="0" step="256" placeholder="なし"></label>
   <label>temperature <input type="number" id="temp" min="0" max="2" step="0.1" value="0"></label>
@@ -131,8 +131,8 @@ function showPending() {
 }
 
 const store = {     // remembered settings (per browser; failures are ignored)
-  get(k, d) { try { const v = localStorage.getItem("tsumi." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
-  set(k, v) { try { localStorage.setItem("tsumi." + k, JSON.stringify(v)); } catch {} },
+  get(k, d) { try { const v = localStorage.getItem("tsugumi." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("tsugumi." + k, JSON.stringify(v)); } catch {} },
 };
 for (const [id, prop] of [["think", "checked"], ["temp", "value"], ["topp", "value"], ["maxtok", "value"], ["sys", "value"], ["tbudget", "value"]]) {
   $(id)[prop] = store.get(id, $(id)[prop]);

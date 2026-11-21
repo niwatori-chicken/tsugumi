@@ -5,7 +5,7 @@
 2. logits: HF text model (N layers, inputs_embeds with the image embeddings, 3-D position ids) vs the engine
    in the T-row mode (per row) and the large-T prefill (last row)."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
 import argparse
 import io
 from types import SimpleNamespace
@@ -13,11 +13,11 @@ from types import SimpleNamespace
 import torch
 from PIL import Image, ImageDraw
 
-import tsumi.paths as tsumi_paths
-from tsumi.model import LM_PREFIX, LazySD
-from tsumi.vision import IMAGE_PAD, ImageTokens, VisionEncoder
+import tsugumi.paths as tsugumi_paths
+from tsugumi.model import LM_PREFIX, LazySD
+from tsugumi.vision import IMAGE_PAD, ImageTokens, VisionEncoder
 
-MODEL = tsumi_paths.MODEL
+MODEL = tsugumi_paths.MODEL
 
 
 def test_image(w, h):
@@ -99,7 +99,7 @@ def main():
     # 1. positions
     pos3, delta = hf_positions(cfg, ids_exp, grids)
 
-    from tsumi.model import Qwen35Engine
+    from tsugumi.model import Qwen35Engine
 
     class Probe:  # rope_pos / set_sequence / _rope_rows without a device
         rope_pos = Qwen35Engine.rope_pos
@@ -143,10 +143,10 @@ def main():
     print("HF done", flush=True)
 
     import ttnn
-    from tsumi.model import Precision
+    from tsugumi.model import Precision
     dev = ttnn.open_device(device_id=0, trace_region_size=256 << 20, l1_small_size=24576)
     try:
-        eng = Qwen35Engine(dev, MODEL, Precision("bfp4"), f"{tsumi_paths.CACHE}/bfp4", max_seq=2048,
+        eng = Qwen35Engine(dev, MODEL, Precision("bfp4"), f"{tsugumi_paths.CACHE}/bfp4", max_seq=2048,
                            n_layers=a.layers, log=lambda *x: None)
         eng.images = reg
         eng.init_spec(32)

@@ -134,9 +134,9 @@ def load_image(url, max_bytes=32 << 20, timeout=30):
         return base64.b64decode(b64)
     if url.startswith(("http://", "https://")):
         if env("IMAGE_FETCH", "1") != "1":
-            raise ValueError("image: fetching URLs is off (TSUMI_IMAGE_FETCH=0); send a data: URL")
+            raise ValueError("image: fetching URLs is off (TSUGUMI_IMAGE_FETCH=0); send a data: URL")
         import urllib.request
-        r = urllib.request.Request(url, headers={"User-Agent": "tsumi"})
+        r = urllib.request.Request(url, headers={"User-Agent": "tsugumi"})
         with urllib.request.urlopen(r, timeout=timeout) as f:
             data = f.read(max_bytes + 1)
         if len(data) > max_bytes:
@@ -147,7 +147,7 @@ def load_image(url, max_bytes=32 << 20, timeout=30):
 
 class VisionEncoder:
     """Image -> [n, 5120] embeddings, n = (h/32) * (w/32): the HF preprocessing on the CPU, then the ViT + 2x2 merger
-    on the device (tt: a tsumi.vision_tt.VisionTT, run under device_lock) or on the CPU (float32, HF model)."""
+    on the device (tt: a tsugumi.vision_tt.VisionTT, run under device_lock) or on the CPU (float32, HF model)."""
 
     def __init__(self, model_dir, max_pixels=None, min_pixels=None, threads=None, log=print, tt=None,
                  device_lock=None, on_device_error=None, after_device=None):
