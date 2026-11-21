@@ -216,8 +216,17 @@ async function send() {
   const t0 = performance.now();
   let tFirst = null;
   try {
-    const r = await fetch("/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json" },
-                                                   body: JSON.stringify(req), signal: ctrl.signal });
+    let r;
+    for (;;) {  // with server authentication: ask for the API key once and keep it in this browser
+      const headers = { "content-type": "application/json" };
+      const key = store.get("apiKey", "");
+      if (key) headers.authorization = "Bearer " + key;
+      r = await fetch("/v1/chat/completions", { method: "POST", headers, body: JSON.stringify(req), signal: ctrl.signal });
+      if (r.status !== 401) break;
+      const k = prompt(key ? "API キーが違います。もう一度入力してください" : "このサーバーには API キーが必要です");
+      if (!k) break;
+      store.set("apiKey", k.trim());
+    }
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error?.message || r.statusText);
     const reader = r.body.getReader(), dec = new TextDecoder();
     let buf = "";

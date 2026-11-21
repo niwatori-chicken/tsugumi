@@ -18,6 +18,10 @@ each image becomes its own virtual token ids, so conversation reuse tells images
 `logprobs` / `top_logprobs` (<= 20; completions: logprobs = n): log-softmax over the device top-64 logits (a
 little too high; tokens outside it, only forced ones, get -9999); chat logprobs cover the content, not the thinking.
 
+Authentication: with --api-key / TSUMI_API_KEY (comma separated) or --api-key-file (one key per line), every
+endpoint except GET / (the web UI page) and GET /health needs `Authorization: Bearer <key>` (OpenAI clients send it
+from their api_key setting); others get 401. Without keys the server is open, as before (fine on 127.0.0.1).
+
 Shutdown (SIGINT / SIGTERM): stop accepting requests, end a running generation at its next token, close the device.
 
 Hang handling: a device wait that makes no progress for TT_METAL_OPERATION_TIMEOUT_SECONDS (default here 30)
@@ -26,6 +30,7 @@ faulthandler backstop (TSUMI_HANG_BACKSTOP seconds without a new token, default 
 wait hangs without raising. run_server.sh resets the device and restarts the server after either.
 """
 import argparse
+import hmac
 import json
 import os
 import signal
@@ -421,21 +426,52 @@ def log_done(tag, info, ncalls=0):
              f", {info['total']:.1f}s")
 
 
-def make_app(backend):
+def load_api_keys(arg, path):
+    keys = [k.strip() for k in (arg or "").split(",") if k.strip()]
+    if path:
+        keys += [l.strip() for l in open(path) if l.strip() and not l.startswith("#")]
+    return keys
+
+
+def make_app(backend, api_keys=()):
     from fastapi import FastAPI, Request
     from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
     from starlette.concurrency import run_in_threadpool
 
     app = FastAPI()
+    keys = [k.encode() for k in api_keys]
+    OPEN = {"/", "/health"}
+
+    if keys:
+        @app.middleware("http")
+        async def auth(req, call_next):
+            if req.url.path in OPEN and req.method in ("GET", "HEAD"):
+                return await call_next(req)
+            h = req.headers.get("authorization", "")
+            given = (h[7:] if h[:7].lower() == "bearer " else "").strip().encode()
+            # compare against every key in constant time, so the timing does not tell which one is close
+            ok = False
+            for k in keys:
+                ok |= hmac.compare_digest(given, k)
+            if not ok:
+                log.warning(f"rejected {req.method} {req.url.path} from {req.client.host if req.client else '?'}: "
+                            f"{'no' if not given else 'wrong'} API key")
+                return JSONResponse({"error": {"message": "invalid or missing API key (Authorization: Bearer ...)",
+                                               "type": "invalid_request_error", "code": "invalid_api_key"}},
+                                    status_code=401)
+            return await call_next(req)
 
     @app.get("/")
     def webui():  # minimal chat page (webui/index.html)
         return FileResponse(os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui", "index.html"))
 
     @app.get("/health")
-    def health():
+    def health(req: Request):
         if backend.dead:
             return JSONResponse({"status": "error", "error": backend.dead}, status_code=503)
+        if keys:  # stays open for health checks, but without the details of the running request
+            return {"status": "ok", "busy": backend.active is not None, "waiting": backend.waiting,
+                    "auth": True}
         a = backend.active
         return {"status": "ok", "busy": a is not None, "waiting": backend.waiting,
                 "active": None if a is None else dict(id=a["id"], prompt_tokens=a["prompt"],
@@ -920,8 +956,14 @@ def main():
                     help="name(s) in the API, comma separated (default: the model directory name, e.g. Qwen3.8-27B)")
     ap.add_argument("--thinking-budget", type=int, default=int(env("THINKING_BUDGET", "-1")),
                     help="default cap on thinking tokens when a request sets none (-1: no cap)")
+    ap.add_argument("--api-key", default=env("API_KEY", ""),
+                    help="require Authorization: Bearer <key>; several keys comma separated (env TSUMI_API_KEY)")
+    ap.add_argument("--api-key-file", default=env("API_KEY_FILE", ""),
+                    help="file with one API key per line (env TSUMI_API_KEY_FILE)")
     a = ap.parse_args()
     import uvicorn
+    api_keys = load_api_keys(a.api_key, a.api_key_file)
+    a.auth = f"{len(api_keys)} API key(s)" if api_keys else "off"
 
     THINK_BUDGET[0] = a.thinking_budget if a.thinking_budget >= 0 else None
 
@@ -933,7 +975,7 @@ def main():
     t0 = time.time()
     backend = Backend(a.max_seq)
     log.info(f"ready in {time.time() - t0:.0f}s: http://{a.host}:{a.port}/ (web UI), /v1/chat/completions")
-    if a.host not in ("127.0.0.1", "localhost", "::1"):
+    if a.host not in ("127.0.0.1", "localhost", "::1") and not api_keys:
         log.warning(f"listening on {a.host} without authentication: anyone on the network can use the server")
     # uvicorn handles SIGINT / SIGTERM: stop accepting, give open requests a few seconds, then return here
     class Server(uvicorn.Server):
@@ -941,7 +983,7 @@ def main():
             backend.stopping = True
             super().handle_exit(sig, frame)
 
-    server = Server(uvicorn.Config(make_app(backend), host=a.host, port=a.port, log_level="warning",
+    server = Server(uvicorn.Config(make_app(backend, api_keys), host=a.host, port=a.port, log_level="warning",
                                    timeout_graceful_shutdown=5))
     # uvicorn re-raises the signal it caught after shutting down, with the handler that was installed before it:
     # with the default handler that kills the process before the device is closed, so install a harmless one
@@ -961,7 +1003,7 @@ def log_settings(a):
     ngram = "off" if g("NGRAM", "3") == "0" else f"when >= {g('NGRAM_MIN', '6')} tokens repeat"
     items = [
         ("model", MODEL_DIR), ("served as", ", ".join(MODEL_NAMES)), ("weights cache", CACHE),
-        ("listen", f"{a.host}:{a.port}"),
+        ("listen", f"{a.host}:{a.port}"), ("auth", a.auth),
         ("max_seq", f"{a.max_seq} tokens"),
         ("thinking", "no default budget" if a.thinking_budget < 0 else f"default budget {a.thinking_budget} tokens"),
         ("KV cache", g("KV_DTYPE", "bfp8")),

@@ -47,8 +47,12 @@
 ## 必要なもの
 
 - Blackhole P100A (P150 でも動くはず。未確認)
-- tt-metal (開発時は `v0.79.0-dev20260916-3-g5f02a6718f4`) と同じ venv の ttnn、`transformers` (5.12 で確認)、
-  サーバーには `fastapi` と `uvicorn`
+- ホストの RAM: 32GB で動作確認
+- tt-metal をソースからビルドしたもの (開発時は `v0.79.0-dev20260916-3-g5f02a6718f4`)。tt-metal の
+  `models/` を import するので、`PYTHONPATH` に tt-metal のディレクトリが要る
+- 同じ venv に ttnn、`torch`、`transformers` (5.12 で確認)、`safetensors`、`Pillow` (画像入力)、
+  サーバー用の `fastapi` と `uvicorn`
+- `tt-smi` (`run_server.sh` がハング後のリセットに使う。PATH になければ `TT_SMI=/path/to/tt-smi`)
 - モデル: Qwen3.8-27B の HF 形式 (bf16、約 56GB)
 - 変換済み重みのキャッシュ用に約 16GB (bfp4)
 
@@ -64,6 +68,33 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
 ./run_server.sh --port 8010 [--max-seq 262144]     # または python server.py ...
 ```
 
+試す:
+
+```bash
+curl -s http://127.0.0.1:8010/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model": "Qwen3.8-27B", "messages": [{"role": "user", "content": "こんにちは"}]}'
+```
+
+OpenAI の SDK や、OpenAI 互換の API を使えるクライアント (コーディングエージェントなど) からは、
+base URL を `http://127.0.0.1:8010/v1` にして使えます。
+
+### 認証 (別のマシンから使うとき)
+
+既定では認証はなく、127.0.0.1 だけで待ち受けます。`--host 0.0.0.0` などでネットワークに出すときは、API キーを設定してください。
+
+```bash
+export TSUMI_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')   # または --api-key KEY
+./run_server.sh --host 0.0.0.0 --port 8010
+# 複数のキー: TSUMI_API_KEY=key1,key2、またはファイルに 1 行 1 キー: --api-key-file keys.txt (TSUMI_API_KEY_FILE)
+```
+
+- キーを設定すると、`GET /` (Web UI のページ) と `GET /health` 以外は `Authorization: Bearer <キー>` が必要になり、
+  ない・違うときは 401 を返します。OpenAI の SDK やクライアントは API キーの設定をこのヘッダで送ります。
+- `/health` はキーなしでも答えますが、処理中のリクエストの詳細は出しません。
+- Web UI は最初の送信で 401 になるとキーを聞き、そのブラウザに保存します。
+- 通信は暗号化しません。インターネットに出すときは、TLS を終端するリバースプロキシ (Caddy、nginx など) の後ろに置いてください。
+- キーなしで 127.0.0.1 以外で待ち受けると、起動時に警告を出します。
+
 サーバー:
 
 - `POST /v1/chat/completions`・`POST /v1/completions` (テンプレートなしの続き書き、プロンプトは文字列かトークン ID 列。どちらも stream 対応)、
@@ -71,7 +102,7 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
 - **Web UI**: ブラウザで `http://127.0.0.1:8010/` を開くと、試し用の最小限のチャット画面 (`webui/index.html`)。
   thinking、温度、最大トークン数、system プロンプトを切り替えられ、応答ごとにプロンプト側 (再利用、画像の読み込み、
   prefill のトークン数・秒・tok/s、応答開始) と生成側 (トークン数、tok/s、トークン/ステップ、思考) の数値を表示する。
-  別のマシンから開くときは `--host 0.0.0.0`。
+  別のマシンから開くときは `--host 0.0.0.0` (API キーの設定を推奨、上の「認証」)。
 - **画像入力**: `messages` の content に OpenAI 形式の `{"type": "image_url", "image_url": {"url": ...}}` (data: URL の base64、
   または http(s) の URL)。ViT (27 層、約 4.6 億パラメータ) はデバイスで動かす (重み bfp8 で DRAM 0.52 GiB、1024×1024 で
   0.17 秒。`TSUMI_VISION_DEVICE=0` で CPU、約 14 秒)。画像は
@@ -130,7 +161,20 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
 ## 制限
 
 - 全部 bfp4 の perplexity は bf16 比で日本語 +5%、英語 +7% (llama.cpp の IQ3_XXS 並み、Q4_0 は +2〜3%)。
-  実務的なタスクでの品質は未評価。
+  タスクでの品質 (ゼロショット、貪欲法、thinking なし。リリース前の内部確認で、モデルの性能の主張ではありません):
+
+  | ベンチマーク | tsumi (全部 bfp4) |
+  |---|---|
+  | JCommonsenseQA (1,119 問) | 95.3% (同じスクリプトの llama.cpp Q4_K_M: 95.0%) |
+  | JSQuAD (500 問) F1 | 0.933 |
+  | MGSM-ja (250 問) | 86.4% |
+  | HumanEval / HumanEval+ | 93.3 / 89.0 |
+  | GPQA Diamond (先頭 50 問、thinking あり) | 84% |
+  | BFCL v4 non-live / live / multi-turn | 84.3 / 77.9 / 58.1 (bf16 のサードパーティ計測、thinking あり: 85.8 / 78.3 / 60.2) |
+  | Japanese MT-Bench / ELYZA-tasks-100 (採点は Gemini Decision 1) | 8.46 / 10、4.18 / 5 |
+
+  評価のスクリプトは `scripts/bench_quality.py`、`run_bfcl.py`、`judge_bench.py`。
+- バッチは 1 (リクエストは 1 つずつ処理)。動画入力、`response_format` (構造化出力)、`n` > 1 は未対応。
 - 会話の続きは再利用します (前回のプロンプト + 返答、またはアシスタントのターン開始位置の状態スナップショットから差分だけ prefill)。
   複数の会話 (本体とサブエージェントなど) は KV のブロックを分けて保持し、リクエストごとに切り替えます (約 0.1 秒)。
   KV の合計は最大文脈ぶん (262,144 トークン) で、足りなくなると最後に使ったのが最も古い会話から捨てます。
@@ -151,6 +195,8 @@ export TSUMI_CACHE_DIR=/path/to/qe_cache/Qwen3.8-27B    # 変換済み重みの�
 | `tsumi/prefill.py`、`tsumi/conv_kernel.py`、`tsumi/page_copy.py` | 大きい T の prefill、因果 conv カーネル、ページコピー |
 | `kernels/*.cpp` | 自作カーネル (generic_op で起動) |
 | `server.py` | OpenAI 互換サーバー |
+| `run_server.sh` | サーバーの起動とハング後の自動復帰 (デバイスのリセット → 再起動) |
+| `webui/index.html` | 試し用のチャット画面 |
 | `scripts/` | 開発用のテスト・計測・perplexity 評価 (使い方は [`scripts/README.md`](scripts/README.md)) |
 
 ## ライセンス
