@@ -48,6 +48,8 @@
 | `test_sampling.py [N]` | サンプリング: seed の再現性、投機的サンプリングと 1 トークンずつの分布の比較 (TV 距離)、速度と採択率。<br>`EXACT_PROMPT=...` で比較用のプロンプトを変える |
 | `test_toolcall.py` | ツール呼び出しの解析 (デバイス不要): ストリームの全分割で同じ結果、型変換、途中で切れた呼び出し、テンプレートとの往復 |
 | `test_tools.py [URL]` | 起動中のサーバーに対して、架空のツールでエージェントのループを回す (並列呼び出し、stream、thinking、tool_choice) |
+| `judge_bench.py gen\|judge\|summary BENCH ...` | LLM as a judge: Japanese MT-Bench (80 問 × 2 ターン) と ELYZA-tasks-100。OpenAI 互換サーバーで回答を作り (tsumi でも llama-server でも)、Gemini で採点 (キーは `GEMINI_API_KEY` か `~/.config/gemini_api_key`) |
+| `run_bfcl.py generate\|evaluate ...` | BFCL (ツール呼び出し) を OpenAI 互換サーバーの FC モードで。別の venv で動かす: `/mnt/HDD/venvs/bfcl/bin/python` (`pip install bfcl-eval soundfile`)。結果は `/mnt/HDD/eval/quality/bfcl` |
 | `test_api2.py [URL]` | 起動中のサーバーに対して、思考の上限・logprobs・`/v1/completions`・`/tokenize` (26 項目) |
 | `test_images.py [URL]` | 起動中のサーバーに対して、画像入力 (図形の色と形、文字の読み取り、2 枚の比較、会話の再利用、stream、エラー) |
 | `prefill_agree.py OUT.pt [テキスト]` | prefill 中の位置ごとの argmax を保存する (prefill 経路どうしの比較用) |

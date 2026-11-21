@@ -134,8 +134,22 @@
 
 - [ ] **2d. 公開前の品質評価 (記事とリポジトリのリリースの前提、2026-11-21 ユーザー判断)**
   - LLM as a judge のベンチ (候補: Japanese MT-Bench、ELYZA-tasks-100。採点に使う LLM と費用はユーザーと決める)。
+    - [x] Gemini Decision 1 で採点 (2026-11-21、無料枠): ELYZA 4.18 / 5、MT-Bench 8.46 / 10 (1 ターン目 8.62、
+      2 ターン目 8.29)。壊した回答での確認では、どれもはっきり減点された (doc/11)。
   - ツール呼び出し・エージェント利用のベンチ (候補: BFCL、τ-bench / τ²-bench)。
-  - 比較対象: 同じ条件の llama.cpp (Q4_K_M など)、可能なら公表値。結果は記事の第 1 部の表と第 4 部へ。
+    - [x] BFCL v4 (2026-11-21、thinking なし): non_live 84.3 / live 77.9 / multi_turn 58.1。bf16 のサードパーティ計測
+      (85.8 / 78.3 / 60.2) と同水準 (doc/11)。irrelevance (-15pt) と parallel (-9.5pt) の差は thinking の有無の可能性。
+  - 目的はリリースに耐える品質かの内部確認 (性能を誇示する数字ではない)。比較対象は公表値・サードパーティの数値
+    (採点 LLM や設定の違いは注記する)。結果は記事の第 1 部の表と第 4 部へ。
+  - llama.cpp Q4_K_M との同条件比較は保留 (2026-11-21): CPU で 1.9 tok/s、MT-Bench だけで 30〜40 時間かかる。
+    7 問分の回答は /mnt/HDD/eval/quality/judge/gguf_Q4_K_M/ に残してある。
+  - 公表値 (2026-11-21 調査): Qwen 公式のモデルカードに BFCL・MT-Bench・ELYZA はない。BFCL v4 のサードパーティ計測
+    (github.com/teacher57/qwen3.8-27b-bfcl-train、bf16、vLLM、FC、thinking あり、temperature 0.001、1 回):
+    non_live 85.8 / live 80.5 (README の値。件数から計算すると 78.3) / multi_turn 60.2 (base 72.5、miss_func 53.0、
+    miss_param 51.5、long_context 64.0) / irrelevance 79.2 / live_irrelevance 74.9。
+    tsumi の実行は thinking なし・greedy なので、比べるときはこの違いを注記する。
+    MT-Bench・ELYZA の Qwen3.8-27B の公表値は見つからなかった。採点 LLM が違うと点数がずれるので、
+    絶対値を見て、回答を読んで確かめる。
 
 - [ ] **6. 大きい T の prefill の細かい改善**
   - slice と要素ごとの op が 1 チャンクで約 250ms。融合する。
