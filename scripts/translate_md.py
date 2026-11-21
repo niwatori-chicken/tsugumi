@@ -2,13 +2,17 @@
 (plamo_port/serve_plamo.sh, OpenAI-compatible, port 8000).
 
   python scripts/translate_md.py docs/article/part1.md docs/article/part1.ja.md [--api http://127.0.0.1:8000]
-      [--bilingual] [--jobs 8]
+      [--bilingual] [--jobs 8] [--form plain|polite] [--glossary terms.tsv] [--context TEXT|@file] [--history N]
 
 - Kept as is: fenced code blocks, HTML comments, blank lines, table separator rows, cells without letters.
 - Translated: headings, paragraphs, list items (with their continuation lines), table cells (one request per cell).
 - Inline code, URLs and [[PLACEHOLDERS]] are checked after translation: a block that lost one is reported (and
   marked with <!-- CHECK --> in the output), so it can be fixed by hand.
 - --bilingual puts the English source of each translated block in an HTML comment above it (for reviewing).
+- PLaMo 3 Translate's chat template options: --form (plain = 常体, polite = 敬体), --glossary (TSV: source<TAB>target
+  per line, '#' comments; only the terms that occur in a block are sent with it), --context (text, or @path).
+- --history N: translate the headings and paragraphs in order, passing the previous N (source, translation) pairs as
+  conversation history (consistent wording across blocks; sequential, so slower). Table cells stay parallel.
 Needs only the standard library."""
 import argparse
 import concurrent.futures as cf
@@ -58,9 +62,24 @@ def blocks(lines):
     return out
 
 
-def translate(api, text):
-    body = dict(model="plamo", messages=[{"role": "user", "content": text}],
-                chat_template_kwargs={"target_lang": "ja", "source_lang": "en"}, temperature=0, max_tokens=4096)
+OPTS = {}
+
+
+def translate(api, text, history=()):
+    kw = {"target_lang": "ja", "source_lang": "en"}
+    if OPTS.get("form"):
+        kw["form"] = OPTS["form"]
+    if OPTS.get("context"):
+        kw["context"] = OPTS["context"]
+    terms = [dict(source=a, target=b) for a, b in OPTS.get("glossary", [])  # whole words (plural / -d allowed)
+             if re.search(r"\b" + re.escape(a) + r"(s|es|d)?\b", text, re.I)]
+    if terms:
+        kw["glossary"] = terms
+    msgs = []
+    for en, ja in history:
+        msgs += [{"role": "user", "content": en}, {"role": "assistant", "content": ja}]
+    body = dict(model="plamo", messages=msgs + [{"role": "user", "content": text}],
+                chat_template_kwargs=kw, temperature=0, max_tokens=4096)
     models = json.loads(urllib.request.urlopen(api + "/v1/models", timeout=30).read())
     body["model"] = models["data"][0]["id"]
     r = urllib.request.Request(api + "/v1/chat/completions", json.dumps(body).encode(),
@@ -82,7 +101,17 @@ def main():
     ap.add_argument("--api", default="http://127.0.0.1:8000")
     ap.add_argument("--bilingual", action="store_true")
     ap.add_argument("--jobs", type=int, default=8)
+    ap.add_argument("--form", choices=["plain", "polite"])
+    ap.add_argument("--glossary")
+    ap.add_argument("--context")
+    ap.add_argument("--history", type=int, default=0)
     a = ap.parse_args()
+    OPTS["form"] = a.form
+    if a.context:
+        OPTS["context"] = open(a.context[1:], encoding="utf-8").read().strip() if a.context.startswith("@") else a.context
+    if a.glossary:
+        OPTS["glossary"] = [tuple(l.rstrip("\n").split("\t", 1)) for l in open(a.glossary, encoding="utf-8")
+                            if l.strip() and not l.startswith("#") and "\t" in l]
     bl = blocks(open(a.src, encoding="utf-8").read().split("\n"))
 
     jobs = {}  # key -> english text
@@ -97,8 +126,15 @@ def main():
                 for ci, cell in enumerate(row.strip().strip("|").split("|")):
                     if re.search(r"[A-Za-z]{2}", KEEP_TOKENS.sub("", cell)):
                         jobs[(bi, (ri, ci))] = cell.strip()
+    seq = [k for k in jobs if k[1] is None] if a.history else []
+    par = [k for k in jobs if k not in set(seq)]
     with cf.ThreadPoolExecutor(a.jobs) as ex:
-        done = dict(zip(jobs, ex.map(lambda t: translate(a.api, t), jobs.values())))
+        fut = ex.map(lambda k: translate(a.api, jobs[k]), par)
+        hist, done = [], {}
+        for k in seq:  # in document order, with the previous pairs as history
+            done[k] = translate(a.api, jobs[k], hist[-a.history:])
+            hist.append((jobs[k], done[k]))
+        done.update(zip(par, fut))
 
     bad, out = [], []
     for bi, (kind, ls) in enumerate(bl):
