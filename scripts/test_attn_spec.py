@@ -1,6 +1,6 @@
 """Attention layer: T=1 sequential decode vs T-row paged path on the same inputs (layer 3 real weights)."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import sys
 
 import torch

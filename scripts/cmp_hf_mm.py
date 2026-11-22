@@ -5,7 +5,7 @@
 2. logits: HF text model (N layers, inputs_embeds with the image embeddings, 3-D position ids) vs the engine
    in the T-row mode (per row) and the large-T prefill (last row)."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import argparse
 import io
 from types import SimpleNamespace

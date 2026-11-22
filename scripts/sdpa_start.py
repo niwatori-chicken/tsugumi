@@ -1,7 +1,7 @@
 """chunked SDPA: start index as int (legacy) vs device tensor (chunk_start_idx_tensor) — program cache growth,
 speed and agreement.  python scripts/sdpa_start.py"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import time, torch, ttnn
 
 T, NB = 1024, 2560  # 160K positions of page table

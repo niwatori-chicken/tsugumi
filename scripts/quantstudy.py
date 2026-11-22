@@ -8,7 +8,7 @@ one input index), shared exponent = max exponent, sign + mantissa with the hidde
 Usage: python scripts/quantstudy.py <shard.safetensors> [name-filter]
 """
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import sys
 
 import torch

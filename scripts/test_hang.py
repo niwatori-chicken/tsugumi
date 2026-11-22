@@ -4,7 +4,7 @@
 Prints whether ttnn raised (and the message) or the faulthandler backstop fired (exit 1).
 Reset the device afterwards (tt-smi -r 0, twice). The server-level test is scripts/test_server_hang.sh."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import faulthandler, os, sys, time
 import ttnn
 from tsugumi.hang_kernel import run_hang_kernel

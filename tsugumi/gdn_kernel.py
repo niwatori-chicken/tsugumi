@@ -1,4 +1,4 @@
-"""Python launcher for the fused multi-token GDN recurrence kernel (lowbit/kernels/gdn_rec_*.cpp).
+"""Python launcher for the fused multi-token GDN recurrence kernel (kernels/gdn_rec_*.cpp).
 
 Tensors (fp32, TILE, DRAM interleaved), H heads, T tokens (rows padded to 32):
   Q, K, V : [1, H, 32, 128]   rows = tokens (q pre-normalized and scaled, k normalized)

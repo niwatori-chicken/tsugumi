@@ -7,7 +7,7 @@ Prompts: Japanese / English prose, code, a tool-free chat answer, with and witho
 decode rate and tokens per verify step, then the total (tokens / decode time) and the mean of per-prompt rates.
 Settings come from the environment like the server (TSUGUMI_KV_DTYPE, TSUGUMI_DRAFT_VOCAB, ...)."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import sys, time
 import ttnn
 from transformers import AutoTokenizer

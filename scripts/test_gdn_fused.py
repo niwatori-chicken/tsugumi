@@ -1,6 +1,6 @@
 """Unit test: fused post-conv GDN kernel vs torch (random data). python scripts/test_gdn_fused.py T [steps]"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import sys
 import time
 

@@ -1,7 +1,7 @@
 """GQAAttention vs torch reference, with a shuffled page table (logical block b at physical perm[b]).
   python scripts/test_gqa.py [max_seq] [splits]"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import sys, time, torch, ttnn
 from tsugumi.gqa_attn import GQAAttention
 NH, NKV, HD, BS = 24, 4, 256, 64

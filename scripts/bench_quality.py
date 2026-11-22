@@ -8,7 +8,7 @@ Prompts follow llm-jp-eval's instructions for the JGLUE-style tasks. Per item: p
 Resumes: items already in OUT are skipped.
 """
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import argparse, json, random, re, time, unicodedata
 from collections import Counter
 

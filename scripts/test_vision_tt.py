@@ -2,7 +2,7 @@
 
   python scripts/test_vision_tt.py [WxH ...]   (default: 320x256 640x480 1024x1024 1000x333)"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import io
 import random
 import sys

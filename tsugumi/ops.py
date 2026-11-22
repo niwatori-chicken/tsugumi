@@ -59,7 +59,7 @@ class DecodeLinear:
         self.K, self.N, self.name = K, N, name
         banks = dev.dram_grid_size().x
         if workers is None:
-            workers = 3 if K <= 5120 else 2  # measured best on P100 (lowbit/mmbench.py)
+            workers = 3 if K <= 5120 else 2  # measured best on P100 (scripts/mmbench.py)
         n_tiles = math.ceil(N / TILE)
         shard_w = math.ceil(math.ceil(n_tiles / banks) / workers) * workers
         self.Np = shard_w * banks * TILE

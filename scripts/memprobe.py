@@ -1,6 +1,6 @@
 """Load the server configuration with a given max_seq and report DRAM usage.  python scripts/memprobe.py 131072 [--no-large]"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import sys, time
 import ttnn
 from tsugumi.model import Precision, Qwen35Engine

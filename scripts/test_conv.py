@@ -1,6 +1,6 @@
 """CausalConvKernel vs torch (bf16 inputs, fp64 ref). python scripts/test_conv.py"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import time, torch, ttnn
 from tsugumi.conv_kernel import CausalConvKernel
 C = 10240

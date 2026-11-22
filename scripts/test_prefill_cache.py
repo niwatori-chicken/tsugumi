@@ -2,7 +2,7 @@
 add programs to the program cache (a program compiled after the capture can allocate buffers that a trace replay
 overwrites, which hung the engine). Also checks the replies stay sane.  python scripts/test_prefill_cache.py"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import faulthandler, random, time, torch, ttnn
 faulthandler.dump_traceback_later(900, exit=True)
 import tsugumi.paths as tsugumi_paths

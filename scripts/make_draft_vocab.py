@@ -9,7 +9,7 @@ Python and C++ sources, the model's own answers from the attn8 / mixed benchmark
 answers (MGSM-ja, HumanEval, GPQA reasoning summaries, JSQuAD) and ja_eval / en_eval. Prints the share of
 held-out tokens inside the set (an upper bound on how often the drafts could still be right)."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import collections, csv, glob, json, os, random, sys
 import torch
 from transformers import AutoTokenizer

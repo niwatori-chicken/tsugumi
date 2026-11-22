@@ -6,7 +6,7 @@ the safetensors (the full model does not fit in host RAM). Same protocol and out
 All chunks go through layer i before layer i+1 is loaded; hidden states (N chunks x C x 5120 fp32) stay in RAM.
 """
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import argparse
 import math
 import time

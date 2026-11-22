@@ -1,6 +1,6 @@
 """Speed: GQAAttention vs current ops at long context.  python scripts/bench_gqa.py [P0]"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import sys, time, torch, ttnn
 from tsugumi.gqa_attn import GQAAttention
 NH, NKV, HD, BS = 24, 4, 256, 64

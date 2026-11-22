@@ -6,7 +6,7 @@
 Also prints reuse kind, switch time, TTFT and program cache growth after the trace capture.
   python scripts/test_multiconv.py"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import faulthandler, time, ttnn
 faulthandler.dump_traceback_later(1500, exit=True)
 from transformers import AutoTokenizer

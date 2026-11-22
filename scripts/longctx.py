@@ -1,6 +1,6 @@
 """Needle test + speed at long context.  python scripts/longctx.py N_TOKENS"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import os, sys, time, random, glob
 import ttnn
 from tsugumi.model import Precision, Qwen35Engine

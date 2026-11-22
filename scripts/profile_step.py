@@ -7,7 +7,7 @@ Runs the step eagerly (same kernels as the trace; the device times per op are th
 not) after two warm-up runs, so the profiled region is exactly one main step and one MTP step. Also prints the
 traced time of the same step for comparison."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import sys, time
 import ttnn
 import tsugumi.paths as tsugumi_paths

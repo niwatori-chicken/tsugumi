@@ -7,7 +7,7 @@
   3. speed and accepted drafts per step: greedy vs temperature 0.7 / 1.0.
   python scripts/test_sampling.py [N=300]      (EXACT_PROMPT=... for another prompt in part 2)"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import collections, faulthandler, random, sys, time
 import ttnn
 from transformers import AutoTokenizer

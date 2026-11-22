@@ -5,7 +5,7 @@
   2. GQAAttention on bfp8 caches vs a torch reference on the bfp8-rounded K/V (T = 4 and 32, long contexts).
   python scripts/test_kv_bfp8.py [max_seq]"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import sys, torch, ttnn
 from tsugumi.kv_kernel import KVWriteKernel
 from tsugumi.gqa_attn import GQAAttention

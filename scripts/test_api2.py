@@ -3,7 +3,7 @@
   python scripts/test_api2.py [URL=http://127.0.0.1:8010]
 Greedy everywhere, so streamed and non-streamed replies must match exactly."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import json
 import sys
 import urllib.request

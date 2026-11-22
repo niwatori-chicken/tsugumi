@@ -2,7 +2,7 @@
 conversion, unterminated calls, and a template round trip (parsed calls rendered back give the same text).
   python scripts/test_toolcall.py"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import json
 from tsugumi.toolcall import ToolStreamParser, prepare_messages, forced_prefix
 

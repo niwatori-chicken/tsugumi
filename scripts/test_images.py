@@ -3,7 +3,7 @@
   python scripts/test_images.py [URL=http://127.0.0.1:8010]
 Greedy everywhere."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import base64
 import io
 import json

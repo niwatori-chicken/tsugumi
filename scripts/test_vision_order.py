@@ -5,7 +5,7 @@ Without the warm-up (ViT programs first compiled after the trace capture) the se
 hung the device (2026-11-20).
 Finds which step hangs (TT_METAL_OPERATION_TIMEOUT_SECONDS=30 turns a hang into an exception)."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import os
 os.environ.setdefault("TT_METAL_OPERATION_TIMEOUT_SECONDS", "30")
 import io

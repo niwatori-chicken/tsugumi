@@ -2,7 +2,7 @@
   python scripts/mmlarge.py [M ...]
 Compares: dram-sharded program (per_core_M = M/32), minimal_matmul (default config), ttnn.linear (auto)."""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import math, sys, time, torch, ttnn
 from tsugumi.ops import DecodeLinear
 

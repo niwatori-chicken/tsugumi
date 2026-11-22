@@ -3,7 +3,7 @@
 python scripts/run_gen.py [--prec mixed|bfp4] [--layers N] [--max-new 64] [--prompt "..."] [--no-trace]
 """
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import argparse
 import sys
 import time

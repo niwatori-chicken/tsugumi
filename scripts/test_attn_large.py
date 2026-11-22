@@ -1,7 +1,7 @@
 """Large-T attention (LargePrefill._attn) vs a torch fp32 reference with the dequantized weights (layer 3).
   python scripts/test_attn_large.py [T] [N]"""
 import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # lowbit/ for `import tsugumi`
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import json, sys, torch, ttnn
 import tsugumi.paths as tsugumi_paths
 from tsugumi.attn import AttnDecode
