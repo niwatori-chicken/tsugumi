@@ -90,7 +90,7 @@ export TSUGUMI_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(
 
 - キーを設定すると、`GET /` (Web UI のページ) と `GET /health` 以外は `Authorization: Bearer <キー>` が必要になり、
   ない・違うときは 401 を返します。OpenAI の SDK やクライアントは API キーの設定をこのヘッダで送ります。
-- `/health` はキーなしでも答えますが、処理中のリクエストの詳細は出しません。
+- `/health` はキーなしでも答えますが、処理中のリクエストの詳細とボード情報は出しません。
 - Web UI は最初の送信で 401 になるとキーを聞き、そのブラウザに保存します。
 - 通信は暗号化しません。インターネットに出すときは、TLS を終端するリバースプロキシ (Caddy、nginx など) の後ろに置いてください。
 - キーなしで 127.0.0.1 以外で待ち受けると、起動時に警告を出します。
@@ -131,6 +131,11 @@ export TSUGUMI_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(
 - 終了 (SIGTERM / Ctrl-C): 受け付けを止め、生成中なら次のトークンで終えて応答を閉じ、デバイスを閉じて終わる (1 秒前後)。
 - `GET /health` は処理中かどうか・待ちの数・処理中のリクエスト (生成済みトークン数、経過秒) を返す。待っている間にクライアントが
   切断したリクエストは、順番が来ても生成しない。
+- `/health` の `board` は `tt-smi -s` から読んだボードの状態 (チップと GDDR の温度、電力、ファン、AICLK、熱トリップの回数、
+  GDDR のエラー数)。サーバーが 10 秒ごとに読んでおき (`TSUGUMI_BOARD_POLL`、0 で切る)、`age_s` が読んだときからの秒数。
+  tt-smi はエンジンがデバイスを使っている間も読める (生成の結果・速度は変わらない)。tt-smi は `TT_SMI`、なければ PATH の
+  `tt-smi`、`~/venv-tt-smi/bin/tt-smi` の順に探す。Web UI は右上に温度・電力・ファンを出し、マウスを載せると詳細を出す
+  (スロットル温度の 10°C 手前、クロック低下、熱トリップ、訂正不能エラーで色が変わる)。
 - ハング検知: デバイスの処理が 30 秒進まないと (`TT_METAL_OPERATION_TIMEOUT_SECONDS`)、そのリクエストに 503 を返し、
   `/health` も 503 にして終了コード 75 で終わる。トークンが 300 秒出ないとき (`TSUGUMI_HANG_BACKSTOP`) も強制終了する。
   `run_server.sh` はそれを見て `tt-smi -r 0` を 2 回 → 再起動する (約 1.5 分で復帰。10 分に 3 回を超えたら諦める)。
@@ -192,6 +197,7 @@ export TSUGUMI_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(
 | `tsugumi/attn.py`、`tsugumi/gqa_attn.py`、`tsugumi/kv_kernel.py` | attention 層、GQA split-K アテンション、KV 書き込み |
 | `tsugumi/vision.py`、`tsugumi/vision_tt.py` | 画像入力 (前処理、画像トークンの仮想 ID と M-RoPE の位置、デバイスの ViT) |
 | `tsugumi/kvpager.py` | KV ブロックのプールとページ表 (複数の会話) |
+| `tsugumi/board.py` | ボードの温度・電力・ファン (`tt-smi -s` を定期的に読む、`/health` の `board`) |
 | `tsugumi/prefill.py`、`tsugumi/conv_kernel.py`、`tsugumi/page_copy.py` | 大きい T の prefill、因果 conv カーネル、ページコピー |
 | `kernels/*.cpp` | 自作カーネル (generic_op で起動) |
 | `server.py` | OpenAI 互換サーバー |
