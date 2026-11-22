@@ -46,10 +46,13 @@ def parse_snapshot(snap, index=0):
         asic_temp_c=_num(t.get("asic_temperature")),
         gddr_temp_max_c=_num(s.get("MAX_GDDR_TEMP")),
         throttle_temp_c=_num(s.get("THM_LIMIT_THROTTLE")) or _num(lim.get("therm_trip_l1_limit")),
-        power_w=_num(t.get("power")),
-        power_limit_w=_num(lim.get("tdp_limit")),
-        current_a=_num(t.get("current")),
-        voltage_v=_num(t.get("voltage")),
+        # the chip (TDP: core rail) power and its limit; the board's total power (TBP) is not reported,
+        # only its limit (BOARD_POWER_LIMIT, 300 W on the P100A)
+        chip_power_w=_num(t.get("power")),
+        chip_power_limit_w=_num(lim.get("tdp_limit")),
+        board_power_limit_w=_num(s.get("BOARD_POWER_LIMIT")),
+        chip_current_a=_num(t.get("current")),
+        chip_voltage_v=_num(t.get("voltage")),
         aiclk_mhz=_num(t.get("aiclk")),
         aiclk_max_mhz=_num(lim.get("asic_fmax")),
         fan_pct=_num(s.get("FAN_SPEED")),  # telemetry.fan_speed is % in tt-smi 5.x but rpm in 6.x

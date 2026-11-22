@@ -313,11 +313,12 @@ function showBoard(b) {
     || (d.aiclk_mhz != null && d.aiclk_max_mhz != null && d.aiclk_mhz < d.aiclk_max_mhz)
     || d.therm_trips > 0 || d.gddr_uncorr_errs > 0;
   el.className = warn ? "warn" : "";
-  el.textContent = `${d.asic_temp_c}°C · ${d.power_w} W · fan ${d.fan_pct}%`;
+  el.textContent = `${d.asic_temp_c}°C · チップ ${d.chip_power_w} W · fan ${d.fan_pct}%`;
   el.title = [
     `${d.board ?? "board"} (${b.age_s} 秒前)`,
     `チップ ${d.asic_temp_c}°C / GDDR 最大 ${d.gddr_temp_max_c}°C (スロットル ${d.throttle_temp_c}°C)`,
-    `電力 ${d.power_w} W / 上限 ${d.power_limit_w} W (${d.voltage_v} V, ${d.current_a} A)`,
+    `チップの電力 ${d.chip_power_w} W / 上限 ${d.chip_power_limit_w} W (${d.chip_voltage_v} V, ${d.chip_current_a} A)`,
+    `ボード全体の電力上限 ${d.board_power_limit_w} W (ボード全体の電力は取れない)`,
     `AICLK ${d.aiclk_mhz} / ${d.aiclk_max_mhz} MHz`,
     `ファン ${d.fan_pct}% (${d.fan_rpm} rpm)`,
     `熱トリップ ${d.therm_trips} 回, GDDR エラー 訂正 ${d.gddr_corr_errs} / 訂正不能 ${d.gddr_uncorr_errs}`,
