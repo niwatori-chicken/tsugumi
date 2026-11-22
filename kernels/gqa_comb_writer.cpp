@@ -1,7 +1,7 @@
 // GQA split-K attention — combine writer: bf16 out tiles (row r' = h' * T + t of row tile r) into
 // OUT [1, 1, 32, NH * HD] (row t, columns of head g*GH + h').
 // T == 32: tile copy (row tile r = head h').  32 % T == 0, T < 32: rows are regrouped per head in L1.
-// CT: 0 T, 1 GH, 2 HDT, 3 DT, then accessor OUT.  RT: 0 addr, 1 g, 2 r, 3 dg (value tiles dg*DT..)
+// CT: 0 T, 1 GH, 2 HDT, 3 DT, then accessor OUT.  RT: 0 addr, 1 g, 2 r, 3 dg (value tiles dg*DT..), 4 R0 (lane's first OUT row; T < 32)
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -24,6 +24,7 @@ void kernel_main() {
     const uint32_t g = get_arg_val<uint32_t>(1);
     const uint32_t r = get_arg_val<uint32_t>(2);
     const uint32_t d0 = get_arg_val<uint32_t>(3) * DT;
+    const uint32_t R0 = get_arg_val<uint32_t>(4);
     constexpr uint32_t TB = 2048;
     Noc noc;
     CircularBuffer out(c_OUT);
@@ -47,7 +48,8 @@ void kernel_main() {
                 for (uint32_t f = 0; f < 2; ++f) {
                     const uint32_t soff = d * TB + (((rr >> 4) * 2 + f) * 256 + (rr & 15) * 16) * 2;
                     noc.async_write(out, sO, T * 32, {.offset_bytes = soff},
-                                    {.page_id = (g * GH + h0 + hh) * HDT + d0 + d, .offset_bytes = f * 512});
+                                    {.page_id = (g * GH + h0 + hh) * HDT + d0 + d,
+                                     .offset_bytes = (((R0 >> 4) * 2 + f) * 256 + (R0 & 15) * 16) * 2});
                 }
             }
         }

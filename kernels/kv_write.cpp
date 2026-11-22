@@ -4,13 +4,14 @@
 //   src  : [1, T, NKV(pad 32), HD] bf16 TILE (tile (t, c) holds heads in rows, HD/32 column tiles)
 //   POS  : int32 row-major [T] positions
 //   PT   : int32 row-major [1, nblocks] page table (one page)
-// CT: 0 T, 1 NKV, 2 HDT (HD/32), 3 BS (block size, multiple of 32), 4 pos_bytes, 5 PT bytes, 6 BFP8 (cache format),
-//     then accessors Ksrc, Vsrc, Kc, Vc, POS, PT
+// Lanes (batched decode): NU sequences of T rows each (lane u = source rows u*T..), each with its own POS and PT.
+// CT: 0 T (rows per lane), 1 NKV, 2 HDT (HD/32), 3 BS (block size, multiple of 32), 4 pos_bytes, 5 PT bytes,
+//     6 BFP8 (cache format), 7 NU (lanes), then accessors Ksrc, Vsrc, Kc, Vc, POS, PT
 // bfp8_b tile (1088 B): 64 exponent bytes (one per face row: face f = (row/16)*2 + col/16, index f*16 + row%16), then
 // 4 faces x 16 rows x 16 mantissa bytes (sign << 7 | 7-bit magnitude incl. the hidden bit, shifted to the row's
 // shared exponent = max exponent of its 16 values; round to nearest even, as tt-metal's host packer). A cache row
 // (one position) owns its own exponents, so rewriting it never touches the other rows of the tile.
-// RT: 0..5 addrs, 6 h, 7 c
+// RT: 0..3 addrs Ksrc, Vsrc, Kc, Vc; then per lane (POS addr, PT addr); then h, c
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -63,7 +64,8 @@ void kernel_main() {
     constexpr uint32_t POSB = get_compile_time_arg_val(4);
     constexpr uint32_t PTB = get_compile_time_arg_val(5);
     constexpr uint32_t BFP8 = get_compile_time_arg_val(6);
-    constexpr auto aKs = TensorAccessorArgs<7>();
+    constexpr uint32_t NU = get_compile_time_arg_val(7);
+    constexpr auto aKs = TensorAccessorArgs<8>();
     constexpr auto aVs = TensorAccessorArgs<aKs.next_compile_time_args_offset()>();
     constexpr auto aKc = TensorAccessorArgs<aVs.next_compile_time_args_offset()>();
     constexpr auto aVc = TensorAccessorArgs<aKc.next_compile_time_args_offset()>();
@@ -73,10 +75,8 @@ void kernel_main() {
     const auto sVs = TensorAccessor(aVs, get_arg_val<uint32_t>(1));
     const auto sKc = TensorAccessor(aKc, get_arg_val<uint32_t>(2));
     const auto sVc = TensorAccessor(aVc, get_arg_val<uint32_t>(3));
-    const auto sP = TensorAccessor(aP, get_arg_val<uint32_t>(4));
-    const auto sPT = TensorAccessor(aPT, get_arg_val<uint32_t>(5));
-    const uint32_t h = get_arg_val<uint32_t>(6);
-    const uint32_t c = get_arg_val<uint32_t>(7);
+    const uint32_t h = get_arg_val<uint32_t>(4 + 2 * NU);
+    const uint32_t c = get_arg_val<uint32_t>(5 + 2 * NU);
 
     constexpr uint32_t TB = 2048;            // bf16 tile bytes (source rows, scratch slots)
     constexpr uint32_t CB_ = BFP8 ? 1088 : 2048;  // cache tile bytes
@@ -84,9 +84,13 @@ void kernel_main() {
     CircularBuffer scr(c_SCR);
     scr.reserve_back(3);
     const uint32_t base = scr.get_write_ptr();
-    noc.async_read(sP, scr, POSB, {.page_id = 0}, {.offset_bytes = 0});
     CircularBuffer cpt(c_PT);
     cpt.reserve_back(1);
+  for (uint32_t u = 0; u < NU; ++u) {
+    const auto sP = TensorAccessor(aP, get_arg_val<uint32_t>(4 + 2 * u));
+    const auto sPT = TensorAccessor(aPT, get_arg_val<uint32_t>(5 + 2 * u));
+    const uint32_t R0 = u * T;
+    noc.async_read(sP, scr, POSB, {.page_id = 0}, {.offset_bytes = 0});
     noc.async_read(sPT, cpt, PTB, {.page_id = 0}, {.offset_bytes = 0});
     noc.async_read_barrier();
     volatile tt_l1_ptr int32_t* PT = reinterpret_cast<volatile tt_l1_ptr int32_t*>(cpt.get_write_ptr());
@@ -121,9 +125,9 @@ void kernel_main() {
                 cur = tile_id;
             }
             if (kv == 0) {
-                noc.async_read(sKs, scr, TB, {.page_id = t * HDT + c}, {.offset_bytes = TB});
+                noc.async_read(sKs, scr, TB, {.page_id = (R0 + t) * HDT + c}, {.offset_bytes = TB});
             } else {
-                noc.async_read(sVs, scr, TB, {.page_id = t * HDT + c}, {.offset_bytes = TB});
+                noc.async_read(sVs, scr, TB, {.page_id = (R0 + t) * HDT + c}, {.offset_bytes = TB});
             }
             noc.async_read_barrier();
             const uint32_t rr = r % 32;
@@ -152,4 +156,5 @@ void kernel_main() {
             noc.async_write_barrier();
         }
     }
+  }  // lanes
 }

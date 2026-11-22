@@ -8,7 +8,7 @@
 //   Kc/Vc : [blocks, NKV, BS, HD] TILE, KVTB bytes per tile (2048 bf16, 1088 bfp8_b);  PT : int32 row-major [1, nblocks] page table (logical -> physical block)
 //   POS : int32 [T] (positions of the T rows; only POS[0] is used, rows are consecutive)
 // CT: 0 T, 1 RT, 2 CT, 3 S, 4 BS, 5 NKV, 6 POSB, 7 GH, 8 HDT, 9 QMODE, 10 PTB, 11 KVTB, then accessors Q, Kc, Vc, POS, SC, CF, PT
-// RT: 0..6 addrs, 7 g, 8 s
+// RT: 0..6 addrs (POS / PT: this core's lane), 7 g, 8 s (split within the lane), 9 R0 (lane's first Q row, QMODE 0)
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -50,6 +50,7 @@ void kernel_main() {
     const auto sPT = TensorAccessor(aPT, get_arg_val<uint32_t>(6));
     const uint32_t g = get_arg_val<uint32_t>(7);
     const uint32_t s = get_arg_val<uint32_t>(8);
+    const uint32_t R0 = get_arg_val<uint32_t>(9);
 
     constexpr uint32_t TB = 2048;  // bf16 tile bytes
     constexpr uint32_t C = CT * 32;
@@ -104,7 +105,7 @@ void kernel_main() {
         const uint32_t qbase = cq.get_write_ptr();
         for (uint32_t t = 0; t < T; ++t) {
             for (uint32_t d = 0; d < HDT; ++d) {
-                noc.async_read(sQ, scr, TB, {.page_id = t * HDT + d}, {.offset_bytes = d * TB});
+                noc.async_read(sQ, scr, TB, {.page_id = (R0 + t) * HDT + d}, {.offset_bytes = d * TB});
             }
             noc.async_read_barrier();
             for (uint32_t h = 0; h < GH; ++h) {

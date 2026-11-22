@@ -4,9 +4,11 @@
 //   GE : [1,1,32,2*NV] fp32; col h = exp(g) of head h (row = token)
 //   BE : [1,1,32,2*NV] fp32; col NV+h = beta of head h
 //   C  : constants fp32 tiles: 0 ones, 1 ones/128, 2 eps, 3..6 norm weight rows, 7.. E_t (T tiles)
-//   S  : state snapshots [1,T*NV,128,128] fp32 (slot-major); read slot = IDX[0]
-//   IDX: uint32 row-major tensor, element 0 = slot to read the state from
-// CT: 0 T, 1 HPC, 2 rep, 3 KOFF, 4 VOFF, 5 ZOFF, 6 NV, 7 NC (const tiles), then accessors X, Y, GE, BE, C, S, IDX
+//   S  : state snapshots [1,slots*NV,128,128] fp32 (slot-major); lane u reads slot IDX[u]
+//   IDX: uint32 row-major tensor, element u = slot to read lane u's state from
+// Lanes (batched decode): the T rows are T/SEG independent sequences of SEG rows each (lane u = rows u*SEG..);
+// each lane starts from its own state. SEG == T: one sequence (the original kernel).
+// CT: 0 T, 1 HPC, 2 rep, 3 KOFF, 4 VOFF, 5 ZOFF, 6 NV, 7 NC (const tiles), 8 SEG, then accessors X, Y, GE, BE, C, S, IDX
 // RT: 0..6 addrs X, Y, GE, BE, C, S, IDX; 7 first head
 
 #include <stdint.h>
@@ -15,7 +17,7 @@
 #include "api/dataflow/circular_buffer.h"
 #include "api/tensor/noc_traits.h"
 
-constexpr uint32_t c_S0 = 0, c_Q = 2, c_K = 3, c_V = 5, c_B = 6, c_G = 7, c_C = 8, c_Z = 12, c_SCR = 20;
+constexpr uint32_t c_SIN = 19, c_Q = 2, c_K = 3, c_V = 5, c_B = 6, c_G = 7, c_C = 8, c_Z = 12, c_SCR = 20;
 
 template <typename Acc>
 FORCE_INLINE void read_tiles(Noc& noc, const Acc& acc, uint32_t cb_id, uint32_t first, uint32_t n) {
@@ -42,7 +44,9 @@ void kernel_main() {
     constexpr uint32_t ZOFF = get_compile_time_arg_val(5);
     constexpr uint32_t NV = get_compile_time_arg_val(6);
     constexpr uint32_t NC = get_compile_time_arg_val(7);
-    constexpr auto aX = TensorAccessorArgs<8>();
+    constexpr uint32_t SEG = get_compile_time_arg_val(8);
+    constexpr uint32_t NU = T / SEG;
+    constexpr auto aX = TensorAccessorArgs<9>();
     constexpr auto aY = TensorAccessorArgs<aX.next_compile_time_args_offset()>();
     constexpr auto aGB = TensorAccessorArgs<aY.next_compile_time_args_offset()>();
     constexpr auto aBE = TensorAccessorArgs<aGB.next_compile_time_args_offset()>();
@@ -69,13 +73,16 @@ void kernel_main() {
     // slot index (state after the last committed token of the previous step)
     noc.async_read(sI, scr, 64, {.page_id = 0}, {.offset_bytes = 0});
     noc.async_read_barrier();
-    const uint32_t slot = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr_addr)[0];
+    uint32_t slots[NU];
+    for (uint32_t u = 0; u < NU; ++u) {
+        slots[u] = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr_addr)[u];
+    }
 
     for (uint32_t hh = 0; hh < HPC; ++hh) {
         const uint32_t h = h0 + hh;
         const uint32_t kh = h / REP;
         read_tiles(noc, sX, c_K, KOFF + kh * 4, 4);
-        read_tiles(noc, sS, c_S0, (slot * NV + h) * 16, 16);
+        read_tiles(noc, sS, c_SIN, (slots[0] * NV + h) * 16, 16);
 
         // exp(g) and beta scalars -> G_t tiles (full) and B tile (row t)
         const uint32_t gtile = h / 32, btile = (NV + h) / 32;
@@ -113,5 +120,9 @@ void kernel_main() {
         read_tiles(noc, sX, c_V, VOFF + h * 4, 4);
         read_tiles(noc, sX, c_Q, kh * 4, 4);
         read_tiles(noc, sY, c_Z, ZOFF + h * 4, 4);
+        // the other lanes' states: c_SIN holds one state; compute frees it after the lane's first token
+        for (uint32_t u = 1; u < NU; ++u) {
+            read_tiles(noc, sS, c_SIN, (slots[u] * NV + h) * 16, 16);
+        }
     }
 }

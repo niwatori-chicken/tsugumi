@@ -7,7 +7,9 @@ KDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "kernels")
 
 
 class KVWriteKernel:
-    def __init__(self, dev, T, NKV, HD, block_size, nblocks, kv_dtype=ttnn.bfloat16):
+    def __init__(self, dev, T, NKV, HD, block_size, nblocks, kv_dtype=ttnn.bfloat16, lanes=1):
+        """lanes > 1: batched decode, lanes x T source rows; call with lists of per-lane pos / page tables."""
+        self.lanes = lanes
         self.bfp8 = int(kv_dtype == ttnn.bfloat8_b)
         self.dev, self.T, self.NKV, self.HDT, self.BS = dev, T, NKV, HD // 32, block_size
         grid = dev.compute_with_storage_grid_size()
@@ -25,11 +27,17 @@ class KVWriteKernel:
             ttnn.CBFormatDescriptor(buffer_index=1, data_format=ttnn.uint32, page_size=self.ptb)]))
 
     def __call__(self, ksrc, vsrc, kc, vc, pos, pt):
-        ins = [ksrc, vsrc, kc, vc, pos, pt]
-        ct = [self.T, self.NKV, self.HDT, self.BS, self.posb, self.ptb, self.bfp8]
+        pos = pos if isinstance(pos, (list, tuple)) else [pos]
+        pt = pt if isinstance(pt, (list, tuple)) else [pt]
+        assert len(pos) == len(pt) == self.lanes
+        ins = [ksrc, vsrc, kc, vc, pos[0], pt[0]]
+        ct = [self.T, self.NKV, self.HDT, self.BS, self.posb, self.ptb, self.bfp8, self.lanes]
         for t in ins:
             ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
-        addrs = [t.buffer_address() for t in ins]
+        addrs = [t.buffer_address() for t in ins[:4]]
+        for p_, t_ in zip(pos, pt):
+            addrs += [p_.buffer_address(), t_.buffer_address()]
+        ins = [ksrc, vsrc, kc, vc] + list(pos) + list(pt)
         rt = [((x, y), addrs + [h, c]) for (x, y), (h, c) in zip(self.coords, self.assign)]
         kd = ttnn.KernelDescriptor(kernel_source=os.path.join(KDIR, "kv_write.cpp"),
                                    source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH, core_ranges=self.cores,

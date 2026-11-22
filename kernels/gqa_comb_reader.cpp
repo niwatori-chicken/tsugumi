@@ -1,7 +1,7 @@
 // GQA split-K attention — combine reader. Core (g, r, dg): row tile r of kv group g, value tiles
 // [dg*DT, dg*DT+DT). Only the non-empty splits s < NA = min(S, ceil((POS[0]+T)/C)) are read.
 // Pushes info (NA), m_s, l_s (s < NA), then O_s (DT tiles) per split.  PART layout: see gqa_attn_writer.cpp.
-// CT: 0 RT, 1 HDT, 2 NKV, 3 S, 4 DT, 5 T, 6 C, 7 POSB, then accessors PART, POS.  RT: 0, 1 addrs, 2 g, 3 r, 4 dg
+// CT: 0 RT, 1 HDT, 2 NKV, 3 S, 4 DT, 5 T, 6 C, 7 POSB, then accessors PART, POS.  RT: 0, 1 addrs (POS: this core's lane), 2 g, 3 r, 4 dg, 5 first split of the lane in PART
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -26,6 +26,7 @@ void kernel_main() {
     const uint32_t g = get_arg_val<uint32_t>(2);
     const uint32_t r = get_arg_val<uint32_t>(3);
     const uint32_t dg = get_arg_val<uint32_t>(4);
+    const uint32_t soff = get_arg_val<uint32_t>(5);
     constexpr uint32_t FB = 4096;
     constexpr uint32_t J = HDT + 2;
     Noc noc;
@@ -41,7 +42,7 @@ void kernel_main() {
     ms.reserve_back(S);
     ls.reserve_back(S);
     for (uint32_t s = 0; s < NA; ++s) {
-        const uint32_t page0 = ((s * NKV + g) * RT + r) * J;
+        const uint32_t page0 = (((soff + s) * NKV + g) * RT + r) * J;
         noc.async_read(sP, ms, FB, {.page_id = page0 + HDT}, {.offset_bytes = s * FB});
         noc.async_read(sP, ls, FB, {.page_id = page0 + HDT + 1}, {.offset_bytes = s * FB});
     }
@@ -49,7 +50,7 @@ void kernel_main() {
     ms.push_back(S);
     ls.push_back(S);
     for (uint32_t s = 0; s < NA; ++s) {
-        const uint32_t page0 = ((s * NKV + g) * RT + r) * J + dg * DT;
+        const uint32_t page0 = (((soff + s) * NKV + g) * RT + r) * J + dg * DT;
         os.reserve_back(DT);
         for (uint32_t d = 0; d < DT; ++d) {
             noc.async_read(sP, os, FB, {.page_id = page0 + d}, {.offset_bytes = d * FB});
