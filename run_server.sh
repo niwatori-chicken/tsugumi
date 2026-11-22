@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 export TT_LOGGER_LEVEL=${TT_LOGGER_LEVEL:-warn}  # tt-metal (spdlog level names: warn, not warning)
 export LOGURU_LEVEL=${LOGURU_LEVEL:-WARNING}  # ttnn (Python)
 say() { echo "$(date '+%F %T.%3N') $1 [run_server] $2"; }
-TT_SMI=${TT_SMI:-$(command -v tt-smi || echo ~/venv-tt-smi/bin/tt-smi)}
+export TT_SMI=${TT_SMI:-$(command -v tt-smi || echo ~/venv-tt-smi/bin/tt-smi)}  # also used by the server for /health board telemetry
 MAX_RESTARTS=${MAX_RESTARTS:-3}
 RESTART_WINDOW=${RESTART_WINDOW:-600}
 restarts=()

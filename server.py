@@ -21,6 +21,9 @@ little too high; tokens outside it, only forced ones, get -9999); chat logprobs 
 Authentication: with --api-key / TSUGUMI_API_KEY (comma separated) or --api-key-file (one key per line), every
 endpoint except GET / (the web UI page) and GET /health needs `Authorization: Bearer <key>` (OpenAI clients send it
 from their api_key setting); others get 401. Without keys the server is open, as before (fine on 127.0.0.1).
+/health without a valid key shows only status / busy / waiting; with one (or without auth) also the running
+request and `board`: temperatures, power, fan and clock from `tt-smi -s` every TSUGUMI_BOARD_POLL seconds (default
+10, 0 = off; tsugumi/board.py).
 
 Shutdown (SIGINT / SIGTERM): stop accepting requests, end a running generation at its next token, close the device.
 
@@ -40,6 +43,7 @@ import time
 import uuid
 import faulthandler
 import tsugumi.paths as tsugumi_paths
+from tsugumi.board import BoardMonitor
 from tsugumi.env import env
 from tsugumi.log import get_logger
 from tsugumi.sampling import Sampler
@@ -433,7 +437,7 @@ def load_api_keys(arg, path):
     return keys
 
 
-def make_app(backend, api_keys=()):
+def make_app(backend, api_keys=(), board=None):
     from fastapi import FastAPI, Request
     from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
     from starlette.concurrency import run_in_threadpool
@@ -442,18 +446,24 @@ def make_app(backend, api_keys=()):
     keys = [k.encode() for k in api_keys]
     OPEN = {"/", "/health"}
 
+    def given_key(req):
+        h = req.headers.get("authorization", "")
+        return (h[7:] if h[:7].lower() == "bearer " else "").strip().encode()
+
+    def key_ok(given):
+        # compare against every key in constant time, so the timing does not tell which one is close
+        ok = False
+        for k in keys:
+            ok |= hmac.compare_digest(given, k)
+        return ok
+
     if keys:
         @app.middleware("http")
         async def auth(req, call_next):
             if req.url.path in OPEN and req.method in ("GET", "HEAD"):
                 return await call_next(req)
-            h = req.headers.get("authorization", "")
-            given = (h[7:] if h[:7].lower() == "bearer " else "").strip().encode()
-            # compare against every key in constant time, so the timing does not tell which one is close
-            ok = False
-            for k in keys:
-                ok |= hmac.compare_digest(given, k)
-            if not ok:
+            given = given_key(req)
+            if not key_ok(given):
                 log.warning(f"rejected {req.method} {req.url.path} from {req.client.host if req.client else '?'}: "
                             f"{'no' if not given else 'wrong'} API key")
                 return JSONResponse({"error": {"message": "invalid or missing API key (Authorization: Bearer ...)",
@@ -469,14 +479,18 @@ def make_app(backend, api_keys=()):
     def health(req: Request):
         if backend.dead:
             return JSONResponse({"status": "error", "error": backend.dead}, status_code=503)
-        if keys:  # stays open for health checks, but without the details of the running request
+        if keys and not key_ok(given_key(req)):
+            # stays open for health checks, but the details (running request, board) need a key
             return {"status": "ok", "busy": backend.active is not None, "waiting": backend.waiting,
                     "auth": True}
         a = backend.active
-        return {"status": "ok", "busy": a is not None, "waiting": backend.waiting,
-                "active": None if a is None else dict(id=a["id"], prompt_tokens=a["prompt"],
-                                                      generated=a["generated"],
-                                                      seconds=round(time.time() - a["since"], 1))}
+        res = {"status": "ok", "busy": a is not None, "waiting": backend.waiting,
+               "active": None if a is None else dict(id=a["id"], prompt_tokens=a["prompt"],
+                                                     generated=a["generated"],
+                                                     seconds=round(time.time() - a["since"], 1))}
+        if board is not None:
+            res["board"] = board.latest()
+        return res
 
     async def acquire(req, tag, n_prompt):
         """Wait for the device without blocking the event loop; give up if the client disconnects meanwhile."""
@@ -974,6 +988,7 @@ def main():
     log_settings(a)
     t0 = time.time()
     backend = Backend(a.max_seq)
+    board = BoardMonitor().start()  # after the device is up (not during its init); tt-smi works alongside the engine
     log.info(f"ready in {time.time() - t0:.0f}s: http://{a.host}:{a.port}/ (web UI), /v1/chat/completions")
     if a.host not in ("127.0.0.1", "localhost", "::1") and not api_keys:
         log.warning(f"listening on {a.host} without authentication: anyone on the network can use the server")
@@ -983,7 +998,7 @@ def main():
             backend.stopping = True
             super().handle_exit(sig, frame)
 
-    server = Server(uvicorn.Config(make_app(backend, api_keys), host=a.host, port=a.port, log_level="warning",
+    server = Server(uvicorn.Config(make_app(backend, api_keys, board), host=a.host, port=a.port, log_level="warning",
                                    timeout_graceful_shutdown=5))
     # uvicorn re-raises the signal it caught after shutting down, with the handler that was installed before it:
     # with the default handler that kills the process before the device is closed, so install a harmless one
@@ -993,6 +1008,7 @@ def main():
     if backend.dead:  # device error path: the process exits with EXIT_HANG from fail()
         return
     log.info("shutting down")
+    board.stop()
     backend.shutdown()
     log.info("bye")
 
