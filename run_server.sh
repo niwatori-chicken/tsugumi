@@ -4,13 +4,13 @@
 # When the server exits abnormally (75 = device timeout detected, 1 = backstop / crash), the device is reset
 # (tt-smi -r 0 twice, waiting after each) and the server is started again. Gives up after MAX_RESTARTS restarts
 # within RESTART_WINDOW seconds. Ctrl-C / SIGTERM stops the server and this script.
-#   TT_SMI (default: tt-smi on PATH, else ~/venv-tt-smi/bin/tt-smi), MAX_RESTARTS (3), RESTART_WINDOW (600),
+#   TT_SMI (default: tt-smi on PATH, else ~/.tenstorrent-venv/bin/tt-smi from tt-installer), MAX_RESTARTS (3), RESTART_WINDOW (600),
 #   TT_LOGGER_LEVEL (tt-metal, default warn here), LOGURU_LEVEL (ttnn Python, default WARNING), TSUGUMI_LOG_LEVEL (server, INFO)
 cd "$(dirname "$0")"
 export TT_LOGGER_LEVEL=${TT_LOGGER_LEVEL:-warn}  # tt-metal (spdlog level names: warn, not warning)
 export LOGURU_LEVEL=${LOGURU_LEVEL:-WARNING}  # ttnn (Python)
 say() { echo "$(date '+%F %T.%3N') $1 [run_server] $2"; }
-export TT_SMI=${TT_SMI:-$(command -v tt-smi || echo ~/venv-tt-smi/bin/tt-smi)}  # also used by the server for /health board telemetry
+export TT_SMI=${TT_SMI:-$(command -v tt-smi || echo ~/.tenstorrent-venv/bin/tt-smi)}  # also used by the server for /health board telemetry
 MAX_RESTARTS=${MAX_RESTARTS:-3}
 RESTART_WINDOW=${RESTART_WINDOW:-600}
 restarts=()

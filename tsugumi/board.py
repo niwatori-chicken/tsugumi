@@ -3,7 +3,7 @@
 tt-smi reads the firmware telemetry over PCIe and works while the engine holds the device (about 0.45 s per
 snapshot). The server calls `BoardMonitor.latest()`, which never waits for tt-smi. Settings:
 TSUGUMI_BOARD_POLL (seconds between snapshots, default 10; 0 turns the monitor off) and TT_SMI (the tt-smi
-binary; default tt-smi on PATH, else ~/venv-tt-smi/bin/tt-smi, as in run_server.sh).
+binary; default tt-smi on PATH, else ~/.tenstorrent-venv/bin/tt-smi (made by tt-installer), as in run_server.sh).
 """
 import json
 import os
@@ -19,7 +19,7 @@ log = get_logger("board")
 
 
 def find_tt_smi():
-    p = os.environ.get("TT_SMI") or shutil.which("tt-smi") or os.path.expanduser("~/venv-tt-smi/bin/tt-smi")
+    p = os.environ.get("TT_SMI") or shutil.which("tt-smi") or os.path.expanduser("~/.tenstorrent-venv/bin/tt-smi")
     return p if os.path.isfile(p) and os.access(p, os.X_OK) else None
 
 
