@@ -178,6 +178,19 @@ class GDNDecode:
         self.kern_T[T] = GDNFusedKernel(self.dev, self.Nv, self.Nk, T, self.qkv_dim, self.kd, snap_all=snap_all)
         self.consts_by_T[T] = GDNFusedKernel.make_consts(self.dev, self._norm_w_host, T)
 
+    def init_batch(self, key, T, seg, max_lanes):
+        """Batched decode (tsugumi/batch.py): T = lanes x seg rows. Lane u keeps its conv history in Hc_b rows
+        u*3.. / Bp_b rows u*seg.. and its state snapshots in snap_b slots u*seg.. (separate from the single-sequence
+        modes, so a prompt can be prefilled while the lanes decode)."""
+        z = lambda shape, dt=ttnn.bfloat16: ttnn.from_torch(torch.zeros(*shape), dtype=dt, layout=ttnn.TILE_LAYOUT,
+                                                           device=self.dev)
+        if not hasattr(self, "snap_b"):
+            self.Hc_b = z((1, 1, 32, self.qkv_dim))
+            self.Bp_b = z((1, 1, 32, self.qkv_dim))
+            self.snap_b = z((1, max_lanes * seg * self.Nv, self.Dk, self.Dv), ttnn.float32)
+        self.kern_T[key] = GDNFusedKernel(self.dev, self.Nv, self.Nk, T, self.qkv_dim, self.kd, seg=seg)
+        self.consts_by_T[key] = GDNFusedKernel.make_consts(self.dev, self._norm_w_host, T)
+
     def reset_spec(self):
         zero = lambda t: ttnn.copy_host_to_device_tensor(
             ttnn.from_torch(torch.zeros(tuple(t.shape)), dtype=t.dtype, layout=ttnn.TILE_LAYOUT), t)
@@ -187,15 +200,16 @@ class GDNDecode:
 
     def forward_spec(self, x, sh):
         """x [1,1,32,H] rows 0..T-1 = tokens. sh: shared step tensors (m_hist, m_shift[4], idx)."""
+        Hc, Bp, snap = (self.Hc_b, self.Bp_b, self.snap_b) if sh.batch else (self.Hc, self.Bp, self.snap)
         y = self.w_in(x, out_mem=_L1)
         qd, zd, nv = self.qkv_dim, self.qkv_dim + self.vd, self.Nv
         B = ttnn.slice(y, (0, 0, 0, 0), (1, 1, 32, qd), memory_config=_L1)
-        cat = ttnn.concat([self.Hc, self.Bp], dim=2, memory_config=_L1)
+        cat = ttnn.concat([Hc, Bp], dim=2, memory_config=_L1)
         hn = ttnn.matmul(sh.m_hist, cat, memory_config=_L1, compute_kernel_config=sh.sel_ck)
         ttnn.deallocate(cat)
-        ttnn.copy(hn, self.Hc)
+        ttnn.copy(hn, Hc)
         ttnn.deallocate(hn)
-        cat = ttnn.concat([self.Hc, B], dim=2, memory_config=_L1)
+        cat = ttnn.concat([Hc, B], dim=2, memory_config=_L1)
         conv = None
         for j in range(self.Kc):
             sj = ttnn.matmul(sh.m_shift[j], cat, memory_config=_L1, compute_kernel_config=sh.sel_ck)
@@ -203,7 +217,7 @@ class GDNDecode:
             ttnn.deallocate(sj)
         ttnn.deallocate(cat)
         conv = ttnn.silu(conv, memory_config=_L1)
-        ttnn.copy(B, self.Bp)
+        ttnn.copy(B, Bp)
         ttnn.deallocate(B)
         ab = ttnn.typecast(ttnn.slice(y, (0, 0, 0, zd), (1, 1, 32, zd + 2 * nv), memory_config=_L1), ttnn.float32)
         u = ttnn.add(ab, self.ab_bias, memory_config=_L1)
@@ -212,7 +226,7 @@ class GDNDecode:
                       memory_config=_L1)
         be = ttnn.sigmoid(u, memory_config=_L1)
         ttnn.deallocate(u)
-        o = self.kern_T[sh.T](conv, y, ge, be, self.consts_by_T[sh.T], self.snap, sh.idx)
+        o = self.kern_T[sh.key](conv, y, ge, be, self.consts_by_T[sh.key], snap, sh.idx)
         ttnn.deallocate(conv)
         ttnn.deallocate(ge)
         ttnn.deallocate(be)
