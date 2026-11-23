@@ -159,7 +159,7 @@
 
 - [x] **5d. 複数リクエストの同時処理 (バッチデコード)** — 2026-11-23 完了 (ブランチ `multi-user-batch`)。`TSUGUMI_BATCH=N` (最大 8)
   - 32 行 = 最大 8 レーン × 4 行。GDN 融合カーネル (`seg`: レーンごとの初期状態)、GQA・KV 書き込みカーネル (レーンごとの位置とページ表)
-    を拡張 (`scripts/test_batch_kernels.py`、全部 PCC > 0.9999)。出力は 1 本ずつと一致 (`scripts/test_batch.py`)。
+    を拡張 (`scripts/test_batch_kernels.py`、全部 PCC > 0.9999)。出力は数値誤差の範囲で 1 本ずつと同じ (`scripts/test_batch.py`: 4 レーンはトークン単位で一致、8 レーンは GQA の分割数の違いで 165〜253 トークン目から分岐)。
   - P150A で計測 (各 1 回): ステップ 1 レーン 65ms / 2 レーン 71ms / 4 レーン 84ms (`scripts/test_batch.py`)。HTTP (`bench_concurrent.py`、
     max_tokens 512、各クライアント 2 リクエスト) で合計 1 本 37.9 / 4 並列 102.2 (2.7 倍) / 8 並列 152.5 tok/s (4.0 倍)。
   - 残り: 新しいプロンプトの prefill 中はレーンが止まりがち (受付 1 件 約 0.65 秒、短いプロンプトは 4 行ずつの prefill)。
