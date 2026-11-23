@@ -50,6 +50,12 @@ def load_or_convert(dev, w, dtype, mem, cache_file=None, pad_n=None):
     return ttnn.to_device(t, dev, memory_config=mem)
 
 
+# (DRAM banks, K) -> settings measured best on that board (scripts/mm_sweep.py); the rest use the defaults below,
+# chosen on a P100A (7 banks). P150A (8 banks), K=6144 (GDN out / attention o projections): 59.1 -> 44.5 us
+# (58% -> 78% of the DRAM roofline); workers stay 2, so the cached (padded) weights are unchanged.
+TUNED = {(8, 6144): dict(in0_block_w=6, in0_cores=32)}
+
+
 class DecodeLinear:
     """y = x @ W for decode (M <= 32 rows). W given as torch [K, N] (ttnn orientation)."""
 
@@ -58,6 +64,9 @@ class DecodeLinear:
         K, N = w_kn.shape if w_kn is not None else shape
         self.K, self.N, self.name = K, N, name
         banks = dev.dram_grid_size().x
+        tuned = TUNED.get((banks, K), {}) if workers is None and in0_block_w is None and in0_cores is None else {}
+        in0_block_w = tuned.get("in0_block_w", in0_block_w)
+        in0_cores = tuned.get("in0_cores", in0_cores)
         if workers is None:
             workers = 3 if K <= 5120 else 2  # measured best on P100 (scripts/mmbench.py)
         n_tiles = math.ceil(N / TILE)
