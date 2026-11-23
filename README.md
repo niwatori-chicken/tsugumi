@@ -17,6 +17,7 @@ HTTP経由でOpenAI 互換サーバーとして使うことができます。
 | 最大文脈 | **262,144 トークン** (モデルの上限。KV は bfp8 で約 9GiBで、ボード上に収まります) |
 | 12.7 万トークンのプロンプト | prefill 110 秒 (1,150 tok/s)、デコード 36 tok/s、「干し草山(Needle-in-a-haystack)」テスト合格 |
 | 24.5 万トークンのプロンプト | prefill 307 秒 (800 tok/s)、デコード 30 tok/s、「干し草山」テスト合格 |
+| 複数リクエストの同時処理 (`TSUGUMI_BATCH=8`、**P150A で計測**、条件は「複数リクエストの同時処理」) | 8 並列で**合計 152 tok/s** (1 リクエストあたりのデコード 22.6 tok/s)、4 並列で合計 102 tok/s。同じ条件で 1 本だけなら合計 37.9 tok/s |
 
 - 投機的デコードの出力は、通常の貪欲法 (1 トークンずつ) の出力と一致します (コードのプロンプトで確認)。サンプリングも同じ分布です。
 - 短いプロンプトでは最初のトークンまで約 0.6 秒です。
@@ -30,7 +31,7 @@ Wormhole世代のアクセラレータには対応していません。
 
 ## 必要なもの
 
-- Blackhole P100A (P150 でも動くはず。未確認)
+- Blackhole P100A (P150A でも動作を確認。バッチデコードの数値は P150A で計測)
 - ホストの RAM: 32GB で動作確認
 - tt-metal をソースからビルドしたもの (開発時は `v0.79.0-dev20260916-3-g5f02a6718f4`)。tt-metal の
   `models/` を import するので、`PYTHONPATH` に tt-metal のディレクトリが要る
@@ -85,7 +86,8 @@ export TSUGUMI_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(
 サーバー:
 
 - `POST /v1/chat/completions`・`POST /v1/completions` (テンプレートなしの続き書き、プロンプトは文字列かトークン ID 列。どちらも stream 対応)、
-  `POST /tokenize`・`/detokenize` (vLLM 形式)、`GET /v1/models`、`GET /health`。1 リクエストずつ処理します(今のところ)。
+  `POST /tokenize`・`/detokenize` (vLLM 形式)、`GET /v1/models`、`GET /health`。既定では 1 リクエストずつ処理します。
+  `TSUGUMI_BATCH=4` / `8` で複数のリクエストを同時に処理します (下の「複数リクエストの同時処理」)。
 - **Web UI**: テスト用の最小限のチャット画面 (`webui/index.html`)が用意されています。ブラウザから `http://127.0.0.1:8010/` にアクセスすると開けます。
   thinking、温度、最大トークン数、system プロンプトを切り替えられ、応答ごとにプロンプト側 (再利用、画像の読み込み、
   prefill のトークン数・秒・tok/s、応答開始) と生成側 (トークン数、tok/s、トークン/ステップ、思考) の数値を表示します。
@@ -126,6 +128,42 @@ export TSUGUMI_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(
   `/health` も 503 にして終了コード 75 で終了します。トークンが 300 秒出ないとき (`TSUGUMI_HANG_BACKSTOP`) も強制終了します。
   `run_server.sh` はそれを見て `tt-smi -r 0` を 2 回 → 再起動します (約 1.5 分で復帰。10 分に 3 回を超えたら停止します)。
 
+### 複数リクエストの同時処理 (バッチデコード)
+
+```bash
+TSUGUMI_BATCH=8 ./run_server.sh --port 8010 --max-seq 32768
+```
+
+- デコードの 1 ステップ (約 60ms) の大半は重みの読み出しで、1 リクエストの 4 行 (現在のトークン + MTP の下書き 3) は
+  32 行のタイルの一部しか使っていません。`TSUGUMI_BATCH=N` (最大 8) にすると、同時に来たリクエストを 4 行ずつの「レーン」として
+  同じステップに詰め、重みの読み出しを共有します。
+- P150A での実測 (計測はそれぞれ 1 回):
+
+  | 同時リクエスト | 合計 | 1 リクエストあたりのデコード |
+  |---|---|---|
+  | 1 | 37.9 tok/s | 40.6 tok/s |
+  | 4 | 102.2 tok/s (1 本の 2.7 倍) | 29.7 tok/s |
+  | 8 | 152.5 tok/s (1 本の 4.0 倍) | 22.6 tok/s |
+
+  条件: `TSUGUMI_BATCH=8 --max-seq 32768`、`TSUGUMI_IMAGES=0 TSUGUMI_LARGE_PREFILL=0 TSUGUMI_VERIFY_T=0`、
+  `scripts/bench_concurrent.py --clients 1,4,8 --max-tokens 512 --rounds 2` (各クライアントが固定のプロンプトで 2 リクエストずつ、貪欲法)。
+  「合計」は生成トークン数の合計 / 実時間 (新しいプロンプトの prefill や待ちを含む)、「1 リクエストあたり」はサーバーが返す
+  `decode_tps` (最初のトークン以降の速度) の平均なので、両者の比は並列数と一致しません。
+  別の実行 (`TSUGUMI_BATCH=4`、`--max-tokens 256`) では 1 / 2 / 4 並列で合計 35.5 / 58.6 / 85.2 tok/s (4 並列で 2.4 倍)。
+  ステップの時間 (`scripts/test_batch.py`、エンジン直接、256 トークン) は 1 レーン 65ms、2 レーン 71ms、4 レーン 84ms。
+- 出力は 1 リクエストずつ処理したときと同じです (貪欲法で 4 並列の出力がトークン単位で一致することを確認。`scripts/test_batch.py`)。
+  サンプリング (seed)・思考の上限・logprobs・停止文字列・`/v1/completions`・途中切断はバッチのモードで動作を確認しました。
+  ツール呼び出しは応答テキストの解析なので変わらないはずですが、バッチのモードでは未確認です。
+- 新しいリクエストのプロンプトは従来どおり 1 本ずつ prefill し、その間も 0.15 秒ごと (`TSUGUMI_PREFILL_SLICE`) に他のレーンの
+  ステップを挟みます (大きい T の prefill は 8,192 トークンごと。ただし `TSUGUMI_LARGE_PREFILL=1` や画像入力との組み合わせはバッチのモードでは未確認)。
+  終わった会話の状態はホストに保存し、続きのリクエストで再利用します。
+- `--max-seq` は全リクエスト (と保持する会話) で共有する KV の総量です。レーン 1 つにつき GDN の状態のスナップショットで
+  DRAM を約 0.6 GiB 使うので、最大文脈 262,144 とは両立しません (実測: 8 レーン + `--max-seq 32768` で DRAM の空き 9.3 GiB)。
+- バッチのモードでは n-gram 下書き (T=8 の検証) は使いません (MTP の下書きのみ)。n-gram 下書きが効く応答 (プロンプトを写す応答) では
+  1 本ずつの処理より遅くなる見込みです (未計測)。
+- `/health` は処理中のリクエストの一覧 (`active`) とレーン数を返します。`/health?sched=1` でスケジューラの平均時間 (ステップ、受付、終了) を返します。
+- 同時接続の計測: `python scripts/bench_concurrent.py --clients 1,4,8 --max-tokens 512 --rounds 2`
+
 TSUGUMIサーバーが起動時に読み取る環境変数
 
 | 変数 | 意味 |
@@ -133,6 +171,9 @@ TSUGUMIサーバーが起動時に読み取る環境変数
 | `TSUGUMI_MODEL_DIR` / `TSUGUMI_CACHE_DIR` | モデルと変換済み重みの場所 (`tsugumi/paths.py`) |
 | `TSUGUMI_API_KEY` | APIにアクセスする際に利用するAPIキー。デフォルトでは未設定です。 |
 | `TSUGUMI_KV_DTYPE=bf16` | KV キャッシュを bf16 にする (既定 bfp8。bf16 では max_seq 155,648 まで) |
+| `TSUGUMI_BATCH` | 同時に処理するリクエストの数 (レーン数、1〜8)。既定 1 (1 リクエストずつ)。レーン 1 つにつき DRAM 約 0.6 GiB |
+| `TSUGUMI_PREFILL_SLICE` | バッチのモードで、新しいプロンプトの prefill 中に他のレーンのステップを挟む間隔 (秒、既定 0.15) |
+| `TSUGUMI_TRACE_MB` | トレース領域の大きさ (MiB、既定 512、バッチのモードでは 1024) |
 | `TSUGUMI_MULTI_CONV=0` / `TSUGUMI_MAX_CONVS` | 複数の会話を保持しない / 保持する会話数の上限 (既定 8、ホストに 1 会話約 180MB) |
 | `TSUGUMI_SNAPSHOT=0` | 会話の再利用用の状態スナップショットを取らない |
 | `TSUGUMI_SERVED_MODEL_NAME` | サーバーが返すモデル名称を上書きする。デフォルトはモデルのディレクトリ名です。 |
@@ -171,6 +212,10 @@ TSUGUMIサーバーが起動時に読み取る環境変数
   ttnn の decode SDPA に T 行を「T ユーザー」として渡す方式 (5.6ms) や chunked SDPA (32 行で 15ms) の置き換え。
 - **KV 書き込みカーネル** (`kernels/kv_write.cpp`): T 行の K/V をページ KV に競合なく書く。
 - 残差ストリームは 40 コアの幅方向シャードで持ち、RMSNorm もシャード版 (89µs → 6.5µs)。argmax はデバイス上で行う。
+- **バッチデコード** (`tsugumi/batch.py`): 32 行を最大 8 レーン × 4 行に分け、レーンごとに別の会話を流す。行列積はそのまま、
+  GDN 融合カーネルはレーンごとに自分の状態スロットから再帰を始め (`seg`)、GQA カーネルと KV 書き込みカーネルはレーンごとの位置と
+  ページ表を読む (1 つのプログラムで全レーン。GQA の分割はレーンで分け合う)。conv の履歴もレーンごとの選択行列でずらす。
+  レーン数 1, 2, 4, 8 ごとにトレースを取り、使っている最大のレーンを含む最小のモードで回す。
 
 ## 制限
 
@@ -188,7 +233,7 @@ TSUGUMIサーバーが起動時に読み取る環境変数
   | Japanese MT-Bench / ELYZA-tasks-100 (採点は Gemini Decision 1) | 8.46 / 10、4.18 / 5 |
 
   評価のスクリプトは `scripts/bench_quality.py`、`run_bfcl.py`、`judge_bench.py`。
-- バッチは 1 (リクエストは 1 つずつ処理)。動画入力、`response_format` (構造化出力)、`n` > 1 バッチは未対応。
+- 既定ではリクエストを 1 つずつ処理する (`TSUGUMI_BATCH` で同時処理)。動画入力、`response_format` (構造化出力)、`n` > 1 は未対応。
 - 会話の続きは再利用します (前回のプロンプト + 返答、またはアシスタントのターン開始位置の状態スナップショットから差分だけ prefill)。
   複数の会話 (本体とサブエージェントなど) は KV のブロックを分けて保持し、リクエストごとに切り替えます (約 0.1 秒)。
   KV の合計は最大文脈ぶん (262,144 トークン) で、足りなくなると最後に使ったのが最も古い会話から捨てます。
@@ -205,6 +250,7 @@ TSUGUMIサーバーが起動時に読み取る環境変数
 | `tsugumi/attn.py`、`tsugumi/gqa_attn.py`、`tsugumi/kv_kernel.py` | attention 層、GQA split-K アテンション、KV 書き込み |
 | `tsugumi/vision.py`、`tsugumi/vision_tt.py` | 画像入力 (前処理、画像トークンの仮想 ID と M-RoPE の位置、デバイスの ViT) |
 | `tsugumi/kvpager.py` | KV ブロックのプールとページ表 (複数の会話) |
+| `tsugumi/batch.py` | バッチデコード (レーン、状態の受け渡し、複数リクエストのスケジューラ) |
 | `tsugumi/board.py` | ボードの温度・電力・ファン (`tt-smi -s` を定期的に読む、`/health` の `board`) |
 | `tsugumi/prefill.py`、`tsugumi/conv_kernel.py`、`tsugumi/page_copy.py` | 大きい T の prefill、因果 conv カーネル、ページコピー |
 | `kernels/*.cpp` | 自作カーネル (generic_op で起動) |

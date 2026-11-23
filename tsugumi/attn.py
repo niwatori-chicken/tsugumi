@@ -104,6 +104,11 @@ class AttnDecode:
         self.sdpa_cfg_T = ttnn.SDPAProgramConfig(compute_with_storage_grid_size=(g.x, g.y), exp_approx_mode=False,
                                                  q_chunk_size=0, k_chunk_size=0)
 
+    def init_batch(self, key, seg, lanes, block_size=64):
+        """Batched decode (tsugumi/batch.py): lanes x seg rows, each lane with its own positions and page table."""
+        nb = self.max_seq // block_size
+        self.kvw_T[key] = KVWriteKernel(self.dev, seg, self.NKV, self.HD, block_size, nb, self.kv_dtype, lanes=lanes)
+
     def forward_spec(self, x, sh):
         """x [1,1,32,H] rows 0..T-1; sh.cur_pos [T] int32, sh.page_table [T,nb], sh.cos/sin [1,T,1,HD]."""
         NH, NKV, HD, T = self.NH, self.NKV, self.HD, sh.T
@@ -140,15 +145,15 @@ class AttnDecode:
                                                          page_table=sh.page_table_1)
                     ttnn.deallocate(r)
         else:
-            self.kvw_T[T](k, v, self.kp, self.vp, sh.cur_pos, sh.page_table_1)
+            self.kvw_T[sh.key](k, v, self.kp, self.vp, sh.kv_pos, sh.kv_pt)
         ttnn.deallocate(k)
         ttnn.deallocate(v)
         if gqa is not None:
-            if T == 32:
+            if gqa.qmode == 1:  # T == 32, one sequence
                 q = ttnn.permute(q, (0, 2, 1, 3), memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [1, NH, 32, HD]
             else:
                 q = ttnn.to_memory_config(q, ttnn.DRAM_MEMORY_CONFIG)
-            o = gqa(q, self.kp, self.vp, sh.cur_pos, sh.page_table_1)  # [1, 1, 32, NH*HD], rows >= T zero
+            o = gqa(q, self.kp, self.vp, sh.kv_pos, sh.kv_pt)  # [1, 1, 32, NH*HD], rows >= T zero
             ttnn.deallocate(q)
             o = ttnn.multiply(o, ttnn.sigmoid(gate, memory_config=_L1), memory_config=_L1)
             ttnn.deallocate(gate)

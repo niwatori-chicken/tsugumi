@@ -102,7 +102,11 @@ class GDNFusedKernel:
     Returns OUT [1,1,32,NV*128] bf16 ready for the out projection.
     """
 
-    def __init__(self, dev, NV, NK, T, qkv_dim, kd, heads_per_core=1, dbg=0, snap_all=True):
+    def __init__(self, dev, NV, NK, T, qkv_dim, kd, heads_per_core=1, dbg=0, snap_all=True, seg=None):
+        """seg: rows per lane (batched decode: T/seg independent sequences, lane u in rows u*seg.., starting from
+        state slot IDX[u] and writing slots u*seg..u*seg+seg-1). None: one sequence of T rows."""
+        self.seg = seg or T
+        assert T % self.seg == 0 and T // self.seg <= 16
         self.dbg = dbg
         self.snap_all = snap_all
         self.dev, self.NV, self.NK, self.T, self.hpc = dev, NV, NK, T, heads_per_core
@@ -121,7 +125,7 @@ class GDNFusedKernel:
         self.cbs = [
             _cb(0, 16, c), _cb(1, 16, c), bf(2, 4), bf(3, 4), _cb(4, 4, c), bf(5, 4), _cb(6, 1, c), _cb(7, T, c),
             _cb(8, self.nc, c), _cb(9, 4, c), _cb(10, 4, c), _cb(11, 4, c), bf(12, 4), _cb(13, 4, c), _cb(14, 4, c),
-            _cb(15, 1, c), _cb(16, 4, c), bf(17, 4), _cb(18, 4, c), _cb(20, 2, c),
+            _cb(15, 1, c), _cb(16, 4, c), bf(17, 4), _cb(18, 4, c), _cb(19, 16, c), _cb(20, 2, c),
         ]
         self.ccfg = ttnn.ComputeConfigDescriptor()
         self.ccfg.math_fidelity = ttnn.MathFidelity.HiFi4
@@ -137,11 +141,14 @@ class GDNFusedKernel:
 
     @staticmethod
     def set_idx(idx_tensor, value):
+        """value: one slot for every lane, or a list (slot of lane u)."""
         import torch
 
-        ttnn.copy_host_to_device_tensor(
-            ttnn.from_torch(torch.full((1, 16), value, dtype=torch.int32), dtype=ttnn.uint32,
-                            layout=ttnn.ROW_MAJOR_LAYOUT), idx_tensor)
+        t = torch.full((1, 16), value if isinstance(value, int) else 0, dtype=torch.int32)
+        if not isinstance(value, int):
+            t[0, :len(value)] = torch.tensor(value, dtype=torch.int32)
+        ttnn.copy_host_to_device_tensor(ttnn.from_torch(t, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT),
+                                        idx_tensor)
 
     @staticmethod
     def make_consts(dev, norm_w, T):
@@ -164,7 +171,7 @@ class GDNFusedKernel:
             OUT = ttnn.allocate_tensor_on_device(ttnn.Shape([1, 1, 32, self.NV * 128]), ttnn.bfloat16,
                                                  ttnn.TILE_LAYOUT, self.dev, ttnn.L1_MEMORY_CONFIG)
         ins = [X, Y, GE, BE, C, S, IDX]
-        r_ct = [self.T, self.hpc, self.rep, self.koff, self.voff, self.zoff, self.NV, self.nc]
+        r_ct = [self.T, self.hpc, self.rep, self.koff, self.voff, self.zoff, self.NV, self.nc, self.seg]
         for t in ins:
             r_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
         w_ct = [self.hpc, self.T if self.snap_all else 1, self.NV]
@@ -186,8 +193,8 @@ class GDNFusedKernel:
                                   compile_time_args=w_ct, runtime_args=w_rt, config=ttnn.WriterConfigDescriptor()),
             ttnn.KernelDescriptor(kernel_source=os.path.join(KDIR, "gdn_fused_compute.cpp"),
                                   source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH, core_ranges=self.cores,
-                                  compile_time_args=[self.T, self.hpc], runtime_args=c_rt, config=self.ccfg,
-                                  defines=[("DBG", str(self.dbg)), ("SNAP_ALL", "1" if self.snap_all else "0")]),
+                                  compile_time_args=[self.T, self.hpc, self.seg], runtime_args=c_rt,
+                                  config=self.ccfg, defines=[("DBG", str(self.dbg)), ("SNAP_ALL", "1" if self.snap_all else "0")]),
         ]
         ttnn.generic_op(ins + [OUT], ttnn.ProgramDescriptor(kernels=kd, cbs=self.cbs))
         return OUT

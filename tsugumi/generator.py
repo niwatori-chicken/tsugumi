@@ -87,7 +87,8 @@ class Generator:
         self.eos = set(eos)
         self.im_start = im_start
         self.k = eng.T_dec - 1
-        self.multi = getattr(eng, "large", None) is not None and env("MULTI_CONV", "1") == "1"
+        self.multi = (getattr(eng, "large", None) is not None or getattr(eng, "state_io", None) is not None) and \
+            env("MULTI_CONV", "1") == "1"
         self.max_convs = max_convs or int(env("MAX_CONVS", "8"))
         # prompt-lookup drafts: index n-grams of NGRAM tokens (0 = off); use them when the context's suffix matches
         # an earlier stretch over at least NGRAM_MIN tokens, verified in the longer T_verify mode when the engine has one
@@ -139,10 +140,18 @@ class Generator:
         self._drop(min(others, key=lambda x: x.last_used))
         return True
 
+    def _save(self):
+        io = getattr(self.eng, "state_io", None)
+        return io.save() if io is not None else self.eng.large.save_state()
+
+    def _restore(self, snap):
+        io = getattr(self.eng, "state_io", None)
+        return io.restore(snap) if io is not None else self.eng.large.restore_state(snap)
+
     def _switch_out(self):
         c = self.cur
         if c.processed:
-            c.state = self.eng.large.save_state()
+            c.state = self._save()
 
     def reset(self):
         """Forget every conversation."""
@@ -176,10 +185,10 @@ class Generator:
             self.cur = best
             eng.pager.activate(best.blocks)
             if how == "exact":
-                eng.large.restore_state(best.state)
+                self._restore(best.state)
             switched = True
         if how == "snapshot":
-            eng.large.restore_state(self.cur.snap[1])
+            self._restore(self.cur.snap[1])
         elif how == "none":
             if self.multi and self.cur.processed:  # keep the current conversation, start a new one
                 self._switch_out()

@@ -87,8 +87,11 @@ class MLPDecode:
 class SpecShared:
     """Per-step device inputs shared by all layers in T-row mode (fixed addresses for trace)."""
 
+    batch = False  # batched decode (tsugumi/batch.py: BatchShared) shares the layer code with these modes
+
     def __init__(self, dev, T, HD, max_seq, pager, block_size=64):
         self.T = T
+        self.key = T  # mode key: per-mode kernels and traces
         bf = lambda t: ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=dev)
         self.m_hist = bf(torch.zeros(1, 1, 32, 64))
         self.m_shift = [bf(self.shift_matrix(T, j)) for j in range(4)]
@@ -96,9 +99,11 @@ class SpecShared:
 
         self.idx = GDNFusedKernel.make_idx(dev, 0)
         self.cur_pos = ttnn.from_torch(torch.zeros(T, dtype=torch.int32), dtype=ttnn.int32, device=dev)
+        self.kv_pos = self.cur_pos
         nb = max_seq // block_size
         self.page_table = pager.table_T(T)  # shared with every mode; rewritten by the pager
         self.page_table_1 = pager.pt1
+        self.kv_pt = self.page_table_1  # KV write / GQA: one page table and position tensor (lists in batch mode)
         self.cur_pos_rows = [ttnn.from_torch(torch.zeros(1, dtype=torch.int32), dtype=ttnn.int32, device=dev)
                              for _ in range(T)]
         self.gqa = None
@@ -242,7 +247,7 @@ class MTPHead:
         tid = ttnn.begin_trace_capture(self.eng.dev, cq_id=0)
         out = self.forward()
         ttnn.end_trace_capture(self.eng.dev, tid, cq_id=0)
-        self.traces[self.eng.T] = (tid, out)
+        self.traces[self.eng.key] = (tid, out)
         self.trace, self.out = tid, out
 
     def run(self, tokens, pos, sel_rows):
@@ -258,7 +263,7 @@ class MTPHead:
             M[0, 0, i, r] = 1.0
         ttnn.copy_host_to_device_tensor(ttnn.from_torch(M, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT), self.m_sel)
         e._set_positions(pos)
-        tr = self.traces.get(e.T)
+        tr = self.traces.get(e.key)
         if tr is not None:
             ttnn.execute_trace(e.dev, tr[0], cq_id=0, blocking=False)
             out = tr[1]
@@ -377,6 +382,9 @@ class Qwen35Engine:
         self.trace_id = None
         self.logits_out = None
         self.fused_gdn = env('FUSED_GDN', '1') == '1'
+        self.batch = None  # tsugumi.batch.BatchMode (batched decode), set by BatchMode
+        self.state_io = None
+        self.between_chunks = None  # called between prefill chunks (the batch scheduler runs lane steps there)
         # chunked SDPA prefill (needs aligned chunk starts); superseded by the GQA kernel (TSUGUMI_GQA_ATTN=1)
         self._chunked_prefill = env('CHUNKED_PREFILL', '1') == '1' and \
             env('GQA_ATTN', '1') != '1'
@@ -558,15 +566,26 @@ class Qwen35Engine:
             self.mtp.init_spec(TP)  # MTP rows start at pos+1 (unaligned): keeps the per-row decode SDPA
 
     def use_T(self, T):
-        self.T = T
+        """Select a mode: an int T (one sequence of T rows) or a batched-decode key ("b", lanes)."""
+        self.key = T
         self.sh = self.sh_by[T]
+        self.T = self.sh.T
         self.spec_trace = self.spec_traces.get(T)
         self.spec_out = self.spec_outs.get(T)
 
     def reset_spec(self):
-        for L in self.layers:
-            if L["type"] == "linear_attention":
-                L["mix"].reset_spec()
+        if self.state_io is not None:  # only slot 0 of the snapshots is read after a reset (and Hc rows 0..2)
+            for L in self.layers:
+                if L["type"] == "linear_attention":
+                    m = L["mix"]
+                    for t in (m.Hc, m.Bp):
+                        ttnn.copy_host_to_device_tensor(
+                            ttnn.from_torch(torch.zeros(tuple(t.shape)), dtype=t.dtype, layout=ttnn.TILE_LAYOUT), t)
+            self.state_io.zero_slot0()
+        else:
+            for L in self.layers:
+                if L["type"] == "linear_attention":
+                    L["mix"].reset_spec()
         self._a_prev = 0
         self._last_snap_all = True
 
@@ -693,19 +712,28 @@ class Qwen35Engine:
         tid = ttnn.begin_trace_capture(self.dev, cq_id=0)
         out = self.forward_spec()
         ttnn.end_trace_capture(self.dev, tid, cq_id=0)
-        self.spec_traces[self.T], self.spec_outs[self.T] = tid, out
-        self.use_T(self.T)
+        self.spec_traces[self.key], self.spec_outs[self.key] = tid, out
+        self.use_T(self.key)
 
     def capture_all(self):
         """Compile every mode eagerly first, then capture all traces back to back (no eager allocations
         between captures: buffers allocated after a capture can alias that trace's buffers)."""
-        modes = sorted(self.sh_by.keys(), reverse=True)
+        modes = sorted(k for k in self.sh_by if isinstance(k, int))[::-1]
+        bm = getattr(self, "batch", None)
+        if bm is not None:  # batched-decode modes (tsugumi/batch.py), plus its eager lane hand-off ops
+            modes += bm.keys()
         for T in modes:
             self.use_T(T)
-            self.set_inputs_spec([0], 0, 0)
-            self.forward_spec()
-            if self.mtp is not None:
-                self.mtp.run([0], 0, [0])
+            if isinstance(T, int):
+                self.set_inputs_spec([0], 0, 0)
+                self.forward_spec()
+                if self.mtp is not None:
+                    self.mtp.run([0], 0, [0])
+            else:
+                bm.compile_mode(T)
+        if bm is not None:
+            self.use_T(self.T_dec)
+            bm.warmup_handoff()
         for T in modes:
             self.use_T(T)
             self.capture_spec(compile_first=False)
@@ -736,6 +764,8 @@ class Qwen35Engine:
         pos = 0
         last = draft = None
         while pos < len(ids):
+            if pos and self.between_chunks is not None:
+                self.between_chunks()
             T = self.T_pre if (self.T_pre and len(ids) - pos >= self.T_pre) else self.T_dec
             mis = (start + pos) % self.T_pre if (self.T_pre and self._chunked_prefill) else 0
             if T == self.T_pre and mis:  # chunked SDPA needs chunk starts aligned to T_pre
@@ -778,7 +808,21 @@ class Qwen35Engine:
                 self.prefill_spec(ids[:k], start=start, with_mtp=with_mtp)
             finally:
                 self.sampler = smp
-        return lp.run(ids[k:], start=start + k, with_mtp=with_mtp)
+        piece = int(env("PREFILL_PIECE", "8192"))
+        if self.between_chunks is None or len(ids) - k <= piece:
+            return lp.run(ids[k:], start=start + k, with_mtp=with_mtp)
+        # batched decode: the large prefill in pieces, lane steps in between (the state is in canonical form
+        # there; the first row of each piece sees a zero previous hidden in the MTP KV, which only affects drafts)
+        smp, self.sampler = self.sampler, None
+        p = k
+        try:
+            while len(ids) - p > piece:
+                lp.run(ids[p:p + piece], start=start + p, with_mtp=with_mtp)
+                p += piece
+                self.between_chunks()
+        finally:
+            self.sampler = smp
+        return lp.run(ids[p:], start=start + p, with_mtp=with_mtp)
 
     def capture(self):
         self.forward()  # compile

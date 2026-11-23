@@ -3,7 +3,7 @@
 //   KT = transpose(Kn)
 //   for t: S *= exp(g_t); D = ((V - Kn@S) * B) * E_t; S += KT@D; O += (Q@S) * E_t
 //   OUT = O * rsqrt(rowmean(O^2) + eps) * w * silu(Z)       (gated RMSNorm, bf16 out)
-// CT: 0 T, 1 HPC
+// CT: 0 T, 1 HPC, 2 SEG (rows per lane: each lane of SEG rows starts from its own state, read from c_SIN)
 
 #include <stdint.h>
 #include "api/compute/compute_kernel_api.h"
@@ -25,7 +25,7 @@
 #endif
 
 constexpr uint32_t c_S0 = 0, c_S1 = 1, c_Q = 2, c_K = 3, c_KT = 4, c_V = 5, c_B = 6, c_G = 7, c_C = 8, c_D = 9,
-                   c_O0 = 10, c_O1 = 11, c_Z = 12, c_Kn = 13, c_T1 = 14, c_R = 15, c_Sout = 16, c_Out = 17, c_Qn = 18;
+                   c_O0 = 10, c_O1 = 11, c_Z = 12, c_Kn = 13, c_T1 = 14, c_R = 15, c_Sout = 16, c_Out = 17, c_Qn = 18, c_SIN = 19;
 constexpr uint32_t C_ONES = 0, C_ONES128 = 1, C_EPS = 2, C_W = 3, C_X128 = 7, C_EPS128 = 8, C_E = 9;
 
 FORCE_INLINE void pack_one(uint32_t cb) {
@@ -67,8 +67,9 @@ FORCE_INLINE void row_rsqrt(uint32_t cb_x, uint32_t ones_idx, uint32_t eps_idx) 
 void kernel_main() {
     constexpr uint32_t T = get_compile_time_arg_val(0);
     constexpr uint32_t HPC = get_compile_time_arg_val(1);
+    constexpr uint32_t SEG = get_compile_time_arg_val(2);
 
-    compute_kernel_hw_startup(c_K, c_S0, c_D);
+    compute_kernel_hw_startup(c_K, c_SIN, c_D);
     cb_wait_front(c_C, C_E + T);
 
     for (uint32_t hh = 0; hh < HPC; ++hh) {
@@ -111,18 +112,22 @@ void kernel_main() {
         cb_pop_front(c_Q, 4);
         cb_wait_front(c_Qn, 4);
 
-        cb_wait_front(c_S0, 16);
         cb_wait_front(c_G, T);
         cb_wait_front(c_B, 1);
         cb_wait_front(c_V, 4);
 
         for (uint32_t t = 0; t < T; ++t) {
-            // 1. decay
+            // 1. decay (a lane's first token reads the lane's initial state from c_SIN; s_cur is c_S0 then, empty)
+            const bool first = (t % SEG) == 0;
+            const uint32_t s_src = first ? c_SIN : s_cur;
+            if (first) {
+                cb_wait_front(c_SIN, 16);
+            }
             for (uint32_t idx = 0; idx < 16; ++idx) {
                 tile_regs_acquire();
-                reconfig_data_format_srca(s_cur);
-                copy_init(s_cur);
-                copy_tile(s_cur, idx, 0);
+                reconfig_data_format_srca(s_src);
+                copy_init(s_src);
+                copy_tile(s_src, idx, 0);
                 reconfig_data_format_srca(c_G);
                 copy_init(c_G);
                 copy_tile(c_G, t, 1);
@@ -130,7 +135,7 @@ void kernel_main() {
                 mul_binary_tile(0, 1, 0);
                 pack_one(s_nxt);
             }
-            cb_pop_front(s_cur, 16);
+            cb_pop_front(s_src, 16);
             {
                 uint32_t tmp = s_cur;
                 s_cur = s_nxt;
@@ -182,7 +187,7 @@ void kernel_main() {
             cb_wait_front(s_cur, 16);
 
             // snapshot after token t (all tokens for speculative verify; only the last one for prefill)
-            if (SNAP_ALL || t == T - 1)
+            if (SNAP_ALL || t % SEG == SEG - 1)
             for (uint32_t idx = 0; idx < 16; ++idx) {
                 tile_regs_acquire();
                 reconfig_data_format_srca(s_cur);
@@ -220,9 +225,10 @@ void kernel_main() {
                 o_cur = o_nxt;
                 o_nxt = tmp;
             }
+            if (t % SEG == SEG - 1) {  // end of the lane (s_cur is c_S0 after every token)
+                cb_pop_front(s_cur, 16);
+            }
         }
-
-        cb_pop_front(s_cur, 16);
 
         // ---- gated RMSNorm: OUT_j = O_j * R * w_j * silu(Z_j) ----
         cb_wait_front(o_cur, 4);

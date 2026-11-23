@@ -95,7 +95,10 @@ class Backend:
         with stage("tokenizer"):
             self.tok = AutoTokenizer.from_pretrained(MODEL_DIR)
         with stage("open device"):
-            self.dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
+            # batched decode (TSUGUMI_BATCH lanes) traces 2 more graphs per lane count (1, 2, 4, ..)
+            self.lanes = max(1, int(env("BATCH", "1")))
+            trace_mb = int(env("TRACE_MB", "512" if self.lanes == 1 else "1024"))
+            self.dev = ttnn.open_device(device_id=0, trace_region_size=trace_mb << 20, l1_small_size=24576)
         with stage(f"load weights ({CACHE}/bfp4; 2-3 min when not in the page cache)"):
             self.eng = Qwen35Engine(self.dev, MODEL_DIR, Precision("bfp4"), f"{CACHE}/bfp4", max_seq=max_seq,
                                     log=eng_log)
@@ -113,6 +116,10 @@ class Backend:
         if env("LARGE_PREFILL", "1") == "1":  # must come before capture_all
             with stage("large-T prefill and warm-up (compiles every chunk shape)"):
                 self.eng.init_large_prefill(int(env("LARGE_T", "1024")))
+        if self.lanes > 1:  # batched decode (tsugumi/batch.py): before capture_all
+            from tsugumi.batch import BatchMode, lane_counts
+            with stage(f"batched decode: {self.lanes} lanes (modes {lane_counts(self.lanes)})"):
+                BatchMode(self.eng, self.lanes)
         # every image size bucket, compiled before the traces (tsugumi/vision_tt.py); TSUGUMI_VISION_WARMUP=0 only to
         # reproduce the hang (e.g. to check the capture guard)
         if self.vision_tt is not None and env("VISION_WARMUP", "1") == "1":
@@ -124,6 +131,7 @@ class Backend:
             self.eng.capture_all()
         self.gen = Generator(self.eng)
         self.lock = threading.Lock()
+        self.sched = None  # batch scheduler (owns the device; requests do not take the lock for their whole run)
         self.vision = None
         if env("IMAGES", "1") == "1":  # image input; the embeddings are looked up by virtual token ids
             from tsugumi.vision import ImageTokens, VisionEncoder
@@ -154,6 +162,12 @@ class Backend:
             log.info(f"capture guard: {self.guard['progs']} programs, {self.guard['dram'] / (1 << 20):.1f} MiB DRAM "
                      f"after the trace capture")
         self.eng.progress = self._arm  # long prefills: re-armed per chunk, not only per generated token
+        if self.lanes > 1:
+            from tsugumi.batch import BatchScheduler
+            arm = lambda: faulthandler.dump_traceback_later(self.backstop, exit=True)
+            self.sched = BatchScheduler(self.gen, self.lock, arm=arm, disarm=faulthandler.cancel_dump_traceback_later,
+                                        on_error=self.fail, log=log.info)
+            self.eng.progress = arm
 
     def _dram_used(self):
         import ttnn
@@ -175,7 +189,13 @@ class Backend:
         g["last"] = state
 
     def _arm(self):
+        if self.sched is not None:  # batched: the scheduler arms the backstop per device step
+            return
         faulthandler.dump_traceback_later(self.backstop, exit=True)
+
+    def _disarm(self):
+        if self.sched is None:
+            faulthandler.cancel_dump_traceback_later()
 
     def fail(self, e):
         """Device error during a request: stop serving and exit so run_server.sh can reset the device."""
@@ -192,6 +212,9 @@ class Backend:
 
         self.stopping = True
         t0 = time.perf_counter()
+        if self.sched is not None:
+            self.sched.stop()
+            self.sched.thread.join(timeout=wait)
         if not self.lock.acquire(timeout=wait):
             log.warning(f"a generation did not stop within {wait}s; closing the device anyway")
         faulthandler.dump_traceback_later(guard, exit=True)  # if closing itself hangs
@@ -207,6 +230,9 @@ class Backend:
 
     def _tokens(self, ids, max_new, stats, sampler=None, think=None, row_cb=None):
         """Generator tokens; re-arms the backstop per token. Device errors go to fail() and are re-raised."""
+        if self.sched is not None:
+            yield from self._tokens_batched(ids, max_new, stats, sampler, think, row_cb)
+            return
         try:
             for t in self.gen.generate(ids, max_new=max_new, stats=stats, sampler=sampler, think=think,
                                        row_cb=row_cb):
@@ -215,6 +241,35 @@ class Backend:
         except Exception as e:
             self.fail(e)
             raise
+
+    def _tokens_batched(self, ids, max_new, stats, sampler, think, row_cb):
+        """The request runs in a lane of the batch scheduler; tokens come through the job's queue."""
+        from tsugumi.batch import END, Job
+        job = Job(ids, max_new, stats=stats, sampler=sampler, think=think)
+        self.sched.submit(job)
+        try:
+            while True:
+                it = job.get(timeout=1.0)
+                if it is None:
+                    if self.dead:
+                        raise RuntimeError(self.dead)
+                    continue
+                if it is END:
+                    return
+                if isinstance(it, Exception):
+                    raise it
+                t, row = it
+                if row_cb is not None:
+                    row_cb(*row)
+                yield t
+        finally:
+            job.cancel()  # the consumer stopped (stop string, disconnect, shutdown): the lane ends at its next step
+
+    def jobs_info(self):
+        """Running / waiting requests of the batch scheduler (for /health)."""
+        busy, waiting = self.sched.jobs()
+        return [dict(state=j.state, prompt_tokens=len(j.ids), generated=j.generated,
+                     seconds=round(time.time() - j.since, 1)) for j in busy], len(waiting)
 
     def encode(self, messages, enable_thinking, tools=None, template_kwargs=None, images=None, embed=True):
         """Prompt ids; each image becomes its virtual ids (encoded on the CPU unless cached). images: a dict
@@ -324,7 +379,7 @@ class Backend:
                     break
         finally:
             toks.close()  # an early end still records the committed state (Generator handles GeneratorExit)
-            faulthandler.cancel_dump_traceback_later()
+            self._disarm()
         prefix = self.tok.decode(out[prefix_off:read_off])
         text = self.tok.decode(out[prefix_off:])
         if len(text) > len(prefix) or pending:
@@ -479,6 +534,16 @@ def make_app(backend, api_keys=(), board=None):
     def health(req: Request):
         if backend.dead:
             return JSONResponse({"status": "error", "error": backend.dead}, status_code=503)
+        if backend.sched is not None:  # batched decode: several requests at once
+            busy, waiting = backend.jobs_info()
+            if keys and not key_ok(given_key(req)):
+                return {"status": "ok", "busy": bool(busy), "waiting": waiting, "auth": True}
+            res = {"status": "ok", "busy": bool(busy), "waiting": waiting, "lanes": backend.lanes, "active": busy}
+            if req.query_params.get("sched"):  # scheduler timings since the last ?sched=1 (and reset them)
+                res["sched"] = backend.sched.stats()
+            if board is not None:
+                res["board"] = board.latest()
+            return res
         if keys and not key_ok(given_key(req)):
             # stays open for health checks, but the details (running request, board) need a key
             return {"status": "ok", "busy": backend.active is not None, "waiting": backend.waiting,
@@ -494,6 +559,8 @@ def make_app(backend, api_keys=(), board=None):
 
     async def acquire(req, tag, n_prompt):
         """Wait for the device without blocking the event loop; give up if the client disconnects meanwhile."""
+        if backend.sched is not None:  # batched: the scheduler queues the request itself
+            return True
         backend.waiting += 1
         try:
             while True:
@@ -507,6 +574,8 @@ def make_app(backend, api_keys=(), board=None):
             backend.waiting -= 1
 
     def release():
+        if backend.sched is not None:
+            return
         tag = (backend.active or {}).get("id", "?")
         backend.active = None
         try:
@@ -599,8 +668,12 @@ def make_app(backend, api_keys=(), board=None):
         ignored = [k for k in ("presence_penalty", "frequency_penalty", "response_format", "logit_bias", "echo",
                                "suffix", "best_of") if body.get(k) not in (None, False, 0, 1, [], "")] + \
             (["n"] if (body.get("n") or 1) > 1 else [])
-        busy = backend.lock.locked()
-        log.info(f"req {tag}: {', '.join(p)}" + (f" (waiting: busy, {backend.waiting} ahead)" if busy else "") +
+        if backend.sched is not None:
+            busy, nw = backend.jobs_info()
+            wait = f" ({len(busy)}/{backend.lanes} lanes busy, {nw} waiting)" if busy else ""
+        else:
+            wait = f" (waiting: busy, {backend.waiting} ahead)" if backend.lock.locked() else ""
+        log.info(f"req {tag}: {', '.join(p)}" + wait +
                  (f"; ignored parameters: {', '.join(ignored)}" if ignored else ""))
         return max_new, make_sampler, stops, think, None
 
@@ -1029,6 +1102,8 @@ def log_settings(a):
         ("images", "off" if g("IMAGES", "1") != "1" else
                    f"on (ViT on the {'device' if g('VISION_DEVICE', '1') == '1' else 'CPU'}, max {g('IMAGE_MAX_PIXELS', str(1 << 20))} pixels/image, "
                    f"cache {g('IMAGE_CACHE_TOKENS', '65536')} tokens, URL fetch={g('IMAGE_FETCH', '1')})"),
+        ("batch", "off (one request at a time)" if int(g("BATCH", "1")) <= 1 else
+                  f"{g('BATCH', '1')} lanes (concurrent requests share each step)"),
         ("conversations", f"multi={g('MULTI_CONV', '1')} max={g('MAX_CONVS', '8')} snapshot={g('SNAPSHOT', '1')}"),
         ("hang detection", f"device timeout {os.environ.get('TT_METAL_OPERATION_TIMEOUT_SECONDS')}s, "
                            f"backstop {g('HANG_BACKSTOP', '300')}s"),
