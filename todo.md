@@ -101,7 +101,7 @@
 
 - [ ] **5c. サーバーの API・運用の穴** (2026-11-20 洗い出し、重要度順)
   - [x] `finish_reason` が常に stop / tool_calls だった → max_tokens で打ち切ったら `length` に (2026-11-20)。
-  - [x] `stop` (停止文字列) に対応 (2026-11-20)。`presence_penalty` などは無視 (todo 8)。`logprobs` / `top_logprobs` は上位 64 での近似で対応 (2026-11-20)。`n > 1`・`response_format` (JSON 固定)・`logit_bias` は未対応
+  - [x] `stop` (停止文字列) に対応 (2026-11-20)。`presence_penalty`・`frequency_penalty` は 2026-11-24 に対応 (todo 8)。`logprobs` / `top_logprobs` は上位 64 での近似で対応 (2026-11-20)。`n > 1`・`response_format` (JSON 固定)・`logit_bias` は未対応
     (無視したパラメータはログに出す)。
   - [x] 待ち行列の見える化 (2026-11-20): `/health` に busy・待ち数・処理中のリクエスト。待っている間に切断したリクエストは生成しない
     (ロックの獲得を非同期にして 0.25 秒ごとに切断を確認)。
@@ -171,7 +171,13 @@
   - T=2048 のバケット (行列積の効率が約 13% 上がるが、作業用の DRAM が増える)。
   - 作業領域を減らして max_seq を 163,840 に戻す (今は 155,648。159,744 は 2026-11-20 に DRAM の断片化で 4.5 万トークン目で OOM になった)。
 
-- [ ] **8. (低優先度) サンプリングのペナルティ (presence / frequency / repetition)**
+- [x] **8. サンプリングのペナルティ (presence / frequency) と、temperature がないときの既定値** — 2026-11-24
+  - pi (コーディングエージェント) で、圧縮の後に直前のメッセージを写し続ける繰り返しが出た。pi は temperature を送らず、
+    tsugumi は貪欲法だった (同じリクエストの再送で同じ出力)。
+  - `temperature` がなければモデルカードの推奨値 (thinking オフ 0.7/0.8/20 + presence 1.5、オン 1.0/0.95/20)。
+    `--sampling-defaults greedy` で以前の動作。presence / frequency は生成トークンが対象、行ごとに「生成済み + その行より前の下書き」で数えるので
+    投機的デコードでも厳密 (scripts/test_sampling.py の 4: 貪欲法 + ペナルティで 1 トークンずつと全一致)。repetition_penalty は未対応。
+  - 以下は当初のメモ:
   - 今は受け取らない (無視)。2026-11-20 時点で、打ち切られた出力 (MGSM 14〜22 問、GPQA 3 問) に繰り返しループはなく、
     どれも長く考え続けたもの。ループ対策は Qwen 推奨のサンプリング (temperature 0.6〜0.7、top_k 20) で足りる見込み。
   - やるとき: ホストの top-64 のうち既出トークンの logit を下げてから引く。行ごとに「そこまでに受理したトークン」を既出とすれば

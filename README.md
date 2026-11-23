@@ -105,8 +105,13 @@ export TSUGUMI_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(
   (ステップの切れ目で判定するので最大 7 トークン超える)。上限を指定したときは `max_tokens` は答えの分だけを数えます。
 - `logprobs` / `top_logprobs` (20 まで、completions は `logprobs: n`): デバイスの上位 64 の logits での log-softmax なので
   少し高めに出ます (64 の外は差し込んだトークンだけで -9999)。chat では本文のトークンだけです (思考は含まない)。
-- サンプリングは `temperature` > 0 で `top_p`、`top_k` (64 まで)、`min_p`、`seed` が有効になります。`temperature` がなければ貪欲法となります。
-  MTP の投機的デコードのまま厳密です (1 トークンずつ引いたのと同じ分布)。Qwen の推奨は thinking オフで 0.7 / 0.8 / 20、オンで 0.6 / 0.95 / 20です。
+- サンプリング: リクエストに `temperature` がないときは、Qwen3.8 のモデルカードの推奨値を thinking のオン / オフで使い分けます。
+  thinking オフは temperature 0.7 / top_p 0.8 / top_k 20 / `presence_penalty` 1.5 (繰り返しの抑制)、オンは 1.0 / 0.95 / 20 です。
+  リクエストで指定した項目はそちらが優先されます。`temperature` を指定したときは指定どおりで、0 なら貪欲法です。
+  以前のように「`temperature` がなければ貪欲法」にするには `--sampling-defaults greedy` (`TSUGUMI_SAMPLING_DEFAULTS`)。
+  `top_p`、`top_k` (64 まで)、`min_p`、`seed` と、`presence_penalty`・`frequency_penalty` (-2〜2、生成したトークンが対象。貪欲法でも有効)
+  に対応します。どれも MTP の投機的デコードのまま厳密です (1 トークンずつ引いたのと同じ分布・同じ出力)。
+  ペナルティはデバイスが返す上位 64 の logits にかけるので、上位の多くが大きく下がったときだけ近似になります。
 - ツール呼び出し: `tools` / `tool_choice` / 履歴の `tool_calls` と `role: tool` に対応しています (OpenAI 形式、ストリーミングも)。
   モデルが出す `<tool_call>` の XML を `tool_calls` に変換します (`tsugumi/toolcall.py`)。
   `tool_choice` は auto / none。required と関数名の指定は thinking オフのときだけ有効です (応答の先頭を `<tool_call>` にする)。
@@ -179,6 +184,7 @@ TSUGUMIサーバーが起動時に読み取る環境変数
 | `TSUGUMI_SERVED_MODEL_NAME` | サーバーが返すモデル名称を上書きする。デフォルトはモデルのディレクトリ名です。 |
 | `TSUGUMI_HANG_BACKSTOP` | トークンがこの環境変数以上の秒数出力されない場合、強制終了する。デフォルトは300秒です。 |
 | `TSUGUMI_BOARD_POLL` | サーバーが`tt-smi`からボードの状態を読み取る間隔。デフォルトは10秒です。 |
+| `TSUGUMI_SAMPLING_DEFAULTS` | `temperature` のないリクエストの扱い。`model` (既定) はモデルの推奨値、`greedy` は貪欲法。 |
 | `TSUGUMI_THINKING_BUDGET` | モデルが思考(CoT)に使えるトークン数の上限。デフォルトは無制限です。 |
 | `TSUGUMI_IMAGES=0` | 画像入力を無効にする (ViT を読み込まない。DRAM 0.52 GiB の節約) |
 | `TSUGUMI_VISION_DEVICE=0` | ViT を CPU で動かす (fp32、ホストの RAM 約 1.8GB、1024×1024 で約 14 秒と遅くなります) |

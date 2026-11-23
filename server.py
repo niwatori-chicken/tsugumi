@@ -4,8 +4,11 @@
 
 Endpoints: POST /v1/chat/completions and /v1/completions (stream or not), POST /tokenize and /detokenize,
 GET /v1/models, GET /health, GET / (a minimal chat web UI).
-Decoding is greedy unless the request sets temperature > 0; then top_p, top_k (<= 64), min_p and seed apply
-(exact speculative sampling, tsugumi/sampling.py). One request at a time.
+Sampling: a request without `temperature` gets the Qwen3.8 preset of its mode (tsugumi/sampling.py PRESETS: thinking
+1.0 / top_p 0.95 / top_k 20; non-thinking 0.7 / 0.8 / 20 + presence_penalty 1.5; its own fields win), unless
+--sampling-defaults greedy. temperature 0: greedy; > 0: top_p, top_k (<= 64), min_p, seed. presence_penalty /
+frequency_penalty (over the generated tokens) work with both. Exact under speculative decoding. One request at a time
+(TSUGUMI_BATCH=N: several).
 `chat_template_kwargs.enable_thinking` controls thinking (default: false); <think> content goes to
 `reasoning_content`. `thinking_budget` (or chat_template_kwargs.thinking_budget; default --thinking-budget) caps
 the thinking tokens: at the cap a closing sentence and </think> are inserted (THINK_FORCE), and max_tokens then
