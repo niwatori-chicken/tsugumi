@@ -257,6 +257,8 @@ class Generator:
         def account(t):
             """Counts the token just yielded; True when generation must stop."""
             st["n"] += 1
+            if eng.sampler is not None:
+                eng.sampler.observe(t)  # repetition penalties count the generated tokens
             if st["think"]:
                 st["n_think"] += 1
                 if t == think.end:
@@ -314,8 +316,9 @@ class Generator:
             eng.use_T(Tm)
             kk = len(drafts)
             y = eng.run_spec([cur] + drafts, p, a_prev)
-            if eng.sampler is not None:
-                y = [eng._pick_row(r) for r in range(kk + 1)]
+            if eng.sampler is not None:  # row r: its prefix is the generated tokens + drafts[:r] (penalties)
+                v, i = eng.last_topk
+                y = [eng.sampler.pick(v[r], i[r], drafts[:r]) for r in range(kk + 1)]
             if kind == "forced":  # all inserted; the token after them is the next forced one or the model's
                 n = kk
                 del queue[:kk]

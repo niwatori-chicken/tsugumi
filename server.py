@@ -46,7 +46,7 @@ import tsugumi.paths as tsugumi_paths
 from tsugumi.board import BoardMonitor
 from tsugumi.env import env
 from tsugumi.log import get_logger
-from tsugumi.sampling import Sampler
+from tsugumi.sampling import PRESETS, Sampler, resolve
 from tsugumi.toolcall import ToolStreamParser, forced_prefix, prepare_messages
 
 
@@ -59,6 +59,7 @@ EXIT_HANG = 75
 THINK_FORCE = ("\n\nConsidering the limited time by the user, I have to give the solution based on the thinking "
                "directly now.\n</think>\n\n")
 THINK_BUDGET = [None]  # server default (--thinking-budget); None = no cap
+SAMPLING_DEFAULTS = ["model"]  # --sampling-defaults: model (Qwen presets when temperature is not set) / greedy
 # must be set before tt-metal reads its runtime options (first ttnn import)
 os.environ.setdefault("TT_METAL_OPERATION_TIMEOUT_SECONDS", "30")
 
@@ -631,10 +632,11 @@ def make_app(backend, api_keys=(), board=None):
     def common(body, ids, tag, params, max_default):
         """Shared request checks: (max_new, sampler factory, stops, think budget, error response or None)."""
         max_new = int(body.get("max_tokens") or body.get("max_completion_tokens") or max_default)
-        temperature = float(body.get("temperature") or 0.0)
+        mode = params.pop("_mode", "completion")
         try:
-            if temperature > 0:
-                Sampler(temperature, body.get("top_p"), body.get("top_k"), body.get("min_p"), body.get("seed"))
+            sp, preset = resolve(body, mode, SAMPLING_DEFAULTS[0])
+            if sp is not None:
+                Sampler(seed=body.get("seed"), **sp)
         except (TypeError, ValueError) as e:
             return None, None, None, None, bad_request(f"sampling parameters: {e}")
         room = backend.max_seq - len(ids) - 8
@@ -647,17 +649,17 @@ def make_app(backend, api_keys=(), board=None):
             room -= think.budget
         max_new = max(1, min(max_new, room))
 
-        def make_sampler():  # per request; None = greedy
-            if temperature <= 0:
-                return None
-            return Sampler(temperature, body.get("top_p"), body.get("top_k"), body.get("min_p"), body.get("seed"))
+        def make_sampler():  # per request (it records the generated tokens for the penalties); None = greedy
+            return None if sp is None else Sampler(seed=body.get("seed"), **sp)
 
         stops = body.get("stop")
         p = [f"prompt {len(ids)} tok", f"max {max_new}"] + params.pop("_pre", [])
         if think is not None:
             p.append(f"thinking budget {think.budget}")
-        if temperature > 0:
-            p.append(f"temp {temperature}")
+        if sp is not None:
+            p.append(("preset " + preset + " " if preset else "") +
+                     " ".join(f"{k.replace('presence_penalty', 'pp').replace('frequency_penalty', 'fp')}={v}"
+                              for k, v in sp.items() if k == "temperature" or v not in (0, 0.0)))
         p += params.pop("_post", [])
         if stops:
             p.append(f"stop {len([stops] if isinstance(stops, str) else stops)}")
@@ -665,7 +667,7 @@ def make_app(backend, api_keys=(), board=None):
             p.append("logprobs")
         if body.get("stream"):
             p.append("stream")
-        ignored = [k for k in ("presence_penalty", "frequency_penalty", "response_format", "logit_bias", "echo",
+        ignored = [k for k in ("response_format", "logit_bias", "echo",
                                "suffix", "best_of") if body.get(k) not in (None, False, 0, 1, [], "")] + \
             (["n"] if (body.get("n") or 1) > 1 else [])
         if backend.sched is not None:
@@ -775,6 +777,7 @@ def make_app(backend, api_keys=(), board=None):
         rid = "chatcmpl-" + uuid.uuid4().hex[:24]
         tag = rid[-6:]
         params = {"_pre": ["thinking"] if thinking and think is None else [], "_think": think,
+                  "_mode": "thinking" if thinking else "instruct",
                   "_post": ([f"tools {len(tools)}"] if tools else []) +
                            ([f"images {imgs['n']} ({imgs['tokens']} tok, {imgs['encoded']} encoded in "
                              f"{imgs['seconds']:.1f}s)"] if imgs else [])}
@@ -1041,6 +1044,9 @@ def main():
     ap.add_argument("--max-seq", type=int, default=262144)  # the model limit; bfp8 KV (9 GiB) leaves ~1.8 GiB free
     ap.add_argument("--served-model-name", default=env("SERVED_MODEL_NAME", ""),
                     help="name(s) in the API, comma separated (default: the model directory name, e.g. Qwen3.8-27B)")
+    ap.add_argument("--sampling-defaults", choices=("model", "greedy"), default=env("SAMPLING_DEFAULTS", "model"),
+                    help="requests without temperature: model = the Qwen3.8 presets (thinking 1.0/0.95/20, "
+                         "non-thinking 0.7/0.8/20 + presence_penalty 1.5); greedy = greedy decoding (before 2026-11)")
     ap.add_argument("--thinking-budget", type=int, default=int(env("THINKING_BUDGET", "-1")),
                     help="default cap on thinking tokens when a request sets none (-1: no cap)")
     ap.add_argument("--api-key", default=env("API_KEY", ""),
@@ -1053,6 +1059,7 @@ def main():
     a.auth = f"{len(api_keys)} API key(s)" if api_keys else "off"
 
     THINK_BUDGET[0] = a.thinking_budget if a.thinking_budget >= 0 else None
+    SAMPLING_DEFAULTS[0] = a.sampling_defaults
 
     names = [n.strip() for n in a.served_model_name.split(",") if n.strip()]
     if names:
@@ -1094,6 +1101,10 @@ def log_settings(a):
         ("model", MODEL_DIR), ("served as", ", ".join(MODEL_NAMES)), ("weights cache", CACHE),
         ("listen", f"{a.host}:{a.port}"), ("auth", a.auth),
         ("max_seq", f"{a.max_seq} tokens"),
+        ("sampling", "greedy unless temperature > 0" if a.sampling_defaults == "greedy" else
+                     "no temperature: " + "; ".join(f"{m} t={p['temperature']} top_p={p['top_p']} top_k={p['top_k']}"
+                                                     + (f" pp={p['presence_penalty']}" if p['presence_penalty'] else "")
+                                                     for m, p in PRESETS.items() if m != "completion")),
         ("thinking", "no default budget" if a.thinking_budget < 0 else f"default budget {a.thinking_budget} tokens"),
         ("KV cache", g("KV_DTYPE", "bfp8")),
         ("prefill", f"large T {g('LARGE_T', '1024')} (on={g('LARGE_PREFILL', '1')}), SDPA {g('PREFILL_SDPA', 'hifi2')}"),
