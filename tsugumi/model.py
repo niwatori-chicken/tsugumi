@@ -361,6 +361,12 @@ class Qwen35Engine:
         self.mrope = []  # M-RoPE spans of the images in the current sequence (ImageTokens.layout)
         self.progress = None  # called after each large-prefill chunk (the server re-arms its hang backstop)
         log(f"model loaded in {time.time() - t0:.0f}s")
+        # after the weight conversion (which wants every core): the per-step host work (embedding rows, RoPE, small
+        # input tensors) is tiny, and with torch's default one thread per core its parallel regions wait for
+        # threads the busy-polling tt-metal threads keep off the CPU (3-5 ms per embedding lookup instead of 0.1 ms)
+        nt = int(env("TORCH_THREADS", "4"))
+        if nt > 0:
+            torch.set_num_threads(nt)
 
         # per-step device inputs (fixed addresses for trace)
         self.x_in = ttnn.from_torch(torch.zeros(1, 1, 32, self.H), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
