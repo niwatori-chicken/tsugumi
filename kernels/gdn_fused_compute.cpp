@@ -3,7 +3,8 @@
 //   KT = transpose(Kn)
 //   for t: S *= exp(g_t); D = ((V - Kn@S) * B) * E_t; S += KT@D; O += (Q@S) * E_t
 //   OUT = O * rsqrt(rowmean(O^2) + eps) * w * silu(Z)       (gated RMSNorm, bf16 out)
-// CT: 0 T, 1 HPC, 2 SEG (rows per lane: each lane of SEG rows starts from its own state, read from c_SIN)
+// CT: 0 T, 1 HPC, 2 SEG (rows per lane: each lane of SEG rows starts from its own state, read from c_SIN),
+//     3 TG (rows of this core: lanes r0/SEG ..); RT: 0 r0
 
 #include <stdint.h>
 #include "api/compute/compute_kernel_api.h"
@@ -68,9 +69,11 @@ void kernel_main() {
     constexpr uint32_t T = get_compile_time_arg_val(0);
     constexpr uint32_t HPC = get_compile_time_arg_val(1);
     constexpr uint32_t SEG = get_compile_time_arg_val(2);
+    constexpr uint32_t TG = get_compile_time_arg_val(3);
+    const uint32_t r0 = get_arg_val<uint32_t>(0);
 
     compute_kernel_hw_startup(c_K, c_SIN, c_D);
-    cb_wait_front(c_C, C_E + T);
+    cb_wait_front(c_C, C_E + TG);  // E tiles of this core's rows only (index tl)
 
     for (uint32_t hh = 0; hh < HPC; ++hh) {
         uint32_t s_cur = c_S0, s_nxt = c_S1;
@@ -112,11 +115,12 @@ void kernel_main() {
         cb_pop_front(c_Q, 4);
         cb_wait_front(c_Qn, 4);
 
-        cb_wait_front(c_G, T);
+        cb_wait_front(c_G, TG);
         cb_wait_front(c_B, 1);
         cb_wait_front(c_V, 4);
 
-        for (uint32_t t = 0; t < T; ++t) {
+        for (uint32_t tl = 0; tl < TG; ++tl) {
+            const uint32_t t = r0 + tl;  // row (E_t constant, lane boundaries); tl: index of this core's rows
             // 1. decay (a lane's first token reads the lane's initial state from c_SIN; s_cur is c_S0 then, empty)
             const bool first = (t % SEG) == 0;
             const uint32_t s_src = first ? c_SIN : s_cur;
@@ -130,7 +134,7 @@ void kernel_main() {
                 copy_tile(s_src, idx, 0);
                 reconfig_data_format_srca(c_G);
                 copy_init(c_G);
-                copy_tile(c_G, t, 1);
+                copy_tile(c_G, tl, 1);
                 mul_binary_tile_init();
                 mul_binary_tile(0, 1, 0);
                 pack_one(s_nxt);
@@ -159,7 +163,7 @@ void kernel_main() {
                 mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(c_B, 0, 0);
                 reconfig_data_format_srcb(c_C);
                 mul_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(c_C);
-                mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(c_C, C_E + t, 0);
+                mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(c_C, C_E + tl, 0);
                 pack_one(c_D);
             }
             cb_wait_front(c_D, 4);
@@ -197,7 +201,7 @@ void kernel_main() {
             }
 
             // 4. O += (Q @ S) * E_t
-            if (t > 0) {
+            if (tl > 0) {
                 cb_wait_front(o_cur, 4);
             }
             for (uint32_t j = 0; j < 4; ++j) {
@@ -209,15 +213,15 @@ void kernel_main() {
                 }
                 reconfig_data_format_srcb(c_C);
                 mul_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(c_C);
-                mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(c_C, C_E + t, 0);
-                if (t > 0) {
+                mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(c_C, C_E + tl, 0);
+                if (tl > 0) {
                     reconfig_data_format_srcb(o_cur);
                 add_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(o_cur);
                     add_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(o_cur, j, 0);
                 }
                 pack_one(o_nxt);
             }
-            if (t > 0) {
+            if (tl > 0) {
                 cb_pop_front(o_cur, 4);
             }
             {
@@ -282,10 +286,10 @@ void kernel_main() {
         cb_pop_front(c_Z, 4);
         cb_pop_front(c_KT, 4);
         cb_pop_front(c_Kn, 4);
-        cb_pop_front(c_G, T);
+        cb_pop_front(c_G, TG);
         cb_pop_front(c_B, 1);
         cb_pop_front(c_V, 4);
         cb_pop_front(c_Qn, 4);
     }
-    cb_pop_front(c_C, C_E + T);
+    cb_pop_front(c_C, C_E + TG);
 }

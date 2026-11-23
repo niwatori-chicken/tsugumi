@@ -102,11 +102,16 @@ class GDNFusedKernel:
     Returns OUT [1,1,32,NV*128] bf16 ready for the out projection.
     """
 
-    def __init__(self, dev, NV, NK, T, qkv_dim, kd, heads_per_core=1, dbg=0, snap_all=True, seg=None):
+    def __init__(self, dev, NV, NK, T, qkv_dim, kd, heads_per_core=1, dbg=0, snap_all=True, seg=None, groups=1):
         """seg: rows per lane (batched decode: T/seg independent sequences, lane u in rows u*seg.., starting from
-        state slot IDX[u] and writing slots u*seg..u*seg+seg-1). None: one sequence of T rows."""
+        state slot IDX[u] and writing slots u*seg..u*seg+seg-1). None: one sequence of T rows.
+        groups: the lanes are split into this many groups, each on its own NV cores (NV * groups cores; the
+        recurrence walks only the group's rows), every core writing only its rows of the output."""
         self.seg = seg or T
         assert T % self.seg == 0 and T // self.seg <= 16
+        self.groups = groups
+        assert groups == 1 or (heads_per_core == 1 and snap_all and (T // self.seg) % groups == 0)
+        self.TG = T // groups
         self.dbg = dbg
         self.snap_all = snap_all
         self.dev, self.NV, self.NK, self.T, self.hpc = dev, NV, NK, T, heads_per_core
@@ -114,8 +119,9 @@ class GDNFusedKernel:
         self.koff = kd // 32
         self.voff = 2 * kd // 32
         self.zoff = qkv_dim // 32
-        n_cores = NV // heads_per_core
+        n_cores = NV // heads_per_core * groups
         grid = dev.compute_with_storage_grid_size()
+        assert n_cores <= grid.x * grid.y, f"{n_cores} cores for the GDN kernel, the grid has {grid.x * grid.y}"
         self.coords = [(i % grid.x, i // grid.x) for i in range(n_cores)]
         c = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in self.coords])
         self.cores = c
@@ -171,19 +177,22 @@ class GDNFusedKernel:
             OUT = ttnn.allocate_tensor_on_device(ttnn.Shape([1, 1, 32, self.NV * 128]), ttnn.bfloat16,
                                                  ttnn.TILE_LAYOUT, self.dev, ttnn.L1_MEMORY_CONFIG)
         ins = [X, Y, GE, BE, C, S, IDX]
-        r_ct = [self.T, self.hpc, self.rep, self.koff, self.voff, self.zoff, self.NV, self.nc, self.seg]
+        r_ct = [self.T, self.hpc, self.rep, self.koff, self.voff, self.zoff, self.NV, self.nc, self.seg, self.TG]
         for t in ins:
             r_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
-        w_ct = [self.hpc, self.T if self.snap_all else 1, self.NV]
+        w_ct = [self.hpc, self.TG if self.snap_all else 1, self.NV, int(self.groups > 1)]
         for t in (S, OUT):
             w_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
         addrs = [t.buffer_address() for t in ins]
         r_rt, w_rt, c_rt = [], [], []
+        nh = self.NV // self.hpc  # cores per group
         for n, (x, y) in enumerate(self.coords):
-            h0 = n * self.hpc
-            r_rt.append(((x, y), addrs + [h0]))
-            w_rt.append(((x, y), [S.buffer_address(), OUT.buffer_address(), h0]))
-            c_rt.append(((x, y), []))
+            g, h0 = n // nh, (n % nh) * self.hpc
+            r0 = g * self.TG
+            r1 = 32 if g == self.groups - 1 else r0 + self.TG  # the last group also writes the padding rows (zero)
+            r_rt.append(((x, y), addrs + [h0, r0]))
+            w_rt.append(((x, y), [S.buffer_address(), OUT.buffer_address(), h0, r0, r1]))
+            c_rt.append(((x, y), [r0]))
         kd = [
             ttnn.KernelDescriptor(kernel_source=os.path.join(KDIR, "gdn_fused_reader.cpp"),
                                   source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH, core_ranges=self.cores,
@@ -193,7 +202,7 @@ class GDNFusedKernel:
                                   compile_time_args=w_ct, runtime_args=w_rt, config=ttnn.WriterConfigDescriptor()),
             ttnn.KernelDescriptor(kernel_source=os.path.join(KDIR, "gdn_fused_compute.cpp"),
                                   source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH, core_ranges=self.cores,
-                                  compile_time_args=[self.T, self.hpc, self.seg], runtime_args=c_rt,
+                                  compile_time_args=[self.T, self.hpc, self.seg, self.TG], runtime_args=c_rt,
                                   config=self.ccfg, defines=[("DBG", str(self.dbg)), ("SNAP_ALL", "1" if self.snap_all else "0")]),
         ]
         ttnn.generic_op(ins + [OUT], ttnn.ProgramDescriptor(kernels=kd, cbs=self.cbs))

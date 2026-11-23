@@ -8,7 +8,9 @@
 //   IDX: uint32 row-major tensor, element u = slot to read lane u's state from
 // Lanes (batched decode): the T rows are T/SEG independent sequences of SEG rows each (lane u = rows u*SEG..);
 // each lane starts from its own state. SEG == T: one sequence (the original kernel).
-// CT: 0 T, 1 HPC, 2 rep, 3 KOFF, 4 VOFF, 5 ZOFF, 6 NV, 7 NC (const tiles), 8 SEG, then accessors X, Y, GE, BE, C, S, IDX
+// Lane groups: a core serves the TG rows r0 .. r0+TG-1 (whole lanes; several cores per head split the lanes).
+// CT: 0 T, 1 HPC, 2 rep, 3 KOFF, 4 VOFF, 5 ZOFF, 6 NV, 7 NC (const tiles), 8 SEG, 9 TG, then accessors X, Y, GE, BE, C, S, IDX
+// RT: 0..6 addrs X, Y, GE, BE, C, S, IDX; 7 first head; 8 r0 (first row of the core's lanes)
 // RT: 0..6 addrs X, Y, GE, BE, C, S, IDX; 7 first head
 
 #include <stdint.h>
@@ -45,8 +47,9 @@ void kernel_main() {
     constexpr uint32_t NV = get_compile_time_arg_val(6);
     constexpr uint32_t NC = get_compile_time_arg_val(7);
     constexpr uint32_t SEG = get_compile_time_arg_val(8);
-    constexpr uint32_t NU = T / SEG;
-    constexpr auto aX = TensorAccessorArgs<9>();
+    constexpr uint32_t TG = get_compile_time_arg_val(9);
+    constexpr uint32_t NU = TG / SEG;  // lanes of this core
+    constexpr auto aX = TensorAccessorArgs<10>();
     constexpr auto aY = TensorAccessorArgs<aX.next_compile_time_args_offset()>();
     constexpr auto aGB = TensorAccessorArgs<aY.next_compile_time_args_offset()>();
     constexpr auto aBE = TensorAccessorArgs<aGB.next_compile_time_args_offset()>();
@@ -61,9 +64,14 @@ void kernel_main() {
     const auto sS = TensorAccessor(aS, get_arg_val<uint32_t>(5));
     const auto sI = TensorAccessor(aI, get_arg_val<uint32_t>(6));
     const uint32_t h0 = get_arg_val<uint32_t>(7);
+    const uint32_t r0 = get_arg_val<uint32_t>(8);
+    const uint32_t u0 = r0 / SEG;
 
     Noc noc;
-    read_tiles(noc, sC, c_C, 0, NC);
+    // constants, and only this core's row selectors E_t (t = r0 .. r0+TG-1): every core reads them from the
+    // same DRAM pages, so reading all T of them on 96 cores costs more than the recurrence it saves
+    read_tiles(noc, sC, c_C, 0, NC - T);
+    read_tiles(noc, sC, c_C, NC - T + r0, TG);
 
     CircularBuffer scr(c_SCR);
     scr.reserve_back(2);  // private scratch, never pushed
@@ -75,7 +83,7 @@ void kernel_main() {
     noc.async_read_barrier();
     uint32_t slots[NU];
     for (uint32_t u = 0; u < NU; ++u) {
-        slots[u] = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr_addr)[u];
+        slots[u] = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr_addr)[u0 + u];
     }
 
     for (uint32_t hh = 0; hh < HPC; ++hh) {
@@ -92,15 +100,15 @@ void kernel_main() {
         volatile tt_l1_ptr uint32_t* sp = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr_addr);
         {
             CircularBuffer cg(c_G);
-            cg.reserve_back(T);
+            cg.reserve_back(TG);
             volatile tt_l1_ptr uint32_t* gp = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cg.get_write_ptr());
-            for (uint32_t t = 0; t < T; ++t) {
-                const uint32_t v = sp[elem_off(t, h % 32)];
+            for (uint32_t t = 0; t < TG; ++t) {
+                const uint32_t v = sp[elem_off(r0 + t, h % 32)];
                 for (uint32_t e = 0; e < 1024; ++e) {
                     gp[t * 1024 + e] = v;
                 }
             }
-            cg.push_back(T);
+            cg.push_back(TG);
         }
         {
             CircularBuffer cb(c_B);
@@ -109,7 +117,7 @@ void kernel_main() {
             for (uint32_t e = 0; e < 1024; ++e) {
                 bp[e] = 0;
             }
-            for (uint32_t t = 0; t < T; ++t) {
+            for (uint32_t t = r0; t < r0 + TG; ++t) {
                 const uint32_t vv = sp[1024 + elem_off(t, (NV + h) % 32)];  // second scratch tile
                 for (uint32_t c = 0; c < 32; ++c) {
                     bp[elem_off(t, c)] = vv;

@@ -42,9 +42,9 @@ def gdn_ref(x, z, eg, beta, S, w):
     return torch.stack(outs), snaps
 
 
-def test_gdn(dev, NU):
+def test_gdn(dev, NU, groups=1):
     T = NU * SEG
-    kern = GDNFusedKernel(dev, NV, NK, T, QKV, KD, seg=SEG)
+    kern = GDNFusedKernel(dev, NV, NK, T, QKV, KD, seg=SEG, groups=groups)
     w = 1 + 0.2 * torch.randn(D)
     C = GDNFusedKernel.make_consts(dev, w, T)
     nslot = T
@@ -73,6 +73,10 @@ def test_gdn(dev, NU):
     Yt = ttnn.from_torch(Y, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=dev, memory_config=L1)
     GBt = ttnn.from_torch(GB, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=dev)
     out = ttnn.to_torch(kern(Xt, Yt, GBt, GBt, C, St, IDX))[0, 0].float()
+    pad = out[T:].abs().max().item() if T < 32 else 0.0
+    if pad != 0 or torch.isnan(out).any():
+        print(f"  GDN lanes={NU} groups={groups}: padding rows max {pad}, nan {torch.isnan(out).sum().item()}")
+        return False
     sn = ttnn.to_torch(St)[0].float()
     ok = True
     for u in range(NU):
@@ -81,7 +85,7 @@ def test_gdn(dev, NU):
         p_o = pcc(out[r], ref)
         p_s = min(pcc(sn[(u * SEG + t) * NV:(u * SEG + t + 1) * NV], snaps[t]) for t in range(SEG))
         ok &= p_o > 0.999 and p_s > 0.9999
-        print(f"  GDN lanes={NU} lane {u}: out pcc {p_o:.6f}  snapshots min pcc {p_s:.6f}")
+        print(f"  GDN lanes={NU} groups={groups} lane {u}: out pcc {p_o:.6f}  snapshots min pcc {p_s:.6f}")
     return ok
 
 
@@ -173,6 +177,8 @@ def main():
         ok = True
         for NU in [1] + lanes:
             ok &= test_gdn(dev, NU)
+            if NU >= 2:
+                ok &= test_gdn(dev, NU, groups=2)
             ok &= test_gqa_kv(dev, NU)
         print("ALL OK" if ok else "FAILED")
     finally:
