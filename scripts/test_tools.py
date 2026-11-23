@@ -66,7 +66,7 @@ def agent(label, question, stream=False, thinking=False, tool_choice=None, max_t
     print(f"=== {label}", flush=True)
     msgs = [{"role": "user", "content": question}]
     for turn in range(max_turns):
-        body = {"messages": msgs, "tools": TOOLS, "stream": stream, "max_tokens": 2048,
+        body = {"messages": msgs, "tools": TOOLS, "stream": stream, "max_tokens": 2048, "temperature": 0,
                 "chat_template_kwargs": {"enable_thinking": thinking}}
         if tool_choice and turn == 0:
             body["tool_choice"] = tool_choice

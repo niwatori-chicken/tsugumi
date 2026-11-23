@@ -13,6 +13,7 @@ fails = []
 
 
 def post(path, body):
+    body = dict(body, temperature=body.get("temperature", 0))  # greedy unless a check sets it: outputs are compared
     r = urllib.request.Request(URL + path, json.dumps(body).encode(), {"content-type": "application/json"})
     try:
         with urllib.request.urlopen(r, timeout=600) as f:
@@ -22,7 +23,7 @@ def post(path, body):
 
 
 def post_stream(path, body):
-    r = urllib.request.Request(URL + path, json.dumps(dict(body, stream=True)).encode(),
+    r = urllib.request.Request(URL + path, json.dumps(dict(body, stream=True, temperature=body.get("temperature", 0))).encode(),
                                {"content-type": "application/json"})
     out = []
     with urllib.request.urlopen(r, timeout=600) as f:

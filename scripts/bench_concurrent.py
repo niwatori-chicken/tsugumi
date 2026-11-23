@@ -30,7 +30,7 @@ PROMPTS = [
 
 def one(url, prompt, max_tokens, key, res):
     body = json.dumps({"model": "x", "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens,
-                       "stream": True}).encode()
+                       "stream": True, "temperature": 0}).encode()
     req = urllib.request.Request(url + "/v1/chat/completions", data=body, headers={"content-type": "application/json",
                                                                                      **({"authorization": f"Bearer {key}"} if key else {})})
     t0 = time.perf_counter()
