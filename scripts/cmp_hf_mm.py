@@ -4,6 +4,7 @@
 1. positions: the engine's rope_pos for every prompt token (and generated ones) vs HF get_rope_index.
 2. logits: HF text model (N layers, inputs_embeds with the image embeddings, 3-D position ids) vs the engine
    in the T-row mode (per row) and the large-T prefill (last row)."""
+import os as _os_fl; _os_fl.environ.setdefault("TSUGUMI_FULL_LOGITS", "1")  # reads eng.last_spec[0] (full logits)
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import argparse
