@@ -27,12 +27,12 @@ from ..kv_kernel import KVWriteKernel
 from ..ops import DecodeLinear, cache_path, has_cache
 from .attn_kernel import InkAttention
 from .prep_kernel import InkPrep
-from .act_kernel import InkAct
+from .act_kernel import InkAct, InkOGate
 from .ares_kernel import InkAres
 from .conv_kernel import InkConv
 from .moe_kernel import InkMoE
-from .gate_kernel import InkGate
-from .route_kernel import InkRoute
+from .gate_kernel import InkGate, InkGate1
+from .route_kernel import InkRoute, InkRouter
 from .config import InklingConfig
 from .prefill import PrefillMixin
 from .convert import convert_layer, expert_dtype, expert_files
@@ -399,12 +399,31 @@ class Engine(PrefillMixin):
         # (act = gc*tanh(g/gc) * sigmoid(g) * uc*tanh(u/uc)) are in the weights
         self.route = InkRoute(self.dev, E=c.n_experts, K=c.top_k,
                               kscale=c.route_scale * c.gate_softcap * c.up_softcap)
-        self.gate = InkGate(self.dev, H=c.hidden, R=c.gate_rank, eps=c.eps)  # message gates (two programs)
+        self.router = InkRouter(self.dev, E=c.n_experts, K=c.top_k, kscale=c.route_scale * c.gate_softcap * c.up_softcap,
+                                H=c.hidden) if env("INKLING_ROUTER", "1") == "1" else None
+        # message gates: one program (in-program barrier; TSUGUMI_INKLING_GATE1=0: the two-program kernel)
+        G = InkGate1 if env("INKLING_GATE1", "1") == "1" else InkGate
+        self.gate = G(self.dev, H=c.hidden, R=c.gate_rank, eps=c.eps)
         # post-attention / post-MLP conv + residual in one program, into persistent L1 buffers: residual and output
         # of application a rotate over 3 buffers (never the input's), the loop input (reused at every pass) has its own
         self.cvk = InkConv(self.dev, c.hidden)
         self.fuse_moe = True  # act kernel + expert combine in the post-MLP conv (False: ttnn ops, for comparisons)
-        self.act = InkAct(self.dev, c.top_k, c.inter, c.gate_softcap, c.up_softcap)
+        # (unused, and its 590 KB of L1 not allocated, when the MoE kernels run)
+        self.act = InkAct(self.dev, c.top_k, c.inter, c.gate_softcap, c.up_softcap) if self.moek is None else None
+        # attention output gate -> the o projections' (shared) width-sharded input layout. Off by default: no faster
+        # in the full step (the slice / multiply / conversion it replaces overlap their neighbours' dispatch) and its
+        # persistent sharded buffer (12 KB per core) breaks the L1 budget of the prefill programs
+        self.ogate = None
+        if env("INKLING_OGATE", "0") == "1":
+            lo_mem = [d["Lo"].xmem for d in self.layers]
+            assert all(m == lo_mem[0] for m in lo_mem)
+            self.lo_in = ttnn.from_torch(torch.zeros(1, 1, 32, c.n_heads * HD), dtype=ttnn.bfloat16,
+                                         layout=ttnn.TILE_LAYOUT, device=self.dev, memory_config=lo_mem[0])
+            self.ogate = InkOGate(self.dev, c.n_heads * HD // 32)
+        # message path of the sliding layers: the q / k / v gate outputs packed in rows 0 / 1 / 2 of one tile, so that
+        # one rms norm and the fused qkv linear serve all three
+        self.qkv3 = ttnn.from_torch(torch.zeros(1, 1, 32, c.hidden), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                                    device=self.dev, memory_config=L1)
         zb = lambda mem=L1: ttnn.from_torch(torch.zeros(1, 1, 32, c.hidden), dtype=ttnn.bfloat16,
                                             layout=ttnn.TILE_LAYOUT, device=self.dev, memory_config=mem)
         self.cvbuf = [zb(DRAM) for _ in range(3)]  # DRAM: read as whole tiles only; L1 is tight in prefill
@@ -423,6 +442,11 @@ class Engine(PrefillMixin):
             [lin.xmem for lin in self.lm_chunks]
         assert all(m == xm[0] for m in xm), "linears with K = hidden need one input sharding"
         self.ares.set_sharded(xm[0])  # attention / final norms straight into the linears' input layout
+        for d in self.layers:
+            if "Qmsg" in d:
+                d["arQmsg"] = self.ares.queries(ttnn.to_torch(d["Qmsg"]).float()[0, 0, :4])
+        self.hmsg = self.ares.zbuf(DRAM)  # the previous pass's output (messages of the next pass)
+        self.msgbuf = [self.ares.zbuf(DRAM) for _ in range(4)]
         self.arQf = self.ares.queries(ttnn.to_torch(self.Qf).float()[0, 0, :1])
         self.arLNf = [self.ares.norm(self.lnf)]
         self.artout = {a: self.ares.zbuf(DRAM) for a, (_, i, _) in enumerate(self.apps) if i > 0 and c.boundary(i)}
@@ -542,7 +566,7 @@ class Engine(PrefillMixin):
         return ttnn.add(out, ttnn.multiply(g, msg, input_tensor_a_activations=[UWP(U.TANH)], memory_config=L1),
                         memory_config=L1)
 
-    def attention(self, d, st, q_in, k_in, v_in, sc):
+    def attention(self, d, st, q_in, k_in, v_in, sc, rows=(0, 0, 0)):
         c = self.cfg
         NH, NKV, HD, DR = c.n_heads, c.n_kv, c.head_dim, c.d_rel
         sliding = d["sliding"]
@@ -561,7 +585,7 @@ class Engine(PrefillMixin):
             yk = d["Lk"](k_in, out_mem=omq)
             yv = d["Lv"](v_in, out_mem=omq)
         o0 = 2 * NH * HD
-        sink = self.row(yq, o0 + NH * DR, o0 + NH * DR + NH)  # [1,1,1,NH] (already / scale)
+        sink = self.row(yq, o0 + NH * DR, o0 + NH * DR + NH)  # [1,1,1,NH] / scale (unused with the sink page)
         C = NKV * HD
         if fused:  # column tiles of k / v in the fused output (tile aligned)
             ks, ko, vs, vo = y, nq // 32, y, (nq + nkv) // 32
@@ -574,7 +598,7 @@ class Engine(PrefillMixin):
                         v_dyn=(vs, vo + C // 32))
         # one program: q * scale -> clip (* tau), r likewise, k / v convolutions (history shifted) -> clip / rms
         q, r, k, v = self.prep(yq, 0, o0 // 32, ks, ko, vs, vo, taps=d["ptaps"], qscale=d["qscale"],
-                               rscale=d["rscale"], tau=None if sliding else self.TAU, **hist)
+                               rscale=d["rscale"], tau=None if sliding else self.TAU, rows=rows, **hist)
         # one kernel writes this token's K and V rows (kernels/kv_write.cpp; the cache as a single block)
         if sliding:
             self.kvw1_ring(k, v, st["kc"], st["vc"], self.D_RING, self.D_PT0)
@@ -582,21 +606,32 @@ class Engine(PrefillMixin):
             self.kvw1_full(k, v, st["kc"], st["vc"], self.D_POSF, self.D_PT0)
         rel = self.mm(r, d["proj"])  # [1,1,NH,R or W]: the relative bias by distance (units of 1 / scale)
         att = self.att_ring if sliding else self.att_full
-        o = att(q, st["kc"], st["vc"], rel, sink, self.D_POSF, self.D_NPR if sliding else self.D_NPF)  # row 0
+        if self.dbg is None and env("INKLING_SINKP", "1") == "1":  # sink logits from their tile of the linear output
+            assert (o0 + NH * DR) % 32 == 0
+            o = att(q, st["kc"], st["vc"], rel, yq, self.D_POSF, self.D_NPR if sliding else self.D_NPF,
+                    sink_page=(o0 + NH * DR) // 32)
+        else:
+            o = att(q, st["kc"], st["vc"], rel, sink, self.D_POSF, self.D_NPR if sliding else self.D_NPF)  # row 0
         if self.dbg is not None:
             g = lambda t: ttnn.to_torch(t).float()
             self.dbg_cur.update(q=g(q)[0, 0, :NH], k=g(k)[0, 0, :NKV], v=g(v)[0, 0, :NKV], r=g(r)[0, 0, :NH],
                                 attn=g(o)[0, 0, 0])
-        o = ttnn.multiply(o, ttnn.slice(yq, (0, 0, 0, NH * HD), (1, 1, 1, 2 * NH * HD), memory_config=L1),
-                          input_tensor_b_activations=[UWP(U.SIGMOID)], memory_config=L1)
+        if self.dbg is None and self.ogate is not None:  # o * sigmoid(gate) -> Lo's sharded input
+            o = self.ogate(o, yq, NH * HD // 32, self.lo_in)
+        else:
+            o = ttnn.multiply(o, ttnn.slice(yq, (0, 0, 0, NH * HD), (1, 1, 1, 2 * NH * HD), memory_config=L1),
+                              input_tensor_b_activations=[UWP(U.SIGMOID)], memory_config=L1)
         return d["Lo"](o, out_mem=om)
 
     def moe(self, d, x, combine=True):
         """Routed experts of row 0. combine=False: returns (down projections [1, K, 32, H], weights [1, K, 1, 1]) for
         the post-MLP conv kernel, which does the weighted sum."""
         c = self.cfg
-        logits = self.rowdot(d["WgT"], x)  # [1,1,1,E] float32
-        ids, wcol = self.route(logits, d["gbias"])  # uint16 [1,1,1,K] expert ids, bf16 [1,K,1,1] weights
+        if self.router is not None:  # kernels/ink_router_*: logits + routing in one program
+            ids, wcol = self.router(x, d["Wg"], d["gbias"])
+        else:
+            logits = self.rowdot(d["WgT"], x)  # [1,1,1,E] float32
+            ids, wcol = self.route(logits, d["gbias"])  # uint16 [1,1,1,K] expert ids, bf16 [1,K,1,1] weights
         if "Mgu" in d:  # kernels/ink_moe_*: experts, act and combine in one program (row 0, combined)
             return self.moek(x, ids, wcol, d["Mgu"], d["Mdn"])
         gu = ttnn.sparse_matmul(x, d["Egu"], sparsity=self.SPARSITY, indices=ids, is_input_a_sparse=False,
@@ -628,6 +663,7 @@ class Engine(PrefillMixin):
         _, i, _ = self.apps[a]
         d, st = self.layers[i], self.state[a]
         fused = self.dbg is None
+        rows = (0, 0, 0)  # source rows of the q / k / v linear inputs
         if fused and i > 0:
             # one kernel pair: stack, attention residual(s), and the input norms when there are no messages
             tb = self.artout.get(a)
@@ -635,10 +671,12 @@ class Engine(PrefillMixin):
                                     sharded=msgs is None and d["nqa"] == 1)
             if msgs is None:
                 q_in, k_in, v_in = (xns * 3)[:3] if d["sliding"] else xns
-            elif d["sliding"]:
+            elif d["sliding"]:  # the three gate outputs in rows 0 / 1 / 2 of one tile: one rms norm, one linear
                 ai = ais[0]
-                q_in, k_in, v_in = (ttnn.rms_norm(self.msg_gate(d, kd, ai, msgs[r]), weight=d["ln"], epsilon=c.eps,
-                                                  memory_config=L1) for r, kd in enumerate(("attn", "k", "v")))
+                for r, kd in enumerate(("attn", "k", "v")):
+                    self.gate(ai, msgs[r], d[f"g_{kd}_d"], d[f"g_{kd}_fg"], kd, out=self.qkv3, orow=r)
+                q_in = k_in = v_in = ttnn.rms_norm(self.qkv3, weight=d["ln"], epsilon=c.eps, memory_config=L1)
+                rows = (0, 1, 2)
             else:
                 q_in, k_in, v_in = (ttnn.rms_norm(self.msg_gate(d, kd, ais[r], msgs[r]), weight=d[ln], epsilon=c.eps,
                                                   memory_config=L1)
@@ -671,7 +709,7 @@ class Engine(PrefillMixin):
                 q_in = ttnn.rms_norm(qa, weight=d["lnq"], epsilon=c.eps, memory_config=L1)
                 k_in = ttnn.rms_norm(ka, weight=d["lnk"], epsilon=c.eps, memory_config=L1)
                 v_in = ttnn.rms_norm(va, weight=d["lnv"], epsilon=c.eps, memory_config=L1)
-        o = self.attention(d, st, q_in, k_in, v_in, sc)
+        o = self.attention(d, st, q_in, k_in, v_in, sc, rows)
         fused = self.dbg is None
         if fused:
             rb, ob = self.cvbuf[(2 * a) % 3], self.cvbuf[(2 * a + 1) % 3]
@@ -734,11 +772,19 @@ class Engine(PrefillMixin):
             a += 1
         for _ in range(1, c.passes):
             # messages from the previous pass: its block state appended at loop_start + block and its output
-            NM = ttnn.add(self.mm(self.MOV20, NB), self.mm(self.SH[1], self.rmsu(h)), memory_config=L1)
+            if self.dbg is None:  # attention-residual kernel, 4 queries: [block state, norm(h)] -> 4 messages
+                NB0 = self.mm(self.MOV20, NB)
+                ttnn.copy(h, self.hmsg)
+            else:
+                NM = ttnn.add(self.mm(self.MOV20, NB), self.mm(self.SH[1], self.rmsu(h)), memory_config=L1)
             h, NB, nb = pre
             for j in range(c.n_loop):
-                M = self.attn_res(self.layers[c.loop_start + j]["Qmsg"], NM, 2)
-                msgs = [self.mm(self.SEL[r], M) for r in range(4)]
+                if self.dbg is None:
+                    self.ares(self.hmsg, NB0, 1, self.layers[c.loop_start + j]["arQmsg"], 4, outs=self.msgbuf)
+                    msgs = self.msgbuf
+                else:
+                    M = self.attn_res(self.layers[c.loop_start + j]["Qmsg"], NM, 2)
+                    msgs = [self.mm(self.SEL[r], M) for r in range(4)]
                 h, NB, nb = self.layer(a, h, NB, nb, sc, msgs)
                 a += 1
         for _ in range(c.loop_end, c.n_layers):

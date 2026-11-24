@@ -41,7 +41,7 @@ class InkAres:
                      _cbd(k1, 5, N1, bf), _cbd(k1, 8, 1, f32)]
         self.cbs2 = [_cbd(k2, 0, N2, bf), _cbd(k2, 1, N2, bf), _cbd(k2, 2, N2, bf), _cbd(k2, 3, 1, bf),
                      _cbd(k2, 4, 2, f32), _cbd(k2, 5, N2, bf), _cbd(k2, 6, 2, bf), _cbd(k2, 8, 1, f32),
-                     _cbd(k2, 9, 7, bf), _cbd(k2, 10, 2, bf), _cbd(k2, 16, 2, bf), _cbd(k2, 17, 2, bf),
+                     _cbd(k2, 9, 9, bf), _cbd(k2, 10, 2, bf), _cbd(k2, 16, 2, bf), _cbd(k2, 17, 2, bf),
                      _cbd(k2, 18, 2, bf)]
         c = ttnn.ComputeConfigDescriptor()
         c.math_fidelity = ttnn.MathFidelity.HiFi4
@@ -93,11 +93,10 @@ class InkAres:
             r_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
         to = tout if tout is not None else self.AI[0]
         use_ln = int(bool(lns))
-        ai = (outs[:nq] + [outs[0]] * 3)[:3]
+        ai = (list(outs[:nq]) + [outs[0]] * 4)[:4]
         w_ct = ttnn.TensorAccessorArgs(self.part).get_compile_time_args()
         for t in ai + [to]:  # one accessor per output: the buffers may live in different memories
             w_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
-        xn = ai
         r_rt, c_rt, w_rt = [], [], []
         for i, (cx, cy) in enumerate(coords):
             j0 = i * NT
@@ -108,8 +107,7 @@ class InkAres:
             c_rt.append(((cx, cy), [phase, NT, int(NB is not None), self.NC1, nq, use_ln, int(tout is not None)]))
             w_rt.append(((cx, cy), [phase, self.part.buffer_address(), i, nb, nq, use_ln, int(tout is not None),
                                     fbits(1.0 / self.H), fbits(self.eps)]
-                         + [t.buffer_address() for t in ai] + [t.buffer_address() for t in xn]
-                         + [to.buffer_address(), j0, NT]))
+                         + [t.buffer_address() for t in ai] + [to.buffer_address(), j0, NT]))
         prog = ttnn.ProgramDescriptor(kernels=[
             K("ink_ar_reader.cpp", r_ct, r_rt, ttnn.ReaderConfigDescriptor()),
             K("ink_ar_writer.cpp", w_ct, w_rt, ttnn.WriterConfigDescriptor()),
@@ -122,13 +120,16 @@ class InkAres:
                 if id(t) not in seen:
                     seen.add(id(t))
                     ins.append(t)
-            ins = ins + outs[:nq] + ([tout] if tout is not None else [])
+            ins = ins + list(outs[:nq]) + ([tout] if tout is not None else [])
         ttnn.generic_op(ins, prog)
 
-    def __call__(self, x, NB, nb, QT, nq=1, lns=None, tout=None, sharded=False):
-        """sharded: XN into the set_sharded() buffers (only with norm weights)."""
+    def __call__(self, x, NB, nb, QT, nq=1, lns=None, tout=None, sharded=False, outs=None):
+        """sharded: XN into the set_sharded() buffers (only with norm weights); outs: output buffers (default the
+        persistent AI buffers; up to 4 queries with outs)."""
         assert nb < 5 and (tout is None or nq == 1) and (not sharded or (lns and nq == 1))
-        outs = self.XS if sharded else self.AI
+        assert nq <= (4 if outs is not None else 3)
+        if outs is None:
+            outs = self.XS if sharded else self.AI
         self._prog(1, x, NB, nb, QT, nq, lns, tout, outs)
         self._prog(2, x, NB, nb, QT, nq, lns, tout, outs)
         return (None if lns else outs[:nq]), (outs[:nq] if lns else None), tout

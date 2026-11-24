@@ -26,7 +26,12 @@ class InkPrep:
         self.NH, self.NKV, self.HD, self.DR = NH, NKV, HD, DR
         self.qk_clip, self.rel_clip, self.eps = qk_clip, rel_clip, eps
         grid = dev.compute_with_storage_grid_size()
-        self.coords = [(i, grid.y - 1) for i in range(4)]  # q, r, k, v
+        # roles split over cores by heads (role, first head, heads): q 6 x 4, r 2 x 12, k 4 x 2, v 4 x 2
+        self.split = [(0, h, 4) for h in range(0, 24, 4)] + [(1, 0, 12), (1, 12, 12)] + \
+            [(2, h, 2) for h in range(0, 8, 2)] + [(3, h, 2) for h in range(0, 8, 2)]
+        if NH != 24 or NKV != 8:
+            self.split = [(r, 0, NH if r < 2 else NKV) for r in range(4)]
+        self.coords = [(i % grid.x, grid.y - 1 - i // grid.x) for i in range(len(self.split))]
         cores = _cores(self.coords)
         bf, f32 = ttnn.bfloat16, ttnn.float32
         self.cbs = [
@@ -64,7 +69,8 @@ class InkPrep:
                                memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
     def __call__(self, q_src, q_off, r_off, k_src, k_off, v_src, v_off, hist_k, hk_off, hist_v, hv_off, taps,
-                 qscale, rscale, tau=None, k_dyn=None, v_dyn=None):
+                 qscale, rscale, tau=None, k_dyn=None, v_dyn=None, rows=(0, 0, 0)):
+        """rows: source rows of q (and r), k, v (their linear inputs packed into rows of one tile)."""
         """*_src: L1 tile tensors (row 0 = the token); *_off: column tile offsets; hist_*: DRAM [1,1,32,C] histories
         with column tile offsets; taps: taps_tensor(); tau: [1,1,1,1] DRAM or None; *_dyn: (src, col tile) of the
         32 dynamic conv weights (full layers) or None. Returns (QO, RO, KO, VO)."""
@@ -79,17 +85,18 @@ class InkPrep:
         ]
         r_rt, c_rt, w_rt = [], [], []
         orr = lambda t: (t if t is not None else dummy_d).buffer_address()
-        for (x, y), (src, soff, nrow, hw, nt, hist, hoff, toff, dyn, scl, mode, thr, out) in zip(self.coords, roles):
+        for (x, y), (role, h0, hn) in zip(self.coords, self.split):
+            src, soff, nrow, hw, nt, hist, hoff, toff, dyn, scl, mode, thr, out = roles[role]
             use_tau = int(tau is not None and hist is None)  # q and r of full layers
             r_rt.append(((x, y), [src.buffer_address(), soff, nrow, hw, nt, int(hist is not None), orr(hist), hoff,
                                   taps.buffer_address(), toff, int(dyn is not None),
                                   (dyn[0] if dyn is not None else src).buffer_address(),
                                   dyn[1] if dyn is not None else 0, int(scl is not None), orr(scl), use_tau, orr(tau),
-                                  self.sc.buffer_address()]))
+                                  self.sc.buffer_address(), h0, hn, rows[(0, 0, 1, 2)[role]]]))
             c_rt.append(((x, y), [nt, int(hist is not None), int(dyn is not None), int(scl is not None), use_tau,
                                   mode, fbits(thr), fbits(thr * thr), fbits(1.0 / hw), fbits(self.eps),
                                   fbits(1.0 / 3.0)]))
-            w_rt.append(((x, y), [out.buffer_address(), nt]))
+            w_rt.append(((x, y), [out.buffer_address(), nt, h0, hn, int(hn == nrow)]))
         dram = [t for t in (hist_k, hist_v, taps, qscale, rscale, tau, self.sc) if t is not None]
         l1 = [q_src, k_src, v_src] + [d[0] for d in (k_dyn, v_dyn) if d is not None]
         r_ct = ttnn.TensorAccessorArgs(q_src).get_compile_time_args() + \
