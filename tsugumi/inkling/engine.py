@@ -425,6 +425,11 @@ class Engine(PrefillMixin):
             [lin.xmem for lin in self.lm_chunks]
         assert all(m == xm[0] for m in xm), "linears with K = hidden need one input sharding"
         self.ares.set_sharded(xm[0])  # attention / final norms straight into the linears' input layout
+        for d in self.layers:
+            if "Qmsg" in d:
+                d["arQmsg"] = self.ares.queries(ttnn.to_torch(d["Qmsg"]).float()[0, 0, :4])
+        self.hmsg = self.ares.zbuf(DRAM)  # the previous pass's output (messages of the next pass)
+        self.msgbuf = [self.ares.zbuf(DRAM) for _ in range(4)]
         self.arQf = self.ares.queries(ttnn.to_torch(self.Qf).float()[0, 0, :1])
         self.arLNf = [self.ares.norm(self.lnf)]
         self.artout = {a: self.ares.zbuf(DRAM) for a, (_, i, _) in enumerate(self.apps) if i > 0 and c.boundary(i)}
@@ -736,11 +741,19 @@ class Engine(PrefillMixin):
             a += 1
         for _ in range(1, c.passes):
             # messages from the previous pass: its block state appended at loop_start + block and its output
-            NM = ttnn.add(self.mm(self.MOV20, NB), self.mm(self.SH[1], self.rmsu(h)), memory_config=L1)
+            if self.dbg is None:  # attention-residual kernel, 4 queries: [block state, norm(h)] -> 4 messages
+                NB0 = self.mm(self.MOV20, NB)
+                ttnn.copy(h, self.hmsg)
+            else:
+                NM = ttnn.add(self.mm(self.MOV20, NB), self.mm(self.SH[1], self.rmsu(h)), memory_config=L1)
             h, NB, nb = pre
             for j in range(c.n_loop):
-                M = self.attn_res(self.layers[c.loop_start + j]["Qmsg"], NM, 2)
-                msgs = [self.mm(self.SEL[r], M) for r in range(4)]
+                if self.dbg is None:
+                    self.ares(self.hmsg, NB0, 1, self.layers[c.loop_start + j]["arQmsg"], 4, outs=self.msgbuf)
+                    msgs = self.msgbuf
+                else:
+                    M = self.attn_res(self.layers[c.loop_start + j]["Qmsg"], NM, 2)
+                    msgs = [self.mm(self.SEL[r], M) for r in range(4)]
                 h, NB, nb = self.layer(a, h, NB, nb, sc, msgs)
                 a += 1
         for _ in range(c.loop_end, c.n_layers):

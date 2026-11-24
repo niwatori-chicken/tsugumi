@@ -26,11 +26,12 @@ class InkPrep:
         self.NH, self.NKV, self.HD, self.DR = NH, NKV, HD, DR
         self.qk_clip, self.rel_clip, self.eps = qk_clip, rel_clip, eps
         grid = dev.compute_with_storage_grid_size()
-        # roles split over cores by heads (role, first head, heads): q 3 x 8, r 1 x 24, k 2 x 4, v 2 x 4
-        self.split = [(0, 0, 8), (0, 8, 8), (0, 16, 8), (1, 0, NH), (2, 0, 4), (2, 4, 4), (3, 0, 4), (3, 4, 4)]
+        # roles split over cores by heads (role, first head, heads): q 6 x 4, r 2 x 12, k 4 x 2, v 4 x 2
+        self.split = [(0, h, 4) for h in range(0, 24, 4)] + [(1, 0, 12), (1, 12, 12)] + \
+            [(2, h, 2) for h in range(0, 8, 2)] + [(3, h, 2) for h in range(0, 8, 2)]
         if NH != 24 or NKV != 8:
             self.split = [(r, 0, NH if r < 2 else NKV) for r in range(4)]
-        self.coords = [(i, grid.y - 1) for i in range(len(self.split))]
+        self.coords = [(i % grid.x, grid.y - 1 - i // grid.x) for i in range(len(self.split))]
         cores = _cores(self.coords)
         bf, f32 = ttnn.bfloat16, ttnn.float32
         self.cbs = [

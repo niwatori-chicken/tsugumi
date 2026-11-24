@@ -6,8 +6,8 @@
 //   W2_k (row 0 = w * r_k), FD (diag (1, .., 1, f)); then the outputs: CB 16 -> AI_k, CB 17 -> XN_k, CB 18 -> TOUT
 //   (page j0 + j of each).
 // CT: accessors PART (L1), OUT_0, OUT_1, OUT_2 (the outputs of queries 0..2), TOUT.
-// RT: 0 phase, 1 part, 2 c, 3 nb, 4 NQ, 5 use_ln, 6 tout, 7 inv_H, 8 eps (float bits), 9..11 ai0..2, 12..14 xn0..2,
-//     15 tout addr, 16 j0, 17 NT
+// RT: 0 phase, 1 part, 2 c, 3 nb, 4 NQ (<= 4), 5 use_ln, 6 tout, 7 inv_H, 8 eps (float bits), 9..12 outputs 0..3
+//     (AI_k without norm weights, else XN_k), 13 tout, 14 j0, 15 NT
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -63,7 +63,8 @@ void kernel_main() {
     constexpr auto aO = TensorAccessorArgs<aP.next_compile_time_args_offset()>();
     constexpr auto aO1 = TensorAccessorArgs<aO.next_compile_time_args_offset()>();
     constexpr auto aO2 = TensorAccessorArgs<aO1.next_compile_time_args_offset()>();
-    constexpr auto aT = TensorAccessorArgs<aO2.next_compile_time_args_offset()>();
+    constexpr auto aO3 = TensorAccessorArgs<aO2.next_compile_time_args_offset()>();
+    constexpr auto aT = TensorAccessorArgs<aO3.next_compile_time_args_offset()>();
     const uint32_t phase = get_arg_val<uint32_t>(0);
     Noc noc;
     CircularBuffer cg(8);
@@ -78,7 +79,7 @@ void kernel_main() {
     const uint32_t nb = get_arg_val<uint32_t>(3), NQ = get_arg_val<uint32_t>(4), use_ln = get_arg_val<uint32_t>(5);
     const uint32_t tout = get_arg_val<uint32_t>(6);
     const float inv_h = fl(get_arg_val<uint32_t>(7)), eps = fl(get_arg_val<uint32_t>(8));
-    const uint32_t j0 = get_arg_val<uint32_t>(16), NT = get_arg_val<uint32_t>(17);
+    const uint32_t j0 = get_arg_val<uint32_t>(14), NT = get_arg_val<uint32_t>(15);
     cg.wait_front(1);
     volatile tt_l1_ptr uint32_t* G = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cg.get_read_ptr());
     const uint32_t n = nb + 1;
@@ -86,7 +87,7 @@ void kernel_main() {
     for (uint32_t a = 0; a < n; ++a)
         for (uint32_t b = 0; b < n; ++b) g[a][b] = fl(G[elem_off(a, b)]);
     const float f = rsq(g[nb][nb] * inv_h + eps);
-    float w[3][5], r[3];
+    float w[4][5], r[4];
     for (uint32_t k = 0; k < NQ; ++k) {
         float s[5], m = -1e30f, sum = 0.0f;
         for (uint32_t j = 0; j < n; ++j) {
@@ -125,20 +126,22 @@ void kernel_main() {
         for (uint32_t k = 0; k < NQ; ++k) {
             // with norm weights only XN_k is written, else only AI_k
             CircularBuffer& co = use_ln ? cxn : cai;
-            const uint32_t addr = get_arg_val<uint32_t>((use_ln ? 12 : 9) + k);
+            const uint32_t addr = get_arg_val<uint32_t>(9 + k);
             co.wait_front(1);
             if (k == 0) {
                 noc.async_write(co, TensorAccessor(aO, addr), 2048, {.offset_bytes = 0}, {.page_id = j0 + j});
             } else if (k == 1) {
                 noc.async_write(co, TensorAccessor(aO1, addr), 2048, {.offset_bytes = 0}, {.page_id = j0 + j});
-            } else {
+            } else if (k == 2) {
                 noc.async_write(co, TensorAccessor(aO2, addr), 2048, {.offset_bytes = 0}, {.page_id = j0 + j});
+            } else {
+                noc.async_write(co, TensorAccessor(aO3, addr), 2048, {.offset_bytes = 0}, {.page_id = j0 + j});
             }
             noc.async_write_barrier();
             co.pop_front(1);
         }
         if (tout) {
-            const auto sT = TensorAccessor(aT, get_arg_val<uint32_t>(15));
+            const auto sT = TensorAccessor(aT, get_arg_val<uint32_t>(13));
             cto.wait_front(1);
             noc.async_write(cto, sT, 2048, {.offset_bytes = 0}, {.page_id = j0 + j});
             noc.async_write_barrier();
