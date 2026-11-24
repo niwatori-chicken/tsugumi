@@ -88,7 +88,8 @@ class InkAttention:
         sb = (self.sink // C) * C
         return n_norm + (1 if sb >= n_norm * C else 0)
 
-    def __call__(self, q, kc, vc, rel, sinkv, pos, npos):
+    def __call__(self, q, kc, vc, rel, sinkv, pos, npos, sink_page=0):
+        """sink_page: the tile of sinkv whose row 0 holds the sink logits (e.g. a column tile of the linear output)."""
         RT, CT, HDT, S, NKV = self.RT, self.CT, self.HDT, self.S, self.NKV
         K = lambda src, ct, rt, cfg, cores: ttnn.KernelDescriptor(
             kernel_source=os.path.join(KDIR, src), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
@@ -104,7 +105,7 @@ class InkAttention:
         mc = _cores(self.m_coords)
         scale_bits = struct.unpack("<I", struct.pack("<f", self.scale))[0]
         prog = ttnn.ProgramDescriptor(kernels=[
-            K("ink_attn_reader.cpp", r_ct, [((x, y), ad + [g, s]) for (x, y), (g, s) in
+            K("ink_attn_reader.cpp", r_ct, [((x, y), ad + [g, s, sink_page]) for (x, y), (g, s) in
                                             zip(self.m_coords, self.m_assign)], ttnn.ReaderConfigDescriptor(), mc),
             K("gqa_attn_writer.cpp", w_ct, [((x, y), [pa, g, s]) for (x, y), (g, s) in
                                             zip(self.m_coords, self.m_assign)], ttnn.WriterConfigDescriptor(), mc),

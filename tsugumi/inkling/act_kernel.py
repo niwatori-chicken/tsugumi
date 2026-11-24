@@ -59,3 +59,50 @@ class InkAct:
         ], cbs=self.cbs)
         ttnn.generic_op([gu, self.out], prog)
         return self.out
+
+
+class InkOGate:
+    """Attention output gate of one token (kernels/ink_og_*.cpp): out = o * sigmoid(g), row 0 of every tile, with g
+    a column range of another tensor (the q linear's output). Rows gathered NR tiles to a dense tile per core.
+    Written straight into `out` (e.g. the o projection's width-sharded input): replaces slice + multiply (+ the
+    linear's input conversion).
+
+    og = InkOGate(dev, n_tiles=96)
+    og(o, g, goff, out)   # o [1,1,32,N] (L1), g (L1) with the gate at column tile goff, out [1,1,32,N]
+    """
+
+    def __init__(self, dev, n_tiles, NR=8):
+        self.dev, self.n, self.NR = dev, n_tiles, NR
+        ncores = (n_tiles + NR - 1) // NR
+        grid = dev.compute_with_storage_grid_size()
+        self.coords = [(i % grid.x, i // grid.x) for i in range(ncores)]
+        cores = _cores(self.coords)
+        bf = ttnn.bfloat16
+        self.cbs = [_cbd(cores, 0, 1, bf), _cbd(cores, 1, 1, bf), _cbd(cores, 2, NR, bf), _cbd(cores, 16, 1, bf)]
+        c = ttnn.ComputeConfigDescriptor()
+        c.math_fidelity = ttnn.MathFidelity.HiFi4
+        c.fp32_dest_acc_en = True
+        c.math_approx_mode = False
+        self.ccfg = c
+
+    def __call__(self, o, g, goff, out):
+        cores = _cores(self.coords)
+        K = lambda src, ct, rt, cfg: ttnn.KernelDescriptor(
+            kernel_source=os.path.join(KDIR, src), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores, compile_time_args=ct, runtime_args=rt, config=cfg)
+        r_rt, w_rt = [], []
+        for i, xy in enumerate(self.coords):
+            o0 = i * self.NR
+            n = min(self.NR, self.n - o0)
+            r_rt.append((xy, [o.buffer_address(), g.buffer_address(), o0, n, goff]))
+            w_rt.append((xy, [out.buffer_address(), o0, n]))
+        prog = ttnn.ProgramDescriptor(kernels=[
+            K("ink_og_reader.cpp", ttnn.TensorAccessorArgs(o).get_compile_time_args() +
+              ttnn.TensorAccessorArgs(g).get_compile_time_args(), r_rt, ttnn.ReaderConfigDescriptor()),
+            K("ink_og_writer.cpp", ttnn.TensorAccessorArgs(out).get_compile_time_args(), w_rt,
+              ttnn.WriterConfigDescriptor()),
+            K("ink_og_compute.cpp", [], [(xy, []) for xy in self.coords], self.ccfg),
+        ], cbs=self.cbs)
+        ins = [o] + ([g] if g is not o else []) + [out]
+        ttnn.generic_op(ins, prog)
+        return out

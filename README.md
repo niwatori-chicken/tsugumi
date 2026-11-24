@@ -208,13 +208,15 @@ export TSUGUMI_CACHE_DIR=/path/to/tsugumi_cache/inkling   # 変換済み重み (
   `auto` (既定。DRAM が 30 GiB 以上なら bfp8、それ以下なら mixed) / `bfp8` / `mixed` (ループの層 6-17 と MXFP8 の層を bfp8、残りを bfp4) / `bfp4`)。
   NVFP4 を bfp4 に詰め直すと重みの誤差が約 11% 増えるため (bfp8 なら 0.7%)、既定は bfp8 です。注意の重みと lm_head は bfp8、KV は bfp8。
   P150A (32GB) で DRAM 使用 26.8 GiB (`--max-seq 32768`)。mixed は P100A (28GB) 向けですが、P100A では未確認です。
-- 速度 (P150A、計測は各 1〜数回): デコード **約 24 tok/s** (サーバー経由 22.9〜24.6 tok/s)、prefill **約 183 tok/s**
-  (32 トークンずつ。1,335 トークンで 7.3 秒)、短いプロンプトの応答開始 約 0.3 秒。デコードは 1 ステップ約 37ms。
-  小さな op は自作カーネル (`kernels/ink_*.cpp`: 注意、q/r/k/v の前処理、ルーティング、メッセージゲート、conv + 残差、
-  attention residual + RMS norm) にまとめ、MoE はデコード・prefill とも 1 プログラム (`kernels/ink_moe_*`、`ink_moep_*`)。
+- 速度 (P150A、計測は各 1〜数回): デコード **約 27 tok/s** (1 ステップ約 31ms)、prefill **約 183 tok/s**
+  (32 トークンずつ。1,335 トークンで 7.3 秒)、短いプロンプトの応答開始 約 0.3 秒。
+  小さな op は自作カーネル (`kernels/ink_*.cpp`) にまとめています: 注意、q/r/k/v の前処理 (ヘッドごとに 16 コア)、
+  ルーター (ロジットとルーティングを 1 プログラム)、メッセージゲート (1 プログラム)、conv + 残差、
+  attention residual + RMS norm (ループのメッセージ計算も)、MoE (デコード・prefill とも 1 プログラム、`ink_moe_*` /
+  `ink_moep_*`)。複数コアの途中結果は、プログラム内のバリアのあと各コアの CB から NoC で直接読み合います。
   エキスパートの重みは読み込み時にデバイス上で DRAM バンクごとに連続する並びへ詰め直します
-  (`TSUGUMI_INKLING_MOE_KERNEL=0` で従来の sparse_matmul)。内訳 (ステップ全体での差し替え計測): MoE 9.5 ms、
-  メッセージゲート 4.7 ms、前処理 3.3 ms、attention residual 2.8 ms、注意 1.9 ms、ルーター 1.6 ms。
+  (`TSUGUMI_INKLING_MOE_KERNEL=0` で従来の sparse_matmul)。メッセージの通る層では q / k / v の入力を
+  1 タイルの行 0 / 1 / 2 に詰め、RMS norm と線形層を 1 回にまとめます。
 - 正しさ: CPU の fp32 参照実装 (`tsugumi/inkling/ref.py`、transformers 5.24 の `modeling_inkling2_loop.py` から書き起こし) と比べ、
   最後の位置の上位 64 ロジットの相関 0.999 (27 トークン) / 0.99 (1,335 トークン)、貪欲法の生成は参照とほぼ一致 (teacher forcing で 23〜24/24。外れるのは参照の上位 2 候補の差が 0.2 未満の位置)。
   `scripts/inkling_check.py` で確認できます。

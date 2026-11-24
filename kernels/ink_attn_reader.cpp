@@ -59,6 +59,7 @@ void kernel_main() {
     const auto sSK = TensorAccessor(aSK, get_arg_val<uint32_t>(7));
     const uint32_t g = get_arg_val<uint32_t>(8);
     const uint32_t s = get_arg_val<uint32_t>(9);
+    const uint32_t sink_page = get_arg_val<uint32_t>(10);  // tile of SINKV holding the sink logits in row 0
 
     constexpr uint32_t TB = 2048;
     constexpr uint32_t C = CT * 32;
@@ -123,7 +124,7 @@ void kernel_main() {
     }
     const uint32_t skoff = GH * WRT * 32 * 2;
     for (uint32_t f = 0; f < 2; ++f) {  // row 0 of the sink tile (heads in columns)
-        noc.async_read(sSK, crel, 32, {.page_id = 0, .offset_bytes = face_off(0, f)},
+        noc.async_read(sSK, crel, 32, {.page_id = sink_page, .offset_bytes = face_off(0, f)},
                        {.offset_bytes = skoff + f * 32});
     }
     if (active) {

@@ -27,7 +27,7 @@ from ..kv_kernel import KVWriteKernel
 from ..ops import DecodeLinear, cache_path, has_cache
 from .attn_kernel import InkAttention
 from .prep_kernel import InkPrep
-from .act_kernel import InkAct
+from .act_kernel import InkAct, InkOGate
 from .ares_kernel import InkAres
 from .conv_kernel import InkConv
 from .moe_kernel import InkMoE
@@ -410,6 +410,16 @@ class Engine(PrefillMixin):
         self.fuse_moe = True  # act kernel + expert combine in the post-MLP conv (False: ttnn ops, for comparisons)
         # (unused, and its 590 KB of L1 not allocated, when the MoE kernels run)
         self.act = InkAct(self.dev, c.top_k, c.inter, c.gate_softcap, c.up_softcap) if self.moek is None else None
+        # attention output gate -> the o projections' (shared) width-sharded input layout. Off by default: no faster
+        # in the full step (the slice / multiply / conversion it replaces overlap their neighbours' dispatch) and its
+        # persistent sharded buffer (12 KB per core) breaks the L1 budget of the prefill programs
+        self.ogate = None
+        if env("INKLING_OGATE", "0") == "1":
+            lo_mem = [d["Lo"].xmem for d in self.layers]
+            assert all(m == lo_mem[0] for m in lo_mem)
+            self.lo_in = ttnn.from_torch(torch.zeros(1, 1, 32, c.n_heads * HD), dtype=ttnn.bfloat16,
+                                         layout=ttnn.TILE_LAYOUT, device=self.dev, memory_config=lo_mem[0])
+            self.ogate = InkOGate(self.dev, c.n_heads * HD // 32)
         # message path of the sliding layers: the q / k / v gate outputs packed in rows 0 / 1 / 2 of one tile, so that
         # one rms norm and the fused qkv linear serve all three
         self.qkv3 = ttnn.from_torch(torch.zeros(1, 1, 32, c.hidden), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
@@ -575,7 +585,7 @@ class Engine(PrefillMixin):
             yk = d["Lk"](k_in, out_mem=omq)
             yv = d["Lv"](v_in, out_mem=omq)
         o0 = 2 * NH * HD
-        sink = self.row(yq, o0 + NH * DR, o0 + NH * DR + NH)  # [1,1,1,NH] (already / scale)
+        sink = self.row(yq, o0 + NH * DR, o0 + NH * DR + NH)  # [1,1,1,NH] / scale (unused with the sink page)
         C = NKV * HD
         if fused:  # column tiles of k / v in the fused output (tile aligned)
             ks, ko, vs, vo = y, nq // 32, y, (nq + nkv) // 32
@@ -596,13 +606,21 @@ class Engine(PrefillMixin):
             self.kvw1_full(k, v, st["kc"], st["vc"], self.D_POSF, self.D_PT0)
         rel = self.mm(r, d["proj"])  # [1,1,NH,R or W]: the relative bias by distance (units of 1 / scale)
         att = self.att_ring if sliding else self.att_full
-        o = att(q, st["kc"], st["vc"], rel, sink, self.D_POSF, self.D_NPR if sliding else self.D_NPF)  # row 0
+        if self.dbg is None and env("INKLING_SINKP", "1") == "1":  # sink logits from their tile of the linear output
+            assert (o0 + NH * DR) % 32 == 0
+            o = att(q, st["kc"], st["vc"], rel, yq, self.D_POSF, self.D_NPR if sliding else self.D_NPF,
+                    sink_page=(o0 + NH * DR) // 32)
+        else:
+            o = att(q, st["kc"], st["vc"], rel, sink, self.D_POSF, self.D_NPR if sliding else self.D_NPF)  # row 0
         if self.dbg is not None:
             g = lambda t: ttnn.to_torch(t).float()
             self.dbg_cur.update(q=g(q)[0, 0, :NH], k=g(k)[0, 0, :NKV], v=g(v)[0, 0, :NKV], r=g(r)[0, 0, :NH],
                                 attn=g(o)[0, 0, 0])
-        o = ttnn.multiply(o, ttnn.slice(yq, (0, 0, 0, NH * HD), (1, 1, 1, 2 * NH * HD), memory_config=L1),
-                          input_tensor_b_activations=[UWP(U.SIGMOID)], memory_config=L1)
+        if self.dbg is None and self.ogate is not None:  # o * sigmoid(gate) -> Lo's sharded input
+            o = self.ogate(o, yq, NH * HD // 32, self.lo_in)
+        else:
+            o = ttnn.multiply(o, ttnn.slice(yq, (0, 0, 0, NH * HD), (1, 1, 1, 2 * NH * HD), memory_config=L1),
+                              input_tensor_b_activations=[UWP(U.SIGMOID)], memory_config=L1)
         return d["Lo"](o, out_mem=om)
 
     def moe(self, d, x, combine=True):
