@@ -53,7 +53,13 @@ def load_or_convert(dev, w, dtype, mem, cache_file=None, pad_n=None):
 # (DRAM banks, K) -> settings measured best on that board (scripts/mm_sweep.py); the rest use the defaults below,
 # chosen on a P100A (7 banks). P150A (8 banks), K=6144 (GDN out / attention o projections): 59.1 -> 44.5 us
 # (58% -> 78% of the DRAM roofline); workers stay 2, so the cached (padded) weights are unchanged.
-TUNED = {(8, 6144): dict(in0_block_w=6, in0_cores=32)}
+TUNED = {
+    (8, 6144): dict(in0_block_w=6, in0_cores=32),
+    # Inkling 2 Mini on P150A (scratchpad sweep, bfp8, 3 workers per bank): hidden 2304 -> qkv / lm_head chunks,
+    # 3072 -> o.  57 us / 153 us / 24 us vs ~75 / ~200 / ~35 us with the generic choice
+    (8, 2304): dict(in0_block_w=3, in0_cores=24),
+    (8, 3072): dict(in0_block_w=6, in0_cores=16),
+}
 
 
 class DecodeLinear:

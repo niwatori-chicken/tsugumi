@@ -27,7 +27,7 @@ HTTP経由でOpenAI 互換サーバーとして使うことができます。
 
 Wormhole世代のアクセラレータには対応していません。
 
-この推論エンジンが対応するモデルは、今のところ**Qwen 3.8 27Bのみです。** 他のモデルについては、アップデートで対応予定です。
+この推論エンジンが対応するモデルは、今のところ**Qwen 3.8 27B** と **Inkling 2 Mini** (下の「Inkling 2 Mini」) です。
 
 ## 必要なもの
 
@@ -191,6 +191,44 @@ TSUGUMIサーバーが起動時に読み取る環境変数
 
 デバッグ用の環境変数については、[debugging.md](./debugging.md)に記載しています。
 
+## Inkling 2 Mini
+
+[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (26.4B の MoE、128 エキスパート中 8、
+中央の 12 層を 3 回まわすループ型で 1 トークンあたり 48 層ぶん) にも対応しています。`TSUGUMI_MODEL_DIR` の `config.json` の
+`model_type` が `inkling2_loop` なら、サーバーは自動で Inkling 用のエンジン (`tsugumi/inkling/`) を使います。
+
+```bash
+hf download thinkingmachines/Inkling-2-Mini --local-dir ~/models/Inkling-2-Mini   # 公式の NVFP4 / MXFP8 チェックポイント (約 20GB)
+export TSUGUMI_MODEL_DIR=~/models/Inkling-2-Mini
+export TSUGUMI_CACHE_DIR=/path/to/tsugumi_cache/inkling   # 変換済み重み (初回に作られる、bfp8 で約 28GB、数分)
+./run_server.sh --port 8010                                # 既定の --max-seq は 32768
+```
+
+- 重み: エキスパートは公式の NVFP4 (層 0-19) / MXFP8 (層 20-23) を復号して **bfp8** に変換します (`TSUGUMI_INKLING_EXPERTS`:
+  `auto` (既定。DRAM が 30 GiB 以上なら bfp8、それ以下なら mixed) / `bfp8` / `mixed` (ループの層 6-17 と MXFP8 の層を bfp8、残りを bfp4) / `bfp4`)。
+  NVFP4 を bfp4 に詰め直すと重みの誤差が約 11% 増えるため (bfp8 なら 0.7%)、既定は bfp8 です。注意の重みと lm_head は bfp8、KV は bfp8。
+  P150A (32GB) で DRAM 使用 26.8 GiB (`--max-seq 32768`)。mixed は P100A (28GB) 向けですが、P100A では未確認です。
+- 速度 (P150A、計測は各 1〜数回): デコード **約 23 tok/s** (サーバー経由 22.7〜23.8 tok/s)、prefill **約 148 tok/s**
+  (32 トークンずつ。1,335 トークンで 9.0 秒)、短いプロンプトの応答開始 約 0.3〜0.4 秒。デコードは 1 ステップ約 38ms
+  (約 2,100 プログラム)。小さな op は自作カーネル (`kernels/ink_*.cpp`: 注意、q/r/k/v の前処理、ルーティング、
+  メッセージゲート、conv + 残差、attention residual + RMS norm、SwiGLU) にまとめています。内訳 (ステップ全体での差し替え計測):
+  MoE 13 ms、qkv の線形 5.3 ms、ゲート 5.1 ms、前処理 3.6 ms、attention residual 3.5 ms、注意 2.2 ms、o 2.0 ms、lm_head 1.8 ms。
+- 正しさ: CPU の fp32 参照実装 (`tsugumi/inkling/ref.py`、transformers 5.24 の `modeling_inkling2_loop.py` から書き起こし) と比べ、
+  最後の位置の上位 64 ロジットの相関 0.999 (27 トークン) / 0.99 (1,335 トークン)、貪欲法の生成は参照とほぼ一致 (teacher forcing で 23〜24/24。外れるのは参照の上位 2 候補の差が 0.2 未満の位置)。
+  `scripts/inkling_check.py` で確認できます。
+- 思考の強さ: リクエストの `reasoning_effort` (`none` / `minimal` / `low` / `medium` / `high` / `xhigh`、または 0〜0.99) か
+  `chat_template_kwargs.reasoning_effort`。`chat_template_kwargs.enable_thinking: false` は `none` として扱います。
+  どれもないときはサーバーの `--reasoning-effort` (`TSUGUMI_REASONING_EFFORT`)、それもなければテンプレートの既定 (0.9)。
+  `none` でもモデルは短く考えてから答えます。思考は `reasoning_content` に分けて返します。
+- 応答はモデルの特殊トークン (`<|content_thinking|>`、`<|content_text|>`、`<|content_invoke_tool_json|>`) で
+  reasoning_content / content / tool_calls に分けます (`tsugumi/inkling/chat.py`)。ツール呼び出し (並列も)、ストリーミング、
+  `logprobs`、停止文字列、`/v1/completions` に対応。
+- 会話の続き: 前回のプロンプトの末尾の状態 (スライディング層のリング KV と畳み込みの履歴) をデバイス上に 1 つ保存し、
+  次のリクエストのプロンプトがそれで始まれば差分だけ prefill します (返答の思考を含めずに送り返されても効く)。
+  `reasoning_effort` を変えると先頭のシステムメッセージが変わるので再利用されません。
+- 未対応: 画像入力、`thinking_budget`、`TSUGUMI_BATCH` (同時処理)、付属の MTP (`mtp.safetensors`) による投機的デコード。
+- 全注意層は毎ステップ `--max-seq` ぶんの KV とマスクを読むので、`--max-seq` を大きくすると短い会話でも遅くなります。
+
 ## 仕組み
 
 1 トークンあたりの時間の大半は重みの読み出しなので、(1) 読む量を減らし、(2) 1 回の読み出しで複数トークンを処理し、
@@ -257,6 +295,7 @@ TSUGUMIサーバーが起動時に読み取る環境変数
 | `tsugumi/board.py` | ボードの温度・電力・ファン (`tt-smi -s` を定期的に読む、`/health` の `board`) |
 | `tsugumi/prefill.py`、`tsugumi/conv_kernel.py`、`tsugumi/page_copy.py` | 大きい T の prefill、因果 conv カーネル、ページコピー |
 | `kernels/*.cpp` | 自作カーネル (generic_op で起動) |
+| `tsugumi/inkling/` | Inkling 2 Mini: 設定 (`config.py`)、チェックポイントの読み込みと NVFP4 / MXFP8 の復号 (`weights.py`、`convert.py`)、CPU 参照実装 (`ref.py`)、デコード (`engine.py`)、32 トークンずつの prefill (`prefill.py`)、生成ループと会話の再利用 (`generator.py`)、チャット形式 (`chat.py`) |
 | `server.py` | OpenAI 互換サーバー |
 | `run_server.sh` | サーバーの起動とハング後の自動復帰 (デバイスのリセット → 再起動) |
 | `debugging.md` | デバッグのためのヒント、および環境変数 |
