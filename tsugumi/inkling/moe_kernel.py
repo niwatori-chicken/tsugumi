@@ -44,12 +44,12 @@ def fbits(x):
 
 
 class InkMoE:
-    def __init__(self, dev, E, H, I, gc, uc, K=8, placement=None, ring=(12, 6, 4)):
+    def __init__(self, dev, E, H, I, gc, uc, K=8, placement=None, ring=(12, 4, 3), NB=4):
         assert (H, I, K) == (2304, 1152, 8)
         self.dev, self.E, self.H, self.I, self.gc, self.uc = dev, E, H, I, gc, uc
         self.ring = ring  # weight blocks: tiles per block, blocks in the CB, blocks in flight
         assert 36 % ring[0] == 0 and (ring[0] * ring[1]) % 24 == 0 and ring[2] < ring[1]
-        self.coords = PLACEMENTS[placement or os.environ.get("TSUGUMI_MOE_PLACEMENT", "rect6x6")]
+        self.coords = PLACEMENTS[placement or os.environ.get("TSUGUMI_MOE_PLACEMENT", "stride2")]
         self.NC = len(self.coords)
         assert self.NC == I // 32 and len(set(self.coords)) == self.NC
         self.pb = 1088  # bfp8 tile
@@ -64,6 +64,13 @@ class InkMoE:
         c.fp32_dest_acc_en = True
         c.math_approx_mode = False
         self.ccfg = c
+        f32 = ttnn.float32
+        self.NB = NB  # prefill: experts per batch (one barrier per batch)
+        self.pcbs = [_cbd(cores, 0, 72, bf), _cbd(cores, 1, ring[0] * ring[1], b8), _cbd(cores, 2, 72, bf),
+                     _cbd(cores, 4, 2, bf), _cbd(cores, 5, 2, bf), _cbd(cores, 6, 4, bf), _cbd(cores, 7, 1, bf),
+                     _cbd(cores, 10, 1, bf), _cbd(cores, 11, 1, bf), _cbd(cores, 12, 1, bf),
+                     _cbd(cores, 13, 2 * NB, bf), _cbd(cores, 14, 3, bf), _cbd(cores, 15, 2, f32),
+                     _cbd(cores, 16, 2, bf)]
         L1 = ttnn.L1_MEMORY_CONFIG
         z = lambda w: ttnn.from_torch(torch.zeros(1, 1, 32, w), dtype=bf, layout=ttnn.TILE_LAYOUT, device=dev,
                                       memory_config=L1)
@@ -127,3 +134,31 @@ class InkMoE:
         ], semaphores=sems, cbs=self.cbs)
         ttnn.generic_op([x, ids, wcol, gu, dn, self.gather, self.out], prog)
         return self.out
+
+    def prefill(self, x, route, used, gu, dn, out):
+        """32 token rows: x [1,1,32,H]; route [1,1,32,E] bf16 tiles (dense routing weights, 0 = not routed); used
+        row-major bf16 [1,1,1,E] (max over the tokens); out [1,1,32,H] (L1 or DRAM)."""
+        cores = _cores(self.coords)
+        Kd = lambda src, ct, rt, cfg: ttnn.KernelDescriptor(
+            kernel_source=os.path.join(KDIR, src), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores, compile_time_args=ct, runtime_args=rt, config=cfg)
+        r_ct = list(self.ring)
+        for t in (x, route, used):
+            r_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
+        nocxy = [v for n in self.noc for v in (n.x, n.y)]
+        r_rt, c_rt, w_rt = [], [], []
+        for c, xy in enumerate(self.coords):
+            r_rt.append((xy, [x.buffer_address(), route.buffer_address(), used.buffer_address(), gu.buffer_address(),
+                              dn.buffer_address(), c, self.pb, self.NB, self.NC] + nocxy))
+            c_rt.append((xy, [fbits(1.0 / self.gc), fbits(1.0 / self.uc), (c // 4) % 2, self.NB]))
+            w_rt.append((xy, [out.buffer_address(), c, self.noc[0].x, self.noc[0].y, self.NB]))
+        sems = [ttnn.SemaphoreDescriptor(id=0, core_ranges=cores, initial_value=0),
+                ttnn.SemaphoreDescriptor(id=1, core_ranges=cores, initial_value=0)]
+        prog = ttnn.ProgramDescriptor(kernels=[
+            Kd("ink_moep_reader.cpp", r_ct, r_rt, ttnn.ReaderConfigDescriptor()),
+            Kd("ink_moep_writer.cpp", ttnn.TensorAccessorArgs(out).get_compile_time_args(), w_rt,
+               ttnn.WriterConfigDescriptor()),
+            Kd("ink_moep_compute.cpp", [], c_rt, self.ccfg),
+        ], semaphores=sems, cbs=self.pcbs)
+        ttnn.generic_op([x, route, used, gu, dn, out], prog)
+        return out

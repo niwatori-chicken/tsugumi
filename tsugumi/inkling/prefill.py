@@ -77,6 +77,8 @@ class PrefillMixin:
         self.kvw_full = KVWriteKernel(self.dev, T, NKV, HD, SA, 1, ttnn.bfloat8_b)
         self.p_pc_gu = self._spc(2 * c.inter, (9, 8), 6)
         self.p_pc_dn = self._spc(H, (9, 8), 6)
+        # output of the prefill MoE kernel (DRAM: written as whole tiles, consumed by ttnn ops)
+        self.p_moe_out = self.tt(torch.zeros(1, 1, T, H), mem=DRAM)
         for d in self.layers:
             self._prefill_layer_consts(d)
         self.p_qf = ttnn.slice(self.Qf, (0, 0, 0, 0), (1, 1, 1, H))
@@ -220,6 +222,8 @@ class PrefillMixin:
                           input_tensor_b_activations=[UWP(U.RECIP), UWP(U.MUL_UNARY_SFPU, kk)], memory_config=L1)
         w = ttnn.typecast(w, ttnn.bfloat16)
         sp = ttnn.to_layout(ttnn.max(w, dim=-2, keepdim=True, memory_config=L1), ttnn.ROW_MAJOR_LAYOUT)
+        if "Mgu" in d:  # kernels/ink_moep_*: the used experts in batches, act, routing weights and sum in one program
+            return self.moek.prefill(x, w, sp, d["Mgu"], d["Mdn"], self.p_moe_out)
         E, I = c.n_experts, c.inter
         gu = ttnn.sparse_matmul(x, d["Egu"], sparsity=sp, is_input_b_sparse=True, memory_config=DRAM,
                                 program_config=self.p_pc_gu, compute_kernel_config=d["eck"])
