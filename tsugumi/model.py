@@ -788,7 +788,7 @@ class Qwen35Engine:
         self.use_T(self.T_dec)
         return last, start + pos, draft
 
-    def init_large_prefill(self, t_max=1024):
+    def init_large_prefill(self, t_max=2048):
         """Large-T prompt prefill (tsugumi/prefill.py); used by prefill() for prompts of 64+ tokens."""
         from .prefill import LargePrefill
 

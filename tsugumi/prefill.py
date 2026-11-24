@@ -34,7 +34,7 @@ class LargePrefill:
     """Create before eng.capture_all(): its constant tensors must not be allocated after a trace capture
     (a replay can overwrite buffers allocated after the capture)."""
 
-    def __init__(self, eng, t_max=1024, t_min=64):
+    def __init__(self, eng, t_max=2048, t_min=64):
         self.eng, self.dev = eng, eng.dev
         self.t_max, self.t_min = t_max, t_min
         self.BS = 64

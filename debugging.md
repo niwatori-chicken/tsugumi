@@ -8,7 +8,7 @@
 |---|---|
 | `TSUGUMI_LOG_LEVEL=DEBUG` | サーバーから詳細なログを出力する |
 | `TSUGUMI_PREFILL_SDPA=hifi4` | prefill の attention を q chunk 128 + HiFi4 に戻す (既定は 256 + HiFi2) |
-| `TSUGUMI_LARGE_PREFILL=0` / `TSUGUMI_LARGE_T` | 大きい T の prefill を使わない (T=32 の旧経路) / 1 チャンクの最大行数 (既定 1024) |
+| `TSUGUMI_LARGE_PREFILL=0` / `TSUGUMI_LARGE_T` | 大きい T の prefill を使わない (T=32 の旧経路) / 1 チャンクの最大行数 (既定 2048。1024 なら作業用の DRAM が 124 MiB 減るが、prefill は 1〜3 割遅い) |
 | `TSUGUMI_GQA_ATTN=0` | 自作の GQA アテンションを使わず、ttnn の SDPA に戻す |
 | `TSUGUMI_CHUNKED_PREFILL=0` | (GQA を切ったとき) prefill で chunked SDPA を使わない |
 | `TSUGUMI_FUSED_GDN=0` | GDN 融合カーネルを使わず、元の op の並びで動かす |
