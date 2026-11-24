@@ -69,7 +69,8 @@ class InkPrep:
                                memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
     def __call__(self, q_src, q_off, r_off, k_src, k_off, v_src, v_off, hist_k, hk_off, hist_v, hv_off, taps,
-                 qscale, rscale, tau=None, k_dyn=None, v_dyn=None):
+                 qscale, rscale, tau=None, k_dyn=None, v_dyn=None, rows=(0, 0, 0)):
+        """rows: source rows of q (and r), k, v (their linear inputs packed into rows of one tile)."""
         """*_src: L1 tile tensors (row 0 = the token); *_off: column tile offsets; hist_*: DRAM [1,1,32,C] histories
         with column tile offsets; taps: taps_tensor(); tau: [1,1,1,1] DRAM or None; *_dyn: (src, col tile) of the
         32 dynamic conv weights (full layers) or None. Returns (QO, RO, KO, VO)."""
@@ -91,7 +92,7 @@ class InkPrep:
                                   taps.buffer_address(), toff, int(dyn is not None),
                                   (dyn[0] if dyn is not None else src).buffer_address(),
                                   dyn[1] if dyn is not None else 0, int(scl is not None), orr(scl), use_tau, orr(tau),
-                                  self.sc.buffer_address(), h0, hn]))
+                                  self.sc.buffer_address(), h0, hn, rows[(0, 0, 1, 2)[role]]]))
             c_rt.append(((x, y), [nt, int(hist is not None), int(dyn is not None), int(scl is not None), use_tau,
                                   mode, fbits(thr), fbits(thr * thr), fbits(1.0 / hw), fbits(self.eps),
                                   fbits(1.0 / 3.0)]))

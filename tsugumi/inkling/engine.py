@@ -32,7 +32,7 @@ from .ares_kernel import InkAres
 from .conv_kernel import InkConv
 from .moe_kernel import InkMoE
 from .gate_kernel import InkGate, InkGate1
-from .route_kernel import InkRoute
+from .route_kernel import InkRoute, InkRouter
 from .config import InklingConfig
 from .prefill import PrefillMixin
 from .convert import convert_layer, expert_dtype, expert_files
@@ -399,6 +399,8 @@ class Engine(PrefillMixin):
         # (act = gc*tanh(g/gc) * sigmoid(g) * uc*tanh(u/uc)) are in the weights
         self.route = InkRoute(self.dev, E=c.n_experts, K=c.top_k,
                               kscale=c.route_scale * c.gate_softcap * c.up_softcap)
+        self.router = InkRouter(self.dev, E=c.n_experts, K=c.top_k, kscale=c.route_scale * c.gate_softcap * c.up_softcap,
+                                H=c.hidden) if env("INKLING_ROUTER", "1") == "1" else None
         # message gates: one program (in-program barrier; TSUGUMI_INKLING_GATE1=0: the two-program kernel)
         G = InkGate1 if env("INKLING_GATE1", "1") == "1" else InkGate
         self.gate = G(self.dev, H=c.hidden, R=c.gate_rank, eps=c.eps)
@@ -406,7 +408,12 @@ class Engine(PrefillMixin):
         # of application a rotate over 3 buffers (never the input's), the loop input (reused at every pass) has its own
         self.cvk = InkConv(self.dev, c.hidden)
         self.fuse_moe = True  # act kernel + expert combine in the post-MLP conv (False: ttnn ops, for comparisons)
-        self.act = InkAct(self.dev, c.top_k, c.inter, c.gate_softcap, c.up_softcap)
+        # (unused, and its 590 KB of L1 not allocated, when the MoE kernels run)
+        self.act = InkAct(self.dev, c.top_k, c.inter, c.gate_softcap, c.up_softcap) if self.moek is None else None
+        # message path of the sliding layers: the q / k / v gate outputs packed in rows 0 / 1 / 2 of one tile, so that
+        # one rms norm and the fused qkv linear serve all three
+        self.qkv3 = ttnn.from_torch(torch.zeros(1, 1, 32, c.hidden), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                                    device=self.dev, memory_config=L1)
         zb = lambda mem=L1: ttnn.from_torch(torch.zeros(1, 1, 32, c.hidden), dtype=ttnn.bfloat16,
                                             layout=ttnn.TILE_LAYOUT, device=self.dev, memory_config=mem)
         self.cvbuf = [zb(DRAM) for _ in range(3)]  # DRAM: read as whole tiles only; L1 is tight in prefill
@@ -549,7 +556,7 @@ class Engine(PrefillMixin):
         return ttnn.add(out, ttnn.multiply(g, msg, input_tensor_a_activations=[UWP(U.TANH)], memory_config=L1),
                         memory_config=L1)
 
-    def attention(self, d, st, q_in, k_in, v_in, sc):
+    def attention(self, d, st, q_in, k_in, v_in, sc, rows=(0, 0, 0)):
         c = self.cfg
         NH, NKV, HD, DR = c.n_heads, c.n_kv, c.head_dim, c.d_rel
         sliding = d["sliding"]
@@ -581,7 +588,7 @@ class Engine(PrefillMixin):
                         v_dyn=(vs, vo + C // 32))
         # one program: q * scale -> clip (* tau), r likewise, k / v convolutions (history shifted) -> clip / rms
         q, r, k, v = self.prep(yq, 0, o0 // 32, ks, ko, vs, vo, taps=d["ptaps"], qscale=d["qscale"],
-                               rscale=d["rscale"], tau=None if sliding else self.TAU, **hist)
+                               rscale=d["rscale"], tau=None if sliding else self.TAU, rows=rows, **hist)
         # one kernel writes this token's K and V rows (kernels/kv_write.cpp; the cache as a single block)
         if sliding:
             self.kvw1_ring(k, v, st["kc"], st["vc"], self.D_RING, self.D_PT0)
@@ -602,8 +609,11 @@ class Engine(PrefillMixin):
         """Routed experts of row 0. combine=False: returns (down projections [1, K, 32, H], weights [1, K, 1, 1]) for
         the post-MLP conv kernel, which does the weighted sum."""
         c = self.cfg
-        logits = self.rowdot(d["WgT"], x)  # [1,1,1,E] float32
-        ids, wcol = self.route(logits, d["gbias"])  # uint16 [1,1,1,K] expert ids, bf16 [1,K,1,1] weights
+        if self.router is not None:  # kernels/ink_router_*: logits + routing in one program
+            ids, wcol = self.router(x, d["Wg"], d["gbias"])
+        else:
+            logits = self.rowdot(d["WgT"], x)  # [1,1,1,E] float32
+            ids, wcol = self.route(logits, d["gbias"])  # uint16 [1,1,1,K] expert ids, bf16 [1,K,1,1] weights
         if "Mgu" in d:  # kernels/ink_moe_*: experts, act and combine in one program (row 0, combined)
             return self.moek(x, ids, wcol, d["Mgu"], d["Mdn"])
         gu = ttnn.sparse_matmul(x, d["Egu"], sparsity=self.SPARSITY, indices=ids, is_input_a_sparse=False,
@@ -635,6 +645,7 @@ class Engine(PrefillMixin):
         _, i, _ = self.apps[a]
         d, st = self.layers[i], self.state[a]
         fused = self.dbg is None
+        rows = (0, 0, 0)  # source rows of the q / k / v linear inputs
         if fused and i > 0:
             # one kernel pair: stack, attention residual(s), and the input norms when there are no messages
             tb = self.artout.get(a)
@@ -642,10 +653,12 @@ class Engine(PrefillMixin):
                                     sharded=msgs is None and d["nqa"] == 1)
             if msgs is None:
                 q_in, k_in, v_in = (xns * 3)[:3] if d["sliding"] else xns
-            elif d["sliding"]:
+            elif d["sliding"]:  # the three gate outputs in rows 0 / 1 / 2 of one tile: one rms norm, one linear
                 ai = ais[0]
-                q_in, k_in, v_in = (ttnn.rms_norm(self.msg_gate(d, kd, ai, msgs[r]), weight=d["ln"], epsilon=c.eps,
-                                                  memory_config=L1) for r, kd in enumerate(("attn", "k", "v")))
+                for r, kd in enumerate(("attn", "k", "v")):
+                    self.gate(ai, msgs[r], d[f"g_{kd}_d"], d[f"g_{kd}_fg"], kd, out=self.qkv3, orow=r)
+                q_in = k_in = v_in = ttnn.rms_norm(self.qkv3, weight=d["ln"], epsilon=c.eps, memory_config=L1)
+                rows = (0, 1, 2)
             else:
                 q_in, k_in, v_in = (ttnn.rms_norm(self.msg_gate(d, kd, ais[r], msgs[r]), weight=d[ln], epsilon=c.eps,
                                                   memory_config=L1)
@@ -678,7 +691,7 @@ class Engine(PrefillMixin):
                 q_in = ttnn.rms_norm(qa, weight=d["lnq"], epsilon=c.eps, memory_config=L1)
                 k_in = ttnn.rms_norm(ka, weight=d["lnk"], epsilon=c.eps, memory_config=L1)
                 v_in = ttnn.rms_norm(va, weight=d["lnv"], epsilon=c.eps, memory_config=L1)
-        o = self.attention(d, st, q_in, k_in, v_in, sc)
+        o = self.attention(d, st, q_in, k_in, v_in, sc, rows)
         fused = self.dbg is None
         if fused:
             rb, ob = self.cvbuf[(2 * a) % 3], self.cvbuf[(2 * a + 1) % 3]

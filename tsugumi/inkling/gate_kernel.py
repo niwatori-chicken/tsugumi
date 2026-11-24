@@ -134,8 +134,9 @@ class InkGate1:
         self.sc = ttnn.from_torch(sc, dtype=bf, layout=ttnn.TILE_LAYOUT, device=dev,
                                   memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
-    def __call__(self, h, m, D, FG, kind):
-        out = self.out[kind]
+    def __call__(self, h, m, D, FG, kind, out=None, orow=0):
+        """out / orow: write row 0 of the result into row orow of out (an L1 tile tensor) instead of self.out[kind]."""
+        out = self.out[kind] if out is None else out
         KT, RT, CPT, NC, HT = self.KT, self.RT, self.CPT, self.NC, self.HT
         cores = _cores(self.coords)
         K = lambda src, ct, rt, cfg: ttnn.KernelDescriptor(
@@ -153,7 +154,7 @@ class InkGate1:
             r_rt.append((xy, [h.buffer_address(), m.buffer_address(), D.buffer_address(), FG.buffer_address(),
                               self.sc.buffer_address(), c, t0, is_m, c * KT, KT, RT, j0, CPT, 2 * HT, HT, NC] + nocxy))
             c_rt.append((xy, [KT, RT, CPT, fbits(1.0 / self.H), fbits(self.eps)]))
-            w_rt.append((xy, [out.buffer_address(), j0, CPT, RT, self.noc[0].x, self.noc[0].y]))
+            w_rt.append((xy, [out.buffer_address(), j0, CPT, RT, self.noc[0].x, self.noc[0].y, orow]))
         sems = [ttnn.SemaphoreDescriptor(id=0, core_ranges=cores, initial_value=0),
                 ttnn.SemaphoreDescriptor(id=1, core_ranges=cores, initial_value=0)]
         prog = ttnn.ProgramDescriptor(kernels=[

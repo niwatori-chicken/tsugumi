@@ -9,7 +9,8 @@
 // CT: accessors L1 (SRC / DYN, interleaved L1 bf16 tiles), DRAM (HIST / TAPS / SCALE / TAU / SC)
 // RT: 0 src, 1 soff, 2 nrow, 3 hw, 4 nt, 5 conv, 6 hist, 7 hoff, 8 taps, 9 toff, 10 dyn, 11 dsrc, 12 doff,
 //     13 scale, 14 scale addr, 15 tau, 16 tau addr, 17 sc addr, 18 first head, 19 heads (a role may be split
-//     over cores by heads: rows outside [h0, h0 + hn) stay zero)
+//     over cores by heads: rows outside [h0, h0 + hn) stay zero), 20 source row (q / k / v from rows 0 / 1 / 2 when
+//     their linear inputs were packed into the rows of one tile)
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -36,6 +37,7 @@ void kernel_main() {
     constexpr auto aD = TensorAccessorArgs<aL.next_compile_time_args_offset()>();
     const uint32_t nrow = get_arg_val<uint32_t>(2), hw = get_arg_val<uint32_t>(3), nt = get_arg_val<uint32_t>(4);
     const uint32_t h0 = get_arg_val<uint32_t>(18), hn = get_arg_val<uint32_t>(19);  // heads of this core
+    const uint32_t srow = get_arg_val<uint32_t>(20);  // row of the source tiles holding this role's token
     const auto sSrc = TensorAccessor(aL, get_arg_val<uint32_t>(0));
     const uint32_t soff = get_arg_val<uint32_t>(1);
     const uint32_t conv = get_arg_val<uint32_t>(5), dyn = get_arg_val<uint32_t>(10);
@@ -56,12 +58,12 @@ void kernel_main() {
         for (uint32_t d = 0; d < nt; ++d) {
             if (hw >= 32) {  // a head spans whole source tiles
                 for (uint32_t f = 0; f < 2; ++f) {
-                    noc.async_read(sSrc, cx, 32, {.page_id = soff + h * nt + d, .offset_bytes = face_off(0, f)},
+                    noc.async_read(sSrc, cx, 32, {.page_id = soff + h * nt + d, .offset_bytes = face_off(srow, f)},
                                    {.offset_bytes = d * TB + face_off(h, f)});
                 }
             } else {  // hw == 16: one face row
                 const uint32_t col = h * hw;
-                noc.async_read(sSrc, cx, 32, {.page_id = soff + col / 32, .offset_bytes = face_off(0, (col / 16) & 1)},
+                noc.async_read(sSrc, cx, 32, {.page_id = soff + col / 32, .offset_bytes = face_off(srow, (col / 16) & 1)},
                                {.offset_bytes = face_off(h, 0)});
             }
         }
@@ -147,7 +149,7 @@ void kernel_main() {
             zero(db, 4 * TB);
             const uint32_t tmp = sb + nrow * nt * 2 * 128;
             for (uint32_t f = 0; f < 2; ++f) {
-                noc.async_read(sDy, cscr, 32, {.page_id = doff, .offset_bytes = face_off(0, f)},
+                noc.async_read(sDy, cscr, 32, {.page_id = doff, .offset_bytes = face_off(srow, f)},
                                {.offset_bytes = nrow * nt * 2 * 128 + f * 32});
             }
             noc.async_read_barrier();
