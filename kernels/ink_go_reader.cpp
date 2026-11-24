@@ -12,10 +12,11 @@ void kernel_main() {
     constexpr auto aP = TensorAccessorArgs<0>();
     constexpr auto aF = TensorAccessorArgs<aP.next_compile_time_args_offset()>();
     constexpr auto aS = TensorAccessorArgs<aF.next_compile_time_args_offset()>();
+    constexpr auto aM = TensorAccessorArgs<aS.next_compile_time_args_offset()>();
     const auto sP = TensorAccessor(aP, get_arg_val<uint32_t>(0));
     const auto sF = TensorAccessor(aF, get_arg_val<uint32_t>(1));
     const auto sH = TensorAccessor(aS, get_arg_val<uint32_t>(2));
-    const auto sM = TensorAccessor(aS, get_arg_val<uint32_t>(3));
+    const auto sM = TensorAccessor(aM, get_arg_val<uint32_t>(3));  // h and m may be in different memories
     const uint32_t NC = get_arg_val<uint32_t>(4), RT = get_arg_val<uint32_t>(5), j0 = get_arg_val<uint32_t>(6);
     const uint32_t CPT = get_arg_val<uint32_t>(7), NCOL = get_arg_val<uint32_t>(8), HT = get_arg_val<uint32_t>(9);
     Noc noc;

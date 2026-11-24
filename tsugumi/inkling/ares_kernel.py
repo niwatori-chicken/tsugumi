@@ -92,10 +92,11 @@ class InkAres:
         for t in (x, nbt, QT, self.sh, self.part, ln[0]):
             r_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
         to = tout if tout is not None else self.AI[0]
-        w_ct = ttnn.TensorAccessorArgs(self.part).get_compile_time_args() + \
-            ttnn.TensorAccessorArgs(outs[0]).get_compile_time_args() + ttnn.TensorAccessorArgs(to).get_compile_time_args()
         use_ln = int(bool(lns))
         ai = (outs[:nq] + [outs[0]] * 3)[:3]
+        w_ct = ttnn.TensorAccessorArgs(self.part).get_compile_time_args()
+        for t in ai + [to]:  # one accessor per output: the buffers may live in different memories
+            w_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
         xn = ai
         r_rt, c_rt, w_rt = [], [], []
         for i, (cx, cy) in enumerate(coords):

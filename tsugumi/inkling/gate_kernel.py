@@ -63,12 +63,13 @@ class InkGate:
             core_ranges=cores, compile_time_args=ct, runtime_args=rt, config=cfg)
         ca = _cores(self.a_coords)
         r_ct = ttnn.TensorAccessorArgs(h).get_compile_time_args() + ttnn.TensorAccessorArgs(D).get_compile_time_args() + \
-            ttnn.TensorAccessorArgs(self.sc).get_compile_time_args()
+            ttnn.TensorAccessorArgs(self.sc).get_compile_time_args() + ttnn.TensorAccessorArgs(m).get_compile_time_args()
         r_rt, c_rt, w_rt = [], [], []
         for c, (x, y) in enumerate(self.a_coords):
             src = h if c < NC // 2 else m
             t0 = (c % (NC // 2)) * KT
-            r_rt.append(((x, y), [src.buffer_address(), D.buffer_address(), self.sc.buffer_address(), t0, c * KT, KT, RT]))
+            r_rt.append(((x, y), [src.buffer_address(), D.buffer_address(), self.sc.buffer_address(), t0, c * KT, KT, RT,
+                                  int(src is m)]))
             c_rt.append(((x, y), [KT, RT]))
             w_rt.append(((x, y), [self.part.buffer_address(), c, RT]))
         prog = ttnn.ProgramDescriptor(kernels=[
@@ -80,7 +81,8 @@ class InkGate:
         ttnn.generic_op([h, m, D, self.sc, self.part], prog)
         cb = _cores(self.b_coords)
         r_ct = ttnn.TensorAccessorArgs(self.part).get_compile_time_args() + \
-            ttnn.TensorAccessorArgs(FG).get_compile_time_args() + ttnn.TensorAccessorArgs(h).get_compile_time_args()
+            ttnn.TensorAccessorArgs(FG).get_compile_time_args() + ttnn.TensorAccessorArgs(h).get_compile_time_args() + \
+            ttnn.TensorAccessorArgs(m).get_compile_time_args()
         r_rt, c_rt, w_rt = [], [], []
         for b, (x, y) in enumerate(self.b_coords):
             j0 = b * CPT

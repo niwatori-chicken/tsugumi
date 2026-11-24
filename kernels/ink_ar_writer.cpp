@@ -5,7 +5,7 @@
 //   r_k = rsqrt(w^T G w / H + eps)  (rms of the output);  weight tiles (bf16) -> CB 9: W_0..W_NQ-1 (row 0 = w),
 //   W2_k (row 0 = w * r_k), FD (diag (1, .., 1, f)); then the outputs: CB 16 -> AI_k, CB 17 -> XN_k, CB 18 -> TOUT
 //   (page j0 + j of each).
-// CT: accessors PART (L1), OUT (L1), TOUT.
+// CT: accessors PART (L1), OUT_0, OUT_1, OUT_2 (the outputs of queries 0..2), TOUT.
 // RT: 0 phase, 1 part, 2 c, 3 nb, 4 NQ, 5 use_ln, 6 tout, 7 inv_H, 8 eps (float bits), 9..11 ai0..2, 12..14 xn0..2,
 //     15 tout addr, 16 j0, 17 NT
 #include <stdint.h>
@@ -59,8 +59,11 @@ float ex(float x) {  // exp(x), x <= 0
 
 void kernel_main() {
     constexpr auto aP = TensorAccessorArgs<0>();
+    // one accessor per output (they may differ: L1 / DRAM / sharded)
     constexpr auto aO = TensorAccessorArgs<aP.next_compile_time_args_offset()>();
-    constexpr auto aT = TensorAccessorArgs<aO.next_compile_time_args_offset()>();
+    constexpr auto aO1 = TensorAccessorArgs<aO.next_compile_time_args_offset()>();
+    constexpr auto aO2 = TensorAccessorArgs<aO1.next_compile_time_args_offset()>();
+    constexpr auto aT = TensorAccessorArgs<aO2.next_compile_time_args_offset()>();
     const uint32_t phase = get_arg_val<uint32_t>(0);
     Noc noc;
     CircularBuffer cg(8);
@@ -122,9 +125,15 @@ void kernel_main() {
         for (uint32_t k = 0; k < NQ; ++k) {
             // with norm weights only XN_k is written, else only AI_k
             CircularBuffer& co = use_ln ? cxn : cai;
-            const auto sA = TensorAccessor(aO, get_arg_val<uint32_t>((use_ln ? 12 : 9) + k));
+            const uint32_t addr = get_arg_val<uint32_t>((use_ln ? 12 : 9) + k);
             co.wait_front(1);
-            noc.async_write(co, sA, 2048, {.offset_bytes = 0}, {.page_id = j0 + j});
+            if (k == 0) {
+                noc.async_write(co, TensorAccessor(aO, addr), 2048, {.offset_bytes = 0}, {.page_id = j0 + j});
+            } else if (k == 1) {
+                noc.async_write(co, TensorAccessor(aO1, addr), 2048, {.offset_bytes = 0}, {.page_id = j0 + j});
+            } else {
+                noc.async_write(co, TensorAccessor(aO2, addr), 2048, {.offset_bytes = 0}, {.page_id = j0 + j});
+            }
             noc.async_write_barrier();
             co.pop_front(1);
         }
