@@ -26,7 +26,11 @@ class InkPrep:
         self.NH, self.NKV, self.HD, self.DR = NH, NKV, HD, DR
         self.qk_clip, self.rel_clip, self.eps = qk_clip, rel_clip, eps
         grid = dev.compute_with_storage_grid_size()
-        self.coords = [(i, grid.y - 1) for i in range(4)]  # q, r, k, v
+        # roles split over cores by heads (role, first head, heads): q 3 x 8, r 1 x 24, k 2 x 4, v 2 x 4
+        self.split = [(0, 0, 8), (0, 8, 8), (0, 16, 8), (1, 0, NH), (2, 0, 4), (2, 4, 4), (3, 0, 4), (3, 4, 4)]
+        if NH != 24 or NKV != 8:
+            self.split = [(r, 0, NH if r < 2 else NKV) for r in range(4)]
+        self.coords = [(i, grid.y - 1) for i in range(len(self.split))]
         cores = _cores(self.coords)
         bf, f32 = ttnn.bfloat16, ttnn.float32
         self.cbs = [
@@ -79,17 +83,18 @@ class InkPrep:
         ]
         r_rt, c_rt, w_rt = [], [], []
         orr = lambda t: (t if t is not None else dummy_d).buffer_address()
-        for (x, y), (src, soff, nrow, hw, nt, hist, hoff, toff, dyn, scl, mode, thr, out) in zip(self.coords, roles):
+        for (x, y), (role, h0, hn) in zip(self.coords, self.split):
+            src, soff, nrow, hw, nt, hist, hoff, toff, dyn, scl, mode, thr, out = roles[role]
             use_tau = int(tau is not None and hist is None)  # q and r of full layers
             r_rt.append(((x, y), [src.buffer_address(), soff, nrow, hw, nt, int(hist is not None), orr(hist), hoff,
                                   taps.buffer_address(), toff, int(dyn is not None),
                                   (dyn[0] if dyn is not None else src).buffer_address(),
                                   dyn[1] if dyn is not None else 0, int(scl is not None), orr(scl), use_tau, orr(tau),
-                                  self.sc.buffer_address()]))
+                                  self.sc.buffer_address(), h0, hn]))
             c_rt.append(((x, y), [nt, int(hist is not None), int(dyn is not None), int(scl is not None), use_tau,
                                   mode, fbits(thr), fbits(thr * thr), fbits(1.0 / hw), fbits(self.eps),
                                   fbits(1.0 / 3.0)]))
-            w_rt.append(((x, y), [out.buffer_address(), nt]))
+            w_rt.append(((x, y), [out.buffer_address(), nt, h0, hn, int(hn == nrow)]))
         dram = [t for t in (hist_k, hist_v, taps, qscale, rscale, tau, self.sc) if t is not None]
         l1 = [q_src, k_src, v_src] + [d[0] for d in (k_dyn, v_dyn) if d is not None]
         r_ct = ttnn.TensorAccessorArgs(q_src).get_compile_time_args() + \

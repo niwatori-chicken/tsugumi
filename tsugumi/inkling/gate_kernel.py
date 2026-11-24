@@ -98,3 +98,74 @@ class InkGate:
         ], cbs=self.b_cbs)
         ttnn.generic_op([self.part, FG, h, m, out], prog)
         return out
+
+
+class InkGate1:
+    """The message gate in ONE program on NC cores (kernels/ink_gate_*.cpp): phase A's partials stay in each core's
+    CB and are pulled (row 0 only) by every core after an in-program barrier, instead of a DRAM round trip and a
+    second program. Same call as InkGate."""
+
+    def __init__(self, dev, H=2304, R=64, eps=1e-6, NC=24, kinds=("attn", "k", "v", "mlp")):
+        self.dev, self.H, self.R, self.eps = dev, H, R, eps
+        self.HT, self.RT = H // 32, R // 32
+        assert (2 * self.HT) % NC == 0 and NC % 2 == 0 and self.HT % NC == 0 and NC <= 32
+        self.NC, self.KT, self.CPT = NC, 2 * self.HT // NC, self.HT // NC
+        grid = dev.compute_with_storage_grid_size()
+        self.coords = [(i % grid.x, i // grid.x) for i in range(NC)]
+        W = lambda x, y: dev.worker_core_from_logical_core(ttnn.CoreCoord(x, y))
+        self.noc = [W(x, y) for x, y in self.coords]
+        bf, f32 = ttnn.bfloat16, ttnn.float32
+        cc = _cores(self.coords)
+        KT, RT, CPT = self.KT, self.RT, self.CPT
+        self.cbs = [_cbd(cc, 0, KT, bf), _cbd(cc, 1, KT * RT, bf), _cbd(cc, 2, 1, bf), _cbd(cc, 3, KT, bf),
+                    _cbd(cc, 4, RT + 1, f32), _cbd(cc, 5, 2 * RT * CPT, bf), _cbd(cc, 6, CPT, bf), _cbd(cc, 7, CPT, bf),
+                    _cbd(cc, 8, RT + 1, f32), _cbd(cc, 9, 2, bf), _cbd(cc, 10, 2, f32), _cbd(cc, 11, RT, bf),
+                    _cbd(cc, 12, 2, bf), _cbd(cc, 13, 2, f32), _cbd(cc, 16, 2, bf)]
+        c = ttnn.ComputeConfigDescriptor()
+        c.math_fidelity = ttnn.MathFidelity.HiFi4
+        c.fp32_dest_acc_en = True
+        c.math_approx_mode = False
+        self.ccfg = c
+        self.out = {k: ttnn.from_torch(torch.zeros(1, 1, 32, H), dtype=bf, layout=ttnn.TILE_LAYOUT, device=dev,
+                                       memory_config=ttnn.DRAM_MEMORY_CONFIG) for k in kinds}
+        sc = torch.zeros(32, 32)
+        sc[0, :] = 1.0
+        sc[16, :] = 1.0
+        self.sc = ttnn.from_torch(sc, dtype=bf, layout=ttnn.TILE_LAYOUT, device=dev,
+                                  memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+    def __call__(self, h, m, D, FG, kind):
+        out = self.out[kind]
+        KT, RT, CPT, NC, HT = self.KT, self.RT, self.CPT, self.NC, self.HT
+        cores = _cores(self.coords)
+        K = lambda src, ct, rt, cfg: ttnn.KernelDescriptor(
+            kernel_source=os.path.join(KDIR, src), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores, compile_time_args=ct, runtime_args=rt, config=cfg)
+        r_ct = []
+        for t in (h, m, D, FG, self.sc):
+            r_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
+        nocxy = [v for n in self.noc for v in (n.x, n.y)]
+        r_rt, c_rt, w_rt = [], [], []
+        for c, xy in enumerate(self.coords):
+            is_m = int(c >= NC // 2)
+            t0 = (c % (NC // 2)) * KT
+            j0 = c * CPT
+            r_rt.append((xy, [h.buffer_address(), m.buffer_address(), D.buffer_address(), FG.buffer_address(),
+                              self.sc.buffer_address(), c, t0, is_m, c * KT, KT, RT, j0, CPT, 2 * HT, HT, NC] + nocxy))
+            c_rt.append((xy, [KT, RT, CPT, fbits(1.0 / self.H), fbits(self.eps)]))
+            w_rt.append((xy, [out.buffer_address(), j0, CPT, RT, self.noc[0].x, self.noc[0].y]))
+        sems = [ttnn.SemaphoreDescriptor(id=0, core_ranges=cores, initial_value=0),
+                ttnn.SemaphoreDescriptor(id=1, core_ranges=cores, initial_value=0)]
+        prog = ttnn.ProgramDescriptor(kernels=[
+            K("ink_gate_reader.cpp", r_ct, r_rt, ttnn.ReaderConfigDescriptor()),
+            K("ink_gate_writer.cpp", ttnn.TensorAccessorArgs(out).get_compile_time_args(), w_rt,
+              ttnn.WriterConfigDescriptor()),
+            K("ink_gate_compute.cpp", [], c_rt, self.ccfg),
+        ], semaphores=sems, cbs=self.cbs)
+        seen, ins = set(), []
+        for t in (h, m, D, FG, self.sc):
+            if id(t) not in seen:
+                seen.add(id(t))
+                ins.append(t)
+        ttnn.generic_op(ins + [out], prog)
+        return out

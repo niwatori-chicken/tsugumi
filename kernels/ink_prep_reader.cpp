@@ -8,7 +8,8 @@
 //     20 scratch
 // CT: accessors L1 (SRC / DYN, interleaved L1 bf16 tiles), DRAM (HIST / TAPS / SCALE / TAU / SC)
 // RT: 0 src, 1 soff, 2 nrow, 3 hw, 4 nt, 5 conv, 6 hist, 7 hoff, 8 taps, 9 toff, 10 dyn, 11 dsrc, 12 doff,
-//     13 scale, 14 scale addr, 15 tau, 16 tau addr, 17 sc addr
+//     13 scale, 14 scale addr, 15 tau, 16 tau addr, 17 sc addr, 18 first head, 19 heads (a role may be split
+//     over cores by heads: rows outside [h0, h0 + hn) stay zero)
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -34,6 +35,7 @@ void kernel_main() {
     constexpr auto aL = TensorAccessorArgs<0>();
     constexpr auto aD = TensorAccessorArgs<aL.next_compile_time_args_offset()>();
     const uint32_t nrow = get_arg_val<uint32_t>(2), hw = get_arg_val<uint32_t>(3), nt = get_arg_val<uint32_t>(4);
+    const uint32_t h0 = get_arg_val<uint32_t>(18), hn = get_arg_val<uint32_t>(19);  // heads of this core
     const auto sSrc = TensorAccessor(aL, get_arg_val<uint32_t>(0));
     const uint32_t soff = get_arg_val<uint32_t>(1);
     const uint32_t conv = get_arg_val<uint32_t>(5), dyn = get_arg_val<uint32_t>(10);
@@ -50,7 +52,7 @@ void kernel_main() {
     cx.reserve_back(nt);
     const uint32_t xb = cx.get_write_ptr();
     zero(xb, nt * TB);
-    for (uint32_t h = 0; h < nrow; ++h) {
+    for (uint32_t h = h0; h < h0 + hn; ++h) {
         for (uint32_t d = 0; d < nt; ++d) {
             if (hw >= 32) {  // a head spans whole source tiles
                 for (uint32_t f = 0; f < 2; ++f) {
@@ -94,7 +96,7 @@ void kernel_main() {
         // history rows (pairs 0-1 and 2-3 of each face, 128 bytes per (h, d, f)) -> scratch
         cscr.reserve_back(4);
         const uint32_t sb = cscr.get_write_ptr();
-        for (uint32_t h = 0; h < nrow; ++h) {
+        for (uint32_t h = h0; h < h0 + hn; ++h) {
             for (uint32_t d = 0; d < nt; ++d) {
                 for (uint32_t f = 0; f < 2; ++f) {
                     const uint32_t o = ((h * nt + d) * 2 + f) * 128;
@@ -109,7 +111,7 @@ void kernel_main() {
         ch.reserve_back(3 * nt);
         const uint32_t hb = ch.get_write_ptr();
         zero(hb, 3 * nt * TB);
-        for (uint32_t h = 0; h < nrow; ++h) {
+        for (uint32_t h = h0; h < h0 + hn; ++h) {
             for (uint32_t d = 0; d < nt; ++d) {
                 for (uint32_t f = 0; f < 2; ++f) {
                     const uint32_t o = sb + ((h * nt + d) * 2 + f) * 128;
@@ -125,7 +127,7 @@ void kernel_main() {
                 }
             }
         }
-        for (uint32_t h = 0; h < nrow; ++h) {
+        for (uint32_t h = h0; h < h0 + hn; ++h) {
             for (uint32_t d = 0; d < nt; ++d) {
                 for (uint32_t f = 0; f < 2; ++f) {
                     const uint32_t o = ((h * nt + d) * 2 + f) * 128;
@@ -150,7 +152,7 @@ void kernel_main() {
             }
             noc.async_read_barrier();
             volatile tt_l1_ptr uint16_t* v = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(tmp);
-            for (uint32_t h = 0; h < nrow; ++h) {
+            for (uint32_t h = h0; h < h0 + hn; ++h) {
                 for (uint32_t lag = 0; lag < 4; ++lag) {
                     volatile tt_l1_ptr uint16_t* t = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(db + lag * TB);
                     t[face_off(h, 0) / 2] = v[h * 4 + lag];

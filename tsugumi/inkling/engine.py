@@ -31,7 +31,7 @@ from .act_kernel import InkAct
 from .ares_kernel import InkAres
 from .conv_kernel import InkConv
 from .moe_kernel import InkMoE
-from .gate_kernel import InkGate
+from .gate_kernel import InkGate, InkGate1
 from .route_kernel import InkRoute
 from .config import InklingConfig
 from .prefill import PrefillMixin
@@ -399,7 +399,9 @@ class Engine(PrefillMixin):
         # (act = gc*tanh(g/gc) * sigmoid(g) * uc*tanh(u/uc)) are in the weights
         self.route = InkRoute(self.dev, E=c.n_experts, K=c.top_k,
                               kscale=c.route_scale * c.gate_softcap * c.up_softcap)
-        self.gate = InkGate(self.dev, H=c.hidden, R=c.gate_rank, eps=c.eps)  # message gates (two programs)
+        # message gates: one program (in-program barrier; TSUGUMI_INKLING_GATE1=0: the two-program kernel)
+        G = InkGate1 if env("INKLING_GATE1", "1") == "1" else InkGate
+        self.gate = G(self.dev, H=c.hidden, R=c.gate_rank, eps=c.eps)
         # post-attention / post-MLP conv + residual in one program, into persistent L1 buffers: residual and output
         # of application a rotate over 3 buffers (never the input's), the loop input (reused at every pass) has its own
         self.cvk = InkConv(self.dev, c.hidden)
