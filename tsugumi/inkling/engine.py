@@ -22,6 +22,7 @@ import time
 import torch
 import ttnn
 
+from ..env import env
 from ..kv_kernel import KVWriteKernel
 from ..ops import DecodeLinear, cache_path, has_cache
 from .attn_kernel import InkAttention
@@ -29,6 +30,7 @@ from .prep_kernel import InkPrep
 from .act_kernel import InkAct
 from .ares_kernel import InkAres
 from .conv_kernel import InkConv
+from .moe_kernel import InkMoE
 from .gate_kernel import InkGate
 from .route_kernel import InkRoute
 from .config import InklingConfig
@@ -66,6 +68,7 @@ class Engine(PrefillMixin):
         # scratch at max_seq + 1).
         self.R, self.RA, self.SA = W + 32, 9 * 128, max_seq + W
         self.wdtype = wdtype
+        self.moek = None  # InkMoE (created with the first bfp8 expert layer)
         self.hi = _ck(ttnn.MathFidelity.HiFi4)
         self.hi2 = _ck(ttnn.MathFidelity.HiFi2)
         self.scale = c.head_dim ** -0.5
@@ -322,6 +325,14 @@ class Engine(PrefillMixin):
         fgu, fdn = expert_files(self.cache, i)
         d["Egu"] = ttnn.to_device(ttnn.load_tensor(cache_path(fgu, edt)), self.dev, memory_config=DRAM)
         d["Edn"] = ttnn.to_device(ttnn.load_tensor(cache_path(fdn, edt)), self.dev, memory_config=DRAM)
+        if edt == ttnn.bfloat8_b and env("INKLING_MOE_KERNEL", "1") == "1":
+            # one-program MoE kernels (decode and 32-row prefill) on a bank-contiguous copy of the experts; the
+            # interleaved tensors are freed (DRAM cannot hold both)
+            if self.moek is None:
+                self.moek = InkMoE(self.dev, c.n_experts, c.hidden, c.inter, c.gate_softcap, c.up_softcap)
+            d["Mgu"], d["Mdn"] = self.moek.prepare(d["Egu"], d["Edn"])
+            ttnn.deallocate(d.pop("Egu"))
+            ttnn.deallocate(d.pop("Edn"))
         # LoFi drops mantissa bits of bfp8 weights; HiFi2 covers them (bfp4 needs only LoFi)
         d["eck"] = self.lofi if edt == ttnn.bfloat4_b else self.hifi2
         if i % 4 == 3:
@@ -586,6 +597,8 @@ class Engine(PrefillMixin):
         c = self.cfg
         logits = self.rowdot(d["WgT"], x)  # [1,1,1,E] float32
         ids, wcol = self.route(logits, d["gbias"])  # uint16 [1,1,1,K] expert ids, bf16 [1,K,1,1] weights
+        if "Mgu" in d:  # kernels/ink_moe_*: experts, act and combine in one program (row 0, combined)
+            return self.moek(x, ids, wcol, d["Mgu"], d["Mdn"])
         gu = ttnn.sparse_matmul(x, d["Egu"], sparsity=self.SPARSITY, indices=ids, is_input_a_sparse=False,
                                 is_input_b_sparse=True, memory_config=L1, program_config=self.pc_gu,
                                 compute_kernel_config=d["eck"])
@@ -687,7 +700,7 @@ class Engine(PrefillMixin):
             if msgs is not None:
                 m_in = self.msg_gate(d, "mlp", m_in, msgs[3])
             x_m = ttnn.rms_norm(m_in, weight=d["lnm"], epsilon=c.eps, memory_config=L1)
-        if fused and self.fuse_moe:
+        if fused and self.fuse_moe and "Mgu" not in d:
             dn, wcol = self.moe(d, x_m, combine=False)
             out = self.cvk(dn, st["hm"], d["tm"], res, ob, wcol)  # expert combine + conv + residual
         elif fused:
