@@ -47,7 +47,7 @@ def main():
         if tv:
             eng.init_verify(tv)
         if env("LARGE_PREFILL", "0") == "1":
-            eng.init_large_prefill(int(env("LARGE_T", "1024")))
+            eng.init_large_prefill(int(env("LARGE_T", "2048")))
         BatchMode(eng, lanes)
         eng.capture_all()
         v = ttnn.get_memory_view(dev, ttnn.BufferType.DRAM)

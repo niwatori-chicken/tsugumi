@@ -30,7 +30,7 @@ try:
     eng = Qwen35Engine(dev, MODEL, Precision("bfp4"), f"{CACHE}/bfp4", max_seq=int(env("MAX_SEQ", "262144")), log=lambda *a: None)
     eng.init_spec(4, mtp=True); eng.init_prefill(32)
     if env("LARGE_PREFILL", "1") == "1":
-        eng.init_large_prefill(int(env("LARGE_T", "1024")))
+        eng.init_large_prefill(int(env("LARGE_T", "2048")))
     eng.capture_all()
     g = Generator(eng); st = {}; out = []; t0 = time.perf_counter(); t1 = None
     for t in g.generate(ids, max_new=int(sys.argv[2]) if len(sys.argv) > 2 else 60, stats=st):

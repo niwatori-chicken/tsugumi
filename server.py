@@ -119,7 +119,7 @@ class Backend:
                 self.eng.init_verify(tv)
         if env("LARGE_PREFILL", "1") == "1":  # must come before capture_all
             with stage("large-T prefill and warm-up (compiles every chunk shape)"):
-                self.eng.init_large_prefill(int(env("LARGE_T", "1024")))
+                self.eng.init_large_prefill(int(env("LARGE_T", "2048")))
         if self.lanes > 1:  # batched decode (tsugumi/batch.py): before capture_all
             from tsugumi.batch import BatchMode, lane_counts
             with stage(f"batched decode: {self.lanes} lanes (modes {lane_counts(self.lanes)})"):
@@ -1110,7 +1110,7 @@ def log_settings(a):
                                                      for m, p in PRESETS.items() if m != "completion")),
         ("thinking", "no default budget" if a.thinking_budget < 0 else f"default budget {a.thinking_budget} tokens"),
         ("KV cache", g("KV_DTYPE", "bfp8")),
-        ("prefill", f"large T {g('LARGE_T', '1024')} (on={g('LARGE_PREFILL', '1')}), SDPA {g('PREFILL_SDPA', 'hifi2')}"),
+        ("prefill", f"large T {g('LARGE_T', '2048')} (on={g('LARGE_PREFILL', '1')}), SDPA {g('PREFILL_SDPA', 'hifi2')}"),
         ("drafts", f"MTP (vocab {'63,168' if g('DRAFT_VOCAB', '1') == '1' else 'full'}), n-gram {ngram}, "
                    f"verify T 4 / {g('VERIFY_T', '8')}"),
         ("images", "off" if g("IMAGES", "1") != "1" else
