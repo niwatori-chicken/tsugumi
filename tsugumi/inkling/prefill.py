@@ -20,23 +20,24 @@ import ttnn
 
 from ..env import env
 from ..kv_kernel import KVWriteKernel, KVWriteRows
-from .relshift import MaskBuilder
+from .mask_kernel import MaskBuilder
 
 L1 = ttnn.L1_MEMORY_CONFIG
 DRAM = ttnn.DRAM_MEMORY_CONFIG
 NEG = -1e9
 U, UWP = ttnn.UnaryOpType, ttnn.UnaryWithParam
 # prompt tokens per prefill step (rows = tokens): 512 (default), 256, 128, 64 or 32 (TSUGUMI_INKLING_PREFILL_T). The
-# per-step cost of most prefill ops grows much less than the rows (max_seq 32768, 4k prompt: 620 tok/s at 512, 334 at
-# 128, 290 at 64); a short remainder costs one full step (27 tokens: 0.77 s at 512, 0.42 s at 128, 0.26 s at 64)
+# per-step cost of most prefill ops grows much less than the rows (max_seq 32768, 4k prompt: 770 tok/s at 512, ~380
+# at 128); a short remainder costs one full step (27 tokens: 0.57 s at 512, ~0.4 s at 128)
 T = int(env("INKLING_PREFILL_T", "512"))
 assert T in (32, 64, 128, 256, 512)
 # the full layers' attention runs on blocks of TS query rows (the [rows, context] scores of 512 rows would not fit)
 TS = min(T, 128)
+KZ = 128  # zero K / V rows after a full layer's bucket (sink column + padding: S a multiple of the SDPA key chunk)
+USE_SDPA = env("INKLING_PREFILL_SDPA", "1") == "1"
 # where the prefill's activations go: DRAM at T = 128 (in L1 the residual stream / q / k / v starve the
 # attention softmax's CBs)
 PL = L1 if T <= 64 else DRAM
-ATT_STOP = None  # (profiling) stop p_attention after a stage
 
 
 class PrefillMixin:
@@ -96,7 +97,8 @@ class PrefillMixin:
             e_ = torch.zeros(1, 1, 32, b + 32)
             e_[0, 0, 0, b] = 1.0
             self.P_ES_B[b] = self.tt(e_)
-        self.P_KZ = ttnn.from_torch(torch.zeros(1, NKV, 32, HD), dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT,
+        # zero K / V rows after a bucket's slots (the sink column, then padding to the SDPA key chunk)
+        self.P_KZ = ttnn.from_torch(torch.zeros(1, NKV, KZ, HD), dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT,
                                     device=self.dev, memory_config=DRAM)
         self.P_RZ = self.tt(torch.zeros(1, c.n_heads, TS, 32), mem=DRAM)
         self.P_VALID = self.tt(torch.zeros(1, 1, T, 1), mem=DRAM)  # 1 for the chunk's real rows (MoE routing)
@@ -111,9 +113,12 @@ class PrefillMixin:
         self.P_POSR = ttnn.from_torch(torch.zeros(T, dtype=torch.int32), dtype=ttnn.int32, device=self.dev)
         self.P_POSF = ttnn.from_torch(torch.zeros(T, dtype=torch.int32), dtype=ttnn.int32, device=self.dev)
         self.P_PT0 = ttnn.from_torch(torch.zeros(1, 8, dtype=torch.int32), dtype=ttnn.int32, device=self.dev)
-        # [p0 % R, p0 % W]: the relative bias shift (kernels/ink_relshift.cpp)
+        # [p0 % R, p0 % W, p0]: chunk start for kernels/ink_mask.cpp
         self.P_BASE = ttnn.from_torch(torch.zeros(1, 8, dtype=torch.int32), dtype=ttnn.int32, device=self.dev)
         self.maskb = MaskBuilder(self.dev)
+        g = self.dev.compute_with_storage_grid_size()
+        self.p_sdpa = {n: ttnn.SDPAProgramConfig(compute_with_storage_grid_size=g, q_chunk_size=128 if n > 128 else 64,
+                                                 k_chunk_size=128, exp_approx_mode=False) for n in {T, TS}}
         self.P_C0 = self.tt(torch.zeros(1, 1, 1, 1), ttnn.float32)  # p0 % R
         self.P_THR = self.tt(torch.zeros(1, 1, T, 1), ttnn.float32)  # min(P_t, W - 1)
         self.P_PCOL = self.tt(torch.zeros(1, 1, T, 1), ttnn.float32)  # P_t
@@ -153,8 +158,10 @@ class PrefillMixin:
                 t = ttnn.to_torch(d[name]).float()[0, 0, :k]
                 d["p_" + name] = self.tt(t.view(1, k, 1, -1))
         # the relative bias by distance: [1, NH, 32, R] (sliding; distances >= W are 0) / [.., W] (full)
-        # columns reversed for kernels/ink_relshift.cpp
+        # columns reversed for kernels/ink_mask.cpp
         pr = ttnn.to_torch(d["proj"]).float()[:, :, :c.d_rel]
+        if USE_SDPA:  # masks in units of 1 (see p_attention)
+            pr = pr * self.scale
         d["p_proj"] = self.tt(torch.flip(pr, dims=[-1]))
 
     # ------------------------------------------------------------------------------------------------ pieces
@@ -215,8 +222,6 @@ class PrefillMixin:
             yq = d["Lq"](q_in, out_mem=PL)
             yk = d["Lk"](k_in, out_mem=PL)
             yv = d["Lv"](v_in, out_mem=PL)
-        if ATT_STOP == "lin":
-            return yq
         part = lambda y, lo, hi, nh, hd: ttnn.reshape(ttnn.slice(y, (0, 0, 0, lo), (1, 1, T, hi), memory_config=PL),
                                                       (1, T, nh, hd))
         tau = None if sliding else self.P_TAU
@@ -230,8 +235,8 @@ class PrefillMixin:
         sink = ttnn.slice(yq, (0, 0, 0, o0 + NH * DR), (1, 1, T, o0 + NH * DR + NH), memory_config=PL)  # [1,1,T,NH]
         sink = ttnn.reshape(ttnn.transpose(sink, -2, -1, memory_config=PL), (1, NH, T, 1))
         sink = ttnn.pad(sink, [(0, 0), (0, 0), (0, 0), (0, 31)], 0.0)  # [1, NH, T, 32], col 0 = sink / scale
-        if ATT_STOP == "qr":
-            return yq
+        if USE_SDPA:  # the SDPA adds the mask after scaling q k: masks in units of 1 (the bias: p_proj pre-scaled)
+            sink = ttnn.multiply(sink, self.scale, memory_config=PL)
         C = NKV * HD
         if sliding:
             if fused:
@@ -240,11 +245,7 @@ class PrefillMixin:
                 kvraw = ttnn.concat([ttnn.slice(yk, (0, 0, 0, 0), (1, 1, T, C), memory_config=PL),
                                      ttnn.slice(yv, (0, 0, 0, 0), (1, 1, T, C), memory_config=PL)], dim=-1,
                                     memory_config=PL)
-            if ATT_STOP == "kvraw":
-                return yq
             kv = self.p_conv(kvraw, st["hkv"], d["p_tkv"])
-            if ATT_STOP == "conv":
-                return yq
             k = ttnn.slice(kv, (0, 0, 0, 0), (1, 1, T, C), memory_config=PL)
             v = ttnn.slice(kv, (0, 0, 0, C), (1, 1, T, 2 * C), memory_config=PL)
         else:
@@ -257,16 +258,12 @@ class PrefillMixin:
             v = self.p_conv(vraw, st["hv"], d["p_tv"], dyn4(yv))
         k = self.p_l2clip(ttnn.reshape(k, (1, T, NKV, HD)), c.qk_clip)
         v = self.rmsu(ttnn.reshape(v, (1, T, NKV, HD)))
-        if ATT_STOP == "kn":
-            return yq
         hm = lambda t: ttnn.permute(t, (0, 2, 1, 3), memory_config=PL)  # [1, NKV, T, HD]
         if sliding:
             self.kvw_ring(hm(k), hm(v), st["kc"], st["vc"], self.P_POSR)
         else:
             self.kvw_full(hm(k), hm(v), st["kc"], st["vc"], self.P_POSF)
         kc, vc = st["kc"], st["vc"]
-        if ATT_STOP == "kv":
-            return yq
         # mask [1, NH, rows, S] (units of 1 / scale)
         rel = self.mm(r, d["p_proj"])  # [1, NH, T, R or W] by distance
         if sliding:
@@ -280,13 +277,19 @@ class PrefillMixin:
                 vc = ttnn.concat([ttnn.slice(vc, (0, 0, 0, 0), (1, NKV, b, HD), memory_config=DRAM), self.P_KZ],
                                  dim=-2, memory_config=DRAM)
             blocks = []
-            S_, sc = (self.SA, self.max_seq) if b is None else (b + 32, b)  # cache columns, sink column
+            S_, sc = (self.SA, self.max_seq) if b is None else (b + KZ, b)  # cache columns, sink column
             for i0 in range(0, T, TS):  # query rows i0 .. i0 + TS
                 blocks.append((i0, TS, self.maskb(rel, sink, self.P_BASE, 1, S_, c.window, sc, m0=i0 // 32, rows=TS)))
         os_ = []
-        if ATT_STOP == "mask":
-            return yq
         for i0, n, mask in blocks:
+            if USE_SDPA:  # fused q k + mask + softmax + p v by key chunks (GQA)
+                qb = ttnn.slice(q, (0, i0, 0, 0), (1, i0 + n, NH, HD), memory_config=PL) if n < T else q
+                qh = ttnn.permute(qb, (0, 2, 1, 3), memory_config=DRAM)  # [1, NH, n, HD]
+                o = ttnn.transformer.scaled_dot_product_attention(
+                    qh, kc, vc, attn_mask=mask, is_causal=False, scale=self.scale, program_config=self.p_sdpa[n],
+                    compute_kernel_config=self.hi, memory_config=DRAM)
+                os_.append(ttnn.permute(o, (0, 2, 1, 3), memory_config=PL))  # [1, n, NH, HD]
+                continue
             S = mask.shape[-1]
             mask = ttnn.reshape(mask, (1, NKV, (NH // NKV) * n, S))
             qb = ttnn.slice(q, (0, i0, 0, 0), (1, i0 + n, NH, HD), memory_config=PL) if n < T else q
@@ -297,8 +300,6 @@ class PrefillMixin:
             o = self.mm(p, vc, memory_config=PL)  # [1, NKV, 3n, HD]
             os_.append(ttnn.permute(ttnn.reshape(o, (1, NH, n, HD)), (0, 2, 1, 3), memory_config=PL))  # [1,n,NH,HD]
         o = os_[0] if len(os_) == 1 else ttnn.concat(os_, dim=1, memory_config=PL)  # [1, T, NH, HD]
-        if ATT_STOP == "score":
-            return o
         o = ttnn.multiply(o, gate, input_tensor_b_activations=[UWP(U.SIGMOID)], memory_config=PL)
         return d["Lo"](ttnn.reshape(o, (1, 1, T, NH * HD)), out_mem=PL)
 
