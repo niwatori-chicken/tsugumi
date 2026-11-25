@@ -23,6 +23,8 @@ FORCE_INLINE uint32_t elem_off(uint32_t r, uint32_t c) {
     return ((r >> 4) * 2 + (c >> 4)) * 256 + (r & 15) * 16 + (c & 15);
 }
 
+uint32_t g_dbg = 0;  // debug bits: 1 no weight reads, 4 no act-tile gather
+
 struct Ring {
     CircularBuffer& cw;
     uint32_t pb, base, wr = 0, inflight = 0, issued = 0;
@@ -37,8 +39,10 @@ struct Ring {
         if (inflight == MAXF) push_oldest();
         cw.reserve_back((inflight + 1) * B);
         const uint32_t l1 = base + ((wr + inflight) % NBUF) * B * pb;
-        noc_async_read_set_trid(1 + issued % NBUF);
-        noc_async_read(get_noc_addr_from_bank_id<true>(bank, addr), l1, B * pb);
+        if (!(g_dbg & 1)) {
+            noc_async_read_set_trid(1 + issued % NBUF);
+            noc_async_read(get_noc_addr_from_bank_id<true>(bank, addr), l1, B * pb);
+        }
         ++inflight;
         ++issued;
     }
@@ -56,6 +60,7 @@ void kernel_main() {
     const auto sU = TensorAccessor(aU, get_arg_val<uint32_t>(2));
     const uint32_t gu = get_arg_val<uint32_t>(3), dn = get_arg_val<uint32_t>(4), c = get_arg_val<uint32_t>(5);
     const uint32_t pb = get_arg_val<uint32_t>(6), NB = get_arg_val<uint32_t>(7), ncores = get_arg_val<uint32_t>(8);
+    g_dbg = get_arg_val<uint32_t>(9 + 2 * ncores);
     constexpr uint32_t TB = 2048;
     Noc noc;
     CircularBuffer cx(0), cw(1), cd(2), cr(6), csc(7), cctl(12), csh(13), cwc(14);
@@ -120,7 +125,7 @@ void kernel_main() {
             const uint32_t sa = share + ((b % 2) * NB + (j - j0)) * MT * TB;  // this expert's act tiles, every core
             cd.reserve_back(IT * MT);  // tile (m, kt) at m * IT + kt
             const uint32_t dl = cd.get_write_ptr();
-            for (uint32_t kt = 0; kt < IT; ++kt)
+            for (uint32_t kt = 0; kt < IT && !(g_dbg & 4); ++kt)
                 for (uint32_t m = 0; m < MT; ++m)
                     noc_async_read(get_noc_addr(get_arg_val<uint32_t>(9 + 2 * kt), get_arg_val<uint32_t>(10 + 2 * kt),
                                                 sa + m * TB), dl + (m * IT + kt) * TB, TB);

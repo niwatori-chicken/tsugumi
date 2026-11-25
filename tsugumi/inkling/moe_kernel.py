@@ -66,6 +66,7 @@ class InkMoE:
         c.fp32_dest_acc_en = True
         c.math_approx_mode = False
         self.ccfg = c
+
         f32 = ttnn.float32
         self.NB = NB  # prefill: experts per batch (one barrier per batch)
         # prefill CBs for MT row tiles (32 tokens each)
@@ -139,7 +140,7 @@ class InkMoE:
         ttnn.generic_op([x, ids, wcol, gu, dn, self.gather, self.out], prog)
         return self.out
 
-    def prefill(self, x, route, used, gu, dn, out):
+    def prefill(self, x, route, used, gu, dn, out, dbg=0):
         """T = 32 MT token rows: x [1,1,T,H]; route [1,1,T,E] bf16 tiles (dense routing weights, 0 = not routed); used
         row-major bf16 [1,1,1,E] (max over the tokens); out [1,1,T,H] (L1 or DRAM)."""
         cores = _cores(self.coords)
@@ -155,16 +156,17 @@ class InkMoE:
         r_rt, c_rt, w_rt = [], [], []
         for c, xy in enumerate(self.coords):
             r_rt.append((xy, [x.buffer_address(), route.buffer_address(), used.buffer_address(), gu.buffer_address(),
-                              dn.buffer_address(), c, self.pb, self.NB, self.NC] + nocxy))
-            c_rt.append((xy, [fbits(1.0 / self.gc), fbits(1.0 / self.uc), (c // 4) % 2, self.NB, MT]))
+                              dn.buffer_address(), c, self.pb, self.NB, self.NC] + nocxy + [dbg]))
+            c_rt.append((xy, [fbits(1.0 / self.gc), fbits(1.0 / self.uc), (c // 4) % 2, self.NB, MT, dbg]))
             w_rt.append((xy, [out.buffer_address(), c, self.noc[0].x, self.noc[0].y, self.NB, MT]))
         sems = [ttnn.SemaphoreDescriptor(id=0, core_ranges=cores, initial_value=0),
                 ttnn.SemaphoreDescriptor(id=1, core_ranges=cores, initial_value=0)]
+        kc = Kd("ink_moep_compute.cpp", [], c_rt, self.ccfg)
         prog = ttnn.ProgramDescriptor(kernels=[
             Kd("ink_moep_reader.cpp", r_ct, r_rt, ttnn.ReaderConfigDescriptor()),
             Kd("ink_moep_writer.cpp", ttnn.TensorAccessorArgs(out).get_compile_time_args(), w_rt,
                ttnn.WriterConfigDescriptor()),
-            Kd("ink_moep_compute.cpp", [], c_rt, self.ccfg),
+            kc,
         ], semaphores=sems, cbs=self.pcbs(MT))
         ttnn.generic_op([x, route, used, gu, dn, out], prog)
         return out

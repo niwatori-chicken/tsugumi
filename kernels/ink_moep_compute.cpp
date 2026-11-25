@@ -37,6 +37,7 @@ FORCE_INLINE void done() {
 void kernel_main() {
     const uint32_t igc = get_arg_val<uint32_t>(0), iuc = get_arg_val<uint32_t>(1);
     const uint32_t first = get_arg_val<uint32_t>(2), NB = get_arg_val<uint32_t>(3), MT = get_arg_val<uint32_t>(4);
+    const uint32_t dbg = get_arg_val<uint32_t>(5);  // debug bits: 2 no matmuls
     compute_kernel_hw_startup(c_W, c_X, c_G);
     cb_wait_front(c_CTL, 1);
     const uint32_t U = read_tile_value(c_CTL, 0, 0);
@@ -50,16 +51,13 @@ void kernel_main() {
             fill_tile_init();
             for (uint32_t i = 0; i < 2 * MT; ++i) fill_tile(i, 0.0f);
             reconfig_data_format(c_W, c_X);
-            matmul_init(c_X, c_W, 0);
+            // one call per K tile: the MT x 2 block (row tiles x [gate, up]); X rows at stride 72, DST (m, n) = 2 m + n
+            matmul_block_init(c_X, c_W, 0, 2, MT, 72);
             for (uint32_t g = 0; g < 6; ++g) {
                 cb_wait_front(c_W, 24);
                 const uint32_t kt0 = ((g + 3 * first) % 6) * 12;
-                for (uint32_t i = 0; i < 12; ++i) {
-                    for (uint32_t m = 0; m < MT; ++m) {
-                        matmul_tiles(c_X, c_W, m * 72 + kt0 + i, 2 * i, 2 * m);
-                        matmul_tiles(c_X, c_W, m * 72 + kt0 + i, 2 * i + 1, 2 * m + 1);
-                    }
-                }
+                if (!(dbg & 2))
+                    for (uint32_t i = 0; i < 12; ++i) matmul_block(c_X, c_W, kt0 + i, 2 * i, 0, 0, 2, MT, 72);
                 cb_pop_front(c_W, 24);
             }
             done();
@@ -83,7 +81,7 @@ void kernel_main() {
             binop_with_scalar_tile_init();
             mul_unary_tile(0, igc);
             mul_unary_tile(2, iuc);
-            tanh_tile_init();
+            tanh_tile_init();  // (the fast approximate forms: -14% kernel time, 9% output error: not used)
             tanh_tile(0);
             tanh_tile(2);
             sigmoid_tile_init();
@@ -125,16 +123,12 @@ void kernel_main() {
         for (uint32_t j = 0; j < n; ++j) {
             cb_wait_front(c_D, 36 * MT);
             reconfig_data_format(c_W, c_D);
-            matmul_init(c_D, c_W, 0);
+            matmul_block_init(c_D, c_W, 0, 2, MT, 36);  // D rows at stride 36
             for (uint32_t g = 0; g < 6; ++g) {
                 cb_wait_front(c_W, 12);
                 const uint32_t kt0 = ((g + 3 * first) % 6) * 6;
-                for (uint32_t i = 0; i < 6; ++i) {
-                    for (uint32_t m = 0; m < MT; ++m) {
-                        matmul_tiles(c_D, c_W, m * 36 + kt0 + i, 2 * i, 2 * m);
-                        matmul_tiles(c_D, c_W, m * 36 + kt0 + i, 2 * i + 1, 2 * m + 1);
-                    }
-                }
+                if (!(dbg & 2))
+                    for (uint32_t i = 0; i < 6; ++i) matmul_block(c_D, c_W, kt0 + i, 2 * i, 0, 0, 2, MT, 36);
                 cb_pop_front(c_W, 12);
             }
             cb_pop_front(c_D, 36 * MT);
