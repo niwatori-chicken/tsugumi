@@ -208,8 +208,10 @@ export TSUGUMI_CACHE_DIR=/path/to/tsugumi_cache/inkling   # 変換済み重み (
   `auto` (既定。DRAM が 30 GiB 以上なら bfp8、それ以下なら mixed) / `bfp8` / `mixed` (ループの層 6-17 と MXFP8 の層を bfp8、残りを bfp4) / `bfp4`)。
   NVFP4 を bfp4 に詰め直すと重みの誤差が約 11% 増えるため (bfp8 なら 0.7%)、既定は bfp8 です。注意の重みと lm_head は bfp8、KV は bfp8。
   P150A (32GB) で DRAM 使用 26.8 GiB (`--max-seq 32768`)。mixed は P100A (28GB) 向けですが、P100A では未確認です。
-- 速度 (P150A、計測は各 1〜数回): デコード **約 27 tok/s** (1 ステップ約 31ms)、prefill **約 183 tok/s**
-  (32 トークンずつ。1,335 トークンで 7.3 秒)、短いプロンプトの応答開始 約 0.3 秒。
+- 速度 (P150A、`--max-seq 32768`、計測は各 1〜数回): デコード **約 27 tok/s** (1 ステップ約 31ms。文脈 30k でも
+  ほぼ同じ)、prefill **約 230〜265 tok/s** (64 トークンずつ。4k で 15.5 秒、30k で 129 秒)、短いプロンプトの応答開始
+  約 0.3 秒。prefill の全注意層は文脈の長さに応じたバケット (4k / 8k / 16k / 全体、`TSUGUMI_INKLING_PREFILL_BUCKETS`)
+  のトレースで、使っている範囲のキャッシュだけを相手にします。
   小さな op は自作カーネル (`kernels/ink_*.cpp`) にまとめています: 注意、q/r/k/v の前処理 (ヘッドごとに 16 コア)、
   ルーター (ロジットとルーティングを 1 プログラム)、メッセージゲート (1 プログラム)、conv + 残差、
   attention residual + RMS norm (ループのメッセージ計算も)、MoE (デコード・prefill とも 1 プログラム、`ink_moe_*` /

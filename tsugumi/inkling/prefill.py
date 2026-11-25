@@ -1,4 +1,4 @@
-"""Chunked prefill for the Inkling engine: T = 32 prompt tokens per step (rows = tokens), at any start position.
+"""Chunked prefill for the Inkling engine: T = 64 (or 32) prompt tokens per step (rows = tokens), at any start position.
 
 Same weights, caches and convolution histories as the decode step (engine.py); the differences:
 - attention residuals per token: the normalized block states are stacked on dim 1 ([1, n, 32, H]); scores =
@@ -18,13 +18,18 @@ import math
 import torch
 import ttnn
 
+from ..env import env
 from ..kv_kernel import KVWriteKernel
 
 L1 = ttnn.L1_MEMORY_CONFIG
 DRAM = ttnn.DRAM_MEMORY_CONFIG
 NEG = -1e9
 U, UWP = ttnn.UnaryOpType, ttnn.UnaryWithParam
-T = 32
+# prompt tokens per prefill step (rows = tokens): 64 (default) or 32 (TSUGUMI_INKLING_PREFILL_T). The per-step cost
+# of most prefill ops grows much less than the rows: 64-row steps give ~200 tok/s vs ~172 at max_seq 32768 (239 vs 202
+# at 8192); a lone short remainder costs a bit more (one 64-row step)
+T = int(env("INKLING_PREFILL_T", "64"))
+assert T in (32, 64)
 
 
 class PrefillMixin:
@@ -34,7 +39,7 @@ class PrefillMixin:
         NKV, HD = c.n_kv, c.head_dim
         k = c.conv_k
         # X_lag[t] = x[t - lag] (t >= lag) or hist row lag - t
-        mall = torch.zeros(1, 1, k * T, 2 * T)
+        mall = torch.zeros(1, 1, k * T, T + 32)  # XH = [x (T rows); hist (32 rows)]
         for lag in range(k):
             for t in range(T):
                 if t >= lag:
@@ -56,6 +61,26 @@ class PrefillMixin:
         ars[:self.max_seq] = torch.arange(self.max_seq).float()
         ars[self.max_seq] = -1e7
         self.P_ARS = self.tt(ars.view(1, 1, 1, SA), ttnn.float32)
+        # context buckets for the full layers' prefill attention: a chunk whose positions are all below S_b attends to
+        # cache slots [0, S_b) + 32 zero K / V rows (the sink at column S_b) instead of all max_seq + W slots; one
+        # trace per bucket (TSUGUMI_INKLING_PREFILL_BUCKETS, comma separated, multiples of the window; "" = off)
+        W = c.window
+        bl = env("INKLING_PREFILL_BUCKETS", "4096,8192,16384")
+        self.p_buckets = [b for b in (int(x) for x in bl.split(",") if x) if b < self.max_seq]
+        assert all(b % W == 0 and b >= T for b in self.p_buckets)
+        self.p_bucket = None
+        self.P_ARS_B, self.P_ES_B = {}, {}
+        for b in self.p_buckets:
+            a_ = torch.full((b + 32,), 1e7)
+            a_[:b] = torch.arange(b).float()
+            a_[b] = -1e7
+            self.P_ARS_B[b] = self.tt(a_.view(1, 1, 1, b + 32), ttnn.float32)
+            e_ = torch.zeros(1, 1, 32, b + 32)
+            e_[0, 0, 0, b] = 1.0
+            self.P_ES_B[b] = self.tt(e_)
+        self.P_KZ = ttnn.from_torch(torch.zeros(1, NKV, 32, HD), dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT,
+                                    device=self.dev, memory_config=DRAM)
+        self.P_RZ = self.tt(torch.zeros(1, c.n_heads, T, 32), mem=DRAM)
         # dynamic conv: D[lag][t, c] = dyn[t, head(c) * 4 + lag] / sqrt(2k + 1)
         el = torch.zeros(1, k, 32, NKV * HD)
         for lag in range(k):
@@ -71,8 +96,8 @@ class PrefillMixin:
         self.P_THR = self.tt(torch.zeros(1, 1, T, 1), ttnn.float32)  # min(P_t, W - 1)
         self.P_PCOL = self.tt(torch.zeros(1, 1, T, 1), ttnn.float32)  # P_t
         self.P_TAU = self.tt(torch.ones(1, T, 1, 1))  # tau(P_t), [1, T, 1, 1] (token-major q / r)
-        self.P_MH = self.tt(torch.zeros(1, 1, T, 2 * T))
-        self.P_SEL = self.tt(torch.zeros(1, 1, T, T))
+        self.P_MH = self.tt(torch.zeros(1, 1, 32, T + 32))  # XH -> the new 32-row history
+        self.P_SEL = self.tt(torch.zeros(1, 1, 32, T))  # the last real row -> row 0 (32 rows for the head)
         self.kvw_ring = KVWriteKernel(self.dev, T, NKV, HD, RA, 1, ttnn.bfloat8_b)
         self.kvw_full = KVWriteKernel(self.dev, T, NKV, HD, SA, 1, ttnn.bfloat8_b)
         self.p_pc_gu = self._spc(2 * c.inter, (9, 8), 6)
@@ -120,7 +145,7 @@ class PrefillMixin:
         return x_norm if B is None else ttnn.concat([B, x_norm], dim=1, memory_config=L1)
 
     def p_conv(self, x, hist, taps4, dyn4=None):
-        XH = ttnn.concat([x, hist], dim=-2, memory_config=L1)  # [1,1,64,C]
+        XH = ttnn.concat([x, hist], dim=-2, memory_config=L1)  # [1,1,T+32,C]
         Y = ttnn.reshape(self.mm(self.P_MALL, XH), (1, self.cfg.conv_k, T, x.shape[-1]))
         taps = taps4 if dyn4 is None else ttnn.add(dyn4, taps4, memory_config=L1)
         y = ttnn.sum(ttnn.multiply(Y, taps, memory_config=L1), dim=1, keepdim=True, memory_config=L1)
@@ -187,24 +212,36 @@ class PrefillMixin:
             self.kvw_ring(k, v, st["kc"], st["vc"], self.P_POSR, self.P_PT0)
         else:
             self.kvw_full(k, v, st["kc"], st["vc"], self.P_POSF, self.P_PT0)
+        kc, vc = st["kc"], st["vc"]
         # mask [1, NH, T, S] (units of 1 / scale)
         rel = self.mm(r, d["p_proj"])  # [1, NH, T, R or W] by distance
         if sliding:
-            rel = ttnn.gather(rel, -1, index=pc["IDXR"])  # [1, NH, T, RA] by slot
-            mask = ttnn.add(rel, pc["VR"], memory_config=L1)
+            rel = ttnn.gather(rel, -1, index=pc["IDXR"], memory_config=DRAM)  # [1, NH, T, RA] by slot
+            mask = ttnn.add(rel, pc["VR"], memory_config=DRAM)
             mask = ttnn.add(mask, self.mm(sink, self.P_ER), memory_config=DRAM)
         else:
-            rel = ttnn.gather(rel, -1, index=pc["IDXF"])  # [1, NH, T, W] by position % W
-            rep = ttnn.repeat(rel, (1, 1, 1, self.SA // c.window), memory_config=DRAM)
+            rel = ttnn.gather(rel, -1, index=pc["IDXF"], memory_config=DRAM)  # [1, NH, T, W] by position % W
+            b = self.p_bucket
+            if b is None:
+                rep = ttnn.repeat(rel, (1, 1, 1, self.SA // c.window), memory_config=DRAM)
+                es = self.P_ES
+            else:  # slots [0, b) + 32 (sink at b)
+                rep = ttnn.concat([ttnn.repeat(rel, (1, 1, 1, b // c.window), memory_config=DRAM), self.P_RZ], dim=-1,
+                                  memory_config=DRAM)
+                es = self.P_ES_B[b]
+                kc = ttnn.concat([ttnn.slice(kc, (0, 0, 0, 0), (1, NKV, b, HD), memory_config=DRAM), self.P_KZ],
+                                 dim=-2, memory_config=DRAM)
+                vc = ttnn.concat([ttnn.slice(vc, (0, 0, 0, 0), (1, NKV, b, HD), memory_config=DRAM), self.P_KZ],
+                                 dim=-2, memory_config=DRAM)
             mask = ttnn.add(ttnn.multiply(rep, pc["BWIN"], memory_config=DRAM), pc["AV"], memory_config=DRAM)
-            mask = ttnn.add(mask, self.mm(sink, self.P_ES, memory_config=DRAM), memory_config=DRAM)
+            mask = ttnn.add(mask, self.mm(sink, es, memory_config=DRAM), memory_config=DRAM)
         S = mask.shape[-1]
         mask = ttnn.reshape(mask, (1, NKV, (NH // NKV) * T, S))
         qg = ttnn.reshape(ttnn.permute(q, (0, 2, 1, 3), memory_config=L1), (1, NKV, (NH // NKV) * T, HD))
-        s = self.mm(qg, st["kc"], transpose_b=True, memory_config=DRAM)  # [1, NKV, 96, S]
+        s = self.mm(qg, kc, transpose_b=True, memory_config=DRAM)  # [1, NKV, 3T, S]
         s = ttnn.multiply(ttnn.add(s, mask, memory_config=DRAM), self.scale, memory_config=DRAM)
         p = ttnn.softmax(s, dim=-1, memory_config=DRAM, numeric_stable=True)
-        o = self.mm(p, st["vc"], memory_config=L1)  # [1, NKV, 96, HD]
+        o = self.mm(p, vc, memory_config=L1)  # [1, NKV, 3T, HD]
         o = ttnn.permute(ttnn.reshape(o, (1, NH, T, HD)), (0, 2, 1, 3), memory_config=L1)  # [1, T, NH, HD]
         o = ttnn.multiply(o, gate, input_tensor_b_activations=[UWP(U.SIGMOID)], memory_config=L1)
         return d["Lo"](ttnn.reshape(o, (1, 1, T, NH * HD)), out_mem=L1)
@@ -223,7 +260,7 @@ class PrefillMixin:
         w = ttnn.typecast(w, ttnn.bfloat16)
         sp = ttnn.to_layout(ttnn.max(w, dim=-2, keepdim=True, memory_config=L1), ttnn.ROW_MAJOR_LAYOUT)
         if "Mgu" in d:  # kernels/ink_moep_*: the used experts in batches, act, routing weights and sum in one program
-            return self.moek.prefill(x, w, sp, d["Mgu"], d["Mdn"], self.p_moe_out)
+            return d["moek"].prefill(x, w, sp, d["Mgu"], d["Mdn"], self.p_moe_out)
         E, I = c.n_experts, c.inter
         gu = ttnn.sparse_matmul(x, d["Egu"], sparsity=sp, is_input_b_sparse=True, memory_config=DRAM,
                                 program_config=self.p_pc_gu, compute_kernel_config=d["eck"])
@@ -295,9 +332,10 @@ class PrefillMixin:
         valid = ttnn.le(dt, self.P_THR, memory_config=L1)
         vr = ttnn.add(ttnn.multiply(ttnn.subtract(valid, 1.0, memory_config=L1), -NEG, memory_config=L1),
                       self.P_SINKFIX, memory_config=L1)
-        pc["VR"] = ttnn.reshape(ttnn.typecast(vr, ttnn.bfloat16), (1, 1, T, self.RA))
+        pc["VR"] = ttnn.to_memory_config(ttnn.reshape(ttnn.typecast(vr, ttnn.bfloat16), (1, 1, T, self.RA)), DRAM)
         idx = ttnn.clamp(dt, min=0.0, max=float(R - 1), memory_config=L1)
-        pc["IDXR"] = ttnn.repeat(ttnn.typecast(idx, ttnn.uint32), (1, c.n_heads, 1, 1), memory_config=L1)
+        # [NH, T, RA] / [NH, T, W] index tensors: DRAM (in L1 they starve the prefill matmuls' CBs, worse at T = 64)
+        pc["IDXR"] = ttnn.repeat(ttnn.typecast(idx, ttnn.uint32), (1, c.n_heads, 1, 1), memory_config=DRAM)
         # full layers: distance by position % W; window / causal masks over the cache
         arw = ttnn.slice(self.ARW, (0, 0, 0, 0), (1, 1, 1, W), memory_config=L1)  # s' = 0..W-1
         df = ttnn.sub(self.P_PCOL, arw, memory_config=L1)  # P_t - s'
@@ -305,8 +343,9 @@ class PrefillMixin:
                                                         memory_config=L1), float(W), memory_config=L1),
                            memory_config=L1)  # (P_t - s') mod W
         df = ttnn.clamp(df, min=0.0, max=float(W - 1), memory_config=L1)
-        pc["IDXF"] = ttnn.repeat(ttnn.typecast(df, ttnn.uint32), (1, c.n_heads, 1, 1), memory_config=L1)
-        dp = ttnn.sub(self.P_PCOL, self.P_ARS, memory_config=DRAM)  # P_t - p, [1,1,T,SA]
+        pc["IDXF"] = ttnn.repeat(ttnn.typecast(df, ttnn.uint32), (1, c.n_heads, 1, 1), memory_config=DRAM)
+        ars = self.P_ARS if self.p_bucket is None else self.P_ARS_B[self.p_bucket]
+        dp = ttnn.sub(self.P_PCOL, ars, memory_config=DRAM)  # P_t - p, [1,1,T,SA or bucket + 32]
         win = ttnn.multiply(ttnn.ge(dp, 0.0, memory_config=DRAM), ttnn.lt(dp, float(W), memory_config=DRAM),
                             memory_config=DRAM)
         pc["BWIN"] = ttnn.typecast(win, ttnn.bfloat16)
@@ -354,11 +393,11 @@ class PrefillMixin:
         P = [p0 + t for t in range(T)]
         posr = [P[t] % self.R if t < n else self.R + 1 for t in range(T)]
         posf = [P[t] if t < n else self.max_seq + 1 for t in range(T)]
-        mh = torch.zeros(1, 1, T, 2 * T)
+        mh = torch.zeros(1, 1, 32, T + 32)
         for r in range(1, c.conv_k):  # new hist row r = x at position p0 + n - r
             j = n - r
             mh[0, 0, r, j if j >= 0 else T + (r - n)] = 1.0
-        sel = torch.zeros(1, 1, T, T)
+        sel = torch.zeros(1, 1, 32, T)
         sel[0, 0, 0, n - 1] = 1.0
         put = lambda t, v, dt: ttnn.copy_host_to_device_tensor(
             ttnn.from_torch(v, dtype=dt, layout=ttnn.TILE_LAYOUT if dt != ttnn.int32 else ttnn.ROW_MAJOR_LAYOUT), t)
@@ -373,7 +412,7 @@ class PrefillMixin:
         put(self.P_SEL, sel, ttnn.bfloat16)
 
     def prefill(self, tokens, logits=True, traced=True, progress=None):
-        """Feed tokens from self.pos on, 32 per step. Returns the top-k after the last one if logits."""
+        """Feed tokens from self.pos on, T per step. Returns the top-k after the last one if logits."""
         out = None
         for k in range(0, len(tokens), T):
             chunk = tokens[k:k + T]
@@ -382,7 +421,8 @@ class PrefillMixin:
             if self.pos + len(chunk) > self.max_seq:
                 raise RuntimeError(f"context full ({self.max_seq} tokens)")
             self.p_write_inputs(chunk, self.pos)
-            key = ("prefill", want)
+            self.p_bucket = next((b for b in self.p_buckets if self.pos + T <= b), None)
+            key = ("prefill", True, self.p_bucket)  # traced with the lm_head only (see Engine.capture)
             if traced and key in self.traces:
                 tid, o = self.traces[key]
                 ttnn.execute_trace(self.dev, tid, cq_id=0, blocking=False)

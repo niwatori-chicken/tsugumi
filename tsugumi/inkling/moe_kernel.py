@@ -44,7 +44,7 @@ def fbits(x):
 
 
 class InkMoE:
-    def __init__(self, dev, E, H, I, gc, uc, K=8, placement=None, ring=(12, 4, 3), NB=4):
+    def __init__(self, dev, E, H, I, gc, uc, K=8, placement=None, ring=(12, 4, 3), NB=4, wdtype=ttnn.bfloat8_b):
         assert (H, I, K) == (2304, 1152, 8)
         self.dev, self.E, self.H, self.I, self.gc, self.uc = dev, E, H, I, gc, uc
         self.ring = ring  # weight blocks: tiles per block, blocks in the CB, blocks in flight
@@ -52,25 +52,30 @@ class InkMoE:
         self.coords = PLACEMENTS[placement or os.environ.get("TSUGUMI_MOE_PLACEMENT", "stride2")]
         self.NC = len(self.coords)
         assert self.NC == I // 32 and len(set(self.coords)) == self.NC
-        self.pb = 1088  # bfp8 tile
+        self.wdtype = wdtype
+        self.pb = {ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}[wdtype]  # bytes per weight tile
         cores = _cores(self.coords)
-        bf, b8 = ttnn.bfloat16, ttnn.bfloat8_b
+        bf, b8 = ttnn.bfloat16, wdtype
         self.cbs = [_cbd(cores, 0, 72, bf), _cbd(cores, 1, ring[0] * ring[1], b8), _cbd(cores, 2, 36, bf), _cbd(cores, 3, K, bf),
                     _cbd(cores, 4, 2, bf), _cbd(cores, 5, 2, bf), _cbd(cores, 7, 1, bf), _cbd(cores, 8, 1, bf),
                     _cbd(cores, 9, 1, bf), _cbd(cores, 10, 1, bf), _cbd(cores, 11, 2 * K, bf),
                     _cbd(cores, 16, 2, bf)]
         c = ttnn.ComputeConfigDescriptor()
-        c.math_fidelity = ttnn.MathFidelity.HiFi2  # bfp8 weights (as the sparse matmuls)
+        # as the sparse matmuls: HiFi2 covers bfp8's mantissa, bfp4 needs only LoFi
+        c.math_fidelity = ttnn.MathFidelity.HiFi2 if wdtype == ttnn.bfloat8_b else ttnn.MathFidelity.LoFi
         c.fp32_dest_acc_en = True
         c.math_approx_mode = False
         self.ccfg = c
+
         f32 = ttnn.float32
         self.NB = NB  # prefill: experts per batch (one barrier per batch)
-        self.pcbs = [_cbd(cores, 0, 72, bf), _cbd(cores, 1, ring[0] * ring[1], b8), _cbd(cores, 2, 72, bf),
-                     _cbd(cores, 4, 2, bf), _cbd(cores, 5, 2, bf), _cbd(cores, 6, 4, bf), _cbd(cores, 7, 1, bf),
-                     _cbd(cores, 10, 1, bf), _cbd(cores, 11, 1, bf), _cbd(cores, 12, 1, bf),
-                     _cbd(cores, 13, 2 * NB, bf), _cbd(cores, 14, 3, bf), _cbd(cores, 15, 2, f32),
-                     _cbd(cores, 16, 2, bf)]
+        # prefill CBs for MT row tiles (32 tokens each)
+        self.pcbs = lambda MT: [
+            _cbd(cores, 0, 72 * MT, bf), _cbd(cores, 1, ring[0] * ring[1], b8), _cbd(cores, 2, 72 * MT, bf),
+            _cbd(cores, 4, MT, bf), _cbd(cores, 5, MT, bf), _cbd(cores, 6, 4 * MT, bf), _cbd(cores, 7, 1, bf),
+            _cbd(cores, 10, 1, bf), _cbd(cores, 11, 1, bf), _cbd(cores, 12, 1, bf),
+            _cbd(cores, 13, 2 * NB * MT, bf), _cbd(cores, 14, 3 * MT, bf), _cbd(cores, 15, 2 * MT, f32),
+            _cbd(cores, 16, 2 * MT, bf)]
         L1 = ttnn.L1_MEMORY_CONFIG
         z = lambda w: ttnn.from_torch(torch.zeros(1, 1, 32, w), dtype=bf, layout=ttnn.TILE_LAYOUT, device=dev,
                                       memory_config=L1)
@@ -83,7 +88,7 @@ class InkMoE:
         grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(7, 0))})
         mem = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.DRAM,
                                 ttnn.ShardSpec(grid, (32, 32 * T), ttnn.ShardOrientation.ROW_MAJOR))
-        return ttnn.allocate_tensor_on_device(ttnn.Shape([1, 1, 32, 32 * T * 8]), ttnn.bfloat8_b, ttnn.TILE_LAYOUT,
+        return ttnn.allocate_tensor_on_device(ttnn.Shape([1, 1, 32, 32 * T * 8]), self.wdtype, ttnn.TILE_LAYOUT,
                                               self.dev, mem)
 
     def _reorder(self, src, kind):
@@ -99,12 +104,12 @@ class InkMoE:
                                   source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH, core_ranges=cores,
                                   compile_time_args=ttnn.TensorAccessorArgs(src).get_compile_time_args(),
                                   runtime_args=rt, config=ttnn.ReaderConfigDescriptor())
-        p = ttnn.ProgramDescriptor(kernels=[k], semaphores=[], cbs=[_cbd(cores, 0, T, ttnn.bfloat8_b)])
+        p = ttnn.ProgramDescriptor(kernels=[k], semaphores=[], cbs=[_cbd(cores, 0, T, self.wdtype)])
         ttnn.generic_op([src, dst], p)
         return dst
 
     def prepare(self, Egu, Edn):
-        assert Egu.dtype == ttnn.bfloat8_b and Edn.dtype == ttnn.bfloat8_b
+        assert Egu.dtype == self.wdtype and Edn.dtype == self.wdtype
         return self._reorder(Egu, 0), self._reorder(Edn, 1)
 
     def __call__(self, x, ids, wcol, gu, dn, stage=3):
@@ -135,30 +140,33 @@ class InkMoE:
         ttnn.generic_op([x, ids, wcol, gu, dn, self.gather, self.out], prog)
         return self.out
 
-    def prefill(self, x, route, used, gu, dn, out):
-        """32 token rows: x [1,1,32,H]; route [1,1,32,E] bf16 tiles (dense routing weights, 0 = not routed); used
-        row-major bf16 [1,1,1,E] (max over the tokens); out [1,1,32,H] (L1 or DRAM)."""
+    def prefill(self, x, route, used, gu, dn, out, dbg=0):
+        """T = 32 MT token rows: x [1,1,T,H]; route [1,1,T,E] bf16 tiles (dense routing weights, 0 = not routed); used
+        row-major bf16 [1,1,1,E] (max over the tokens); out [1,1,T,H] (L1 or DRAM)."""
         cores = _cores(self.coords)
         Kd = lambda src, ct, rt, cfg: ttnn.KernelDescriptor(
             kernel_source=os.path.join(KDIR, src), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores, compile_time_args=ct, runtime_args=rt, config=cfg)
-        r_ct = list(self.ring)
+        MT = x.shape[-2] // 32
+        assert x.shape[-2] == 32 * MT and 1 <= MT <= 2  # 2 MT float32 DST tiles
+        r_ct = list(self.ring) + [MT]
         for t in (x, route, used):
             r_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
         nocxy = [v for n in self.noc for v in (n.x, n.y)]
         r_rt, c_rt, w_rt = [], [], []
         for c, xy in enumerate(self.coords):
             r_rt.append((xy, [x.buffer_address(), route.buffer_address(), used.buffer_address(), gu.buffer_address(),
-                              dn.buffer_address(), c, self.pb, self.NB, self.NC] + nocxy))
-            c_rt.append((xy, [fbits(1.0 / self.gc), fbits(1.0 / self.uc), (c // 4) % 2, self.NB]))
-            w_rt.append((xy, [out.buffer_address(), c, self.noc[0].x, self.noc[0].y, self.NB]))
+                              dn.buffer_address(), c, self.pb, self.NB, self.NC] + nocxy + [dbg]))
+            c_rt.append((xy, [fbits(1.0 / self.gc), fbits(1.0 / self.uc), (c // 4) % 2, self.NB, MT, dbg]))
+            w_rt.append((xy, [out.buffer_address(), c, self.noc[0].x, self.noc[0].y, self.NB, MT]))
         sems = [ttnn.SemaphoreDescriptor(id=0, core_ranges=cores, initial_value=0),
                 ttnn.SemaphoreDescriptor(id=1, core_ranges=cores, initial_value=0)]
+        kc = Kd("ink_moep_compute.cpp", [], c_rt, self.ccfg)
         prog = ttnn.ProgramDescriptor(kernels=[
             Kd("ink_moep_reader.cpp", r_ct, r_rt, ttnn.ReaderConfigDescriptor()),
             Kd("ink_moep_writer.cpp", ttnn.TensorAccessorArgs(out).get_compile_time_args(), w_rt,
                ttnn.WriterConfigDescriptor()),
-            Kd("ink_moep_compute.cpp", [], c_rt, self.ccfg),
-        ], semaphores=sems, cbs=self.pcbs)
+            kc,
+        ], semaphores=sems, cbs=self.pcbs(MT))
         ttnn.generic_op([x, route, used, gu, dn, out], prog)
         return out
