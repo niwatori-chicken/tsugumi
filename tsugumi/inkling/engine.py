@@ -65,14 +65,17 @@ class Engine(PrefillMixin):
         # ring KV of the sliding layers: R = W + PT slots (a PT-token prefill chunk is written before its
         # attention; the positions it evicts are older than any of its tokens' windows), then a sink slot (K = V = 0;
         # the prefill attention puts the per-token sink logits into the mask there) and a scratch slot (padding rows of
-        # a chunk write there), padded to RA = 9 x 128. Full layers: max_seq + one block of W (sink at max_seq,
+        # a chunk write there), padded to RA (multiple of 128). Full layers: max_seq + one block of W (sink at max_seq,
         # scratch at max_seq + 1).
-        self.R, self.RA, self.SA = W + PT, 9 * 128, max_seq + W  # PT: prefill chunk (32 or 64)
+        # PT: prefill chunk (32, 64 or 128); RA: R + the sink and scratch slots, in 128-key chunks (9 for PT <= 64)
+        self.R, self.SA = W + PT, max_seq + W
+        self.RA = (self.R + 2 + 127) // 128 * 128
         assert self.R + 2 <= self.RA
         self.wdtype = wdtype
         self.moek = None  # InkMoE (created with the first bfp8 / bfp4 expert layer)
         self.moeks = {}  # per weight format
         self.hi = _ck(ttnn.MathFidelity.HiFi4)
+        self.mm_mem = L1  # self.mm output placement (prefill.p_forward sets DRAM at T = 128)
         self.hi2 = _ck(ttnn.MathFidelity.HiFi2)
         self.scale = c.head_dim ** -0.5
         if experts is None:
@@ -121,7 +124,7 @@ class Engine(PrefillMixin):
         return self.ck.get(name)
 
     def mm(self, a, b, **kw):
-        kw.setdefault("memory_config", L1)
+        kw.setdefault("memory_config", self.mm_mem)  # DRAM inside the 128-row prefill
         kw.setdefault("compute_kernel_config", self.hi)
         return ttnn.matmul(a, b, **kw)
 
@@ -396,7 +399,7 @@ class Engine(PrefillMixin):
         # decode attention kernels (bias / validity / sink in the mask; full layers read up to the position only)
         # chunks of 128 keys; 9 splits per KV head for the ring (17 chunks), 13 for full layers (long contexts)
         self.att_ring = InkAttention(self.dev, ring=True, bsl=self.RA, r=self.R, w=c.window, sink=self.R, wr=self.R,
-                                     chunk_tiles=4, splits=9)
+                                     chunk_tiles=4, splits=self.RA // 128)
         self.att_full = InkAttention(self.dev, ring=False, bsl=self.SA, r=self.R, w=c.window, sink=self.max_seq,
                                      wr=c.window, chunk_tiles=4, splits=13)
         self.D_NPR = ttnn.from_torch(torch.zeros(8, dtype=torch.int32), dtype=ttnn.int32, device=self.dev)
@@ -501,7 +504,8 @@ class Engine(PrefillMixin):
 
     # ------------------------------------------------------------------------------------------------ pieces
     def rmsu(self, x):
-        return ttnn.rms_norm(x, epsilon=self.cfg.eps, memory_config=L1)
+        mc = DRAM if x.memory_config().buffer_type == ttnn.BufferType.DRAM else L1  # 128-row prefill: DRAM
+        return ttnn.rms_norm(x, epsilon=self.cfg.eps, memory_config=mc)
 
     def rowdot(self, WT, x):
         """x row 0 [1, K] @ WT^T, WT [N, K] (small N): multiply + row sums on many cores. Returns [1,1,1,N]."""
@@ -565,15 +569,16 @@ class Engine(PrefillMixin):
         if not rows:  # decode: kernels/ink_gz_*, ink_go_* (z, the norms, f / g and the mix in two programs)
             return self.gate(h, msg, d[f"g_{wh}_d"], d[f"g_{wh}_fg"], wh)
         nh = self.rmsu(h) if nh is None else nh
-        cat = ttnn.concat([nh, self.rmsu(msg)], dim=-1, memory_config=L1)
+        mc = DRAM if h.memory_config().buffer_type == ttnn.BufferType.DRAM else L1  # 128-row prefill: DRAM
+        cat = ttnn.concat([nh, self.rmsu(msg)], dim=-1, memory_config=mc)
         z = self.mm(cat, d[f"g_{wh}_d"]) if rows else self.rowdot(d[f"g_{wh}_dT"], cat)
         fg = self.mm(z, d[f"g_{wh}_fg"])  # [1,1,1,2H]: broadcast over the rows of h / msg
         H = self.cfg.hidden
-        f = ttnn.slice(fg, (0, 0, 0, 0), (1, 1, fg.shape[-2], H), memory_config=L1)
-        g = ttnn.slice(fg, (0, 0, 0, H), (1, 1, fg.shape[-2], 2 * H), memory_config=L1)
-        out = ttnn.multiply(f, h, input_tensor_a_activations=[UWP(U.TANH), UWP(U.RSUB, 1.0)], memory_config=L1)
-        return ttnn.add(out, ttnn.multiply(g, msg, input_tensor_a_activations=[UWP(U.TANH)], memory_config=L1),
-                        memory_config=L1)
+        f = ttnn.slice(fg, (0, 0, 0, 0), (1, 1, fg.shape[-2], H), memory_config=mc)
+        g = ttnn.slice(fg, (0, 0, 0, H), (1, 1, fg.shape[-2], 2 * H), memory_config=mc)
+        out = ttnn.multiply(f, h, input_tensor_a_activations=[UWP(U.TANH), UWP(U.RSUB, 1.0)], memory_config=mc)
+        return ttnn.add(out, ttnn.multiply(g, msg, input_tensor_a_activations=[UWP(U.TANH)], memory_config=mc),
+                        memory_config=mc)
 
     def attention(self, d, st, q_in, k_in, v_in, sc, rows=(0, 0, 0)):
         c = self.cfg

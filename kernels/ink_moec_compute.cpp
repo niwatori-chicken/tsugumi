@@ -7,7 +7,8 @@
 //   scatter: out[m] += sum_m' PS(m, m') @ Y(m') with the writer's 0/1 placement tiles PS (CB 3, MT x CT per
 //     expert: [t % 32][r % 32] = 1 for token t = L[r]); the running sum in CB 15 (float32) between batches; the
 //     last batch -> CB 16 (bf16, 2 MT output tiles).
-// RT: 0 1/gc, 1 1/uc (float bits), 2 half of K read first, 3 NB, 4 MT, 5 dbg (2: no matmuls)
+// RT: 0 1/gc, 1 1/uc (float bits), 2 half of K read first, 3 NB, 4 MT (2 MT float32 DST tiles: MT = 4 needs
+//     the full-sync DST), 5 dbg (2: no matmuls). Entries (expert, <= 32 CTM tokens), CTM = min(MT, 2).
 #include <stdint.h>
 #include "api/compute/compute_kernel_api.h"
 #include "api/compute/compute_kernel_hw_startup.h"
@@ -42,6 +43,7 @@ void kernel_main() {
     const uint32_t igc = get_arg_val<uint32_t>(0), iuc = get_arg_val<uint32_t>(1);
     const uint32_t first = get_arg_val<uint32_t>(2), NB = get_arg_val<uint32_t>(3), MT = get_arg_val<uint32_t>(4);
     const uint32_t dbg = get_arg_val<uint32_t>(5);
+    const uint32_t CTM = MT < 2 ? MT : 2;  // compact tiles per entry (fixed CB blocks)
     compute_kernel_hw_startup(c_W, c_X, c_G);
     cb_wait_front(c_CTL, 1);
     const uint32_t U = read_tile_value(c_CTL, 0, 0);
@@ -70,9 +72,9 @@ void kernel_main() {
             }
             tile_regs_release();
             // act on the compact tiles (rows = the routed tokens)
-            cb_wait_front(c_CG, MT);  // fixed MT-tile blocks (variable ones could wrap around a CB's end): ct used
-            cb_wait_front(c_CU, MT);
-            cb_wait_front(c_WC, MT);
+            cb_wait_front(c_CG, CTM);  // fixed CTM-tile blocks (variable ones could wrap around a CB's end): ct used
+            cb_wait_front(c_CU, CTM);
+            cb_wait_front(c_WC, CTM);
             for (uint32_t m = 0; m < ct; ++m) {
                 tile_regs_acquire();
                 reconfig_data_format_srca(c_CG);
@@ -106,7 +108,7 @@ void kernel_main() {
                 tile_regs_release();
                 cb_pop_front(c_A, 1);
             }
-            for (uint32_t m = ct; m < MT; ++m) {  // the expert's remaining share slots (never read)
+            for (uint32_t m = ct; m < CTM; ++m) {  // the entry's remaining share slots (never read)
                 tile_regs_acquire();
                 fill_tile_init();
                 fill_tile(0, 0.0f);
@@ -114,14 +116,14 @@ void kernel_main() {
                 pack_to(0, c_SH);
                 tile_regs_release();
             }
-            cb_pop_front(c_CG, MT);
-            cb_pop_front(c_CU, MT);
-            cb_pop_front(c_WC, MT);
+            cb_pop_front(c_CG, CTM);
+            cb_pop_front(c_CU, CTM);
+            cb_pop_front(c_WC, CTM);
         }
         // down per expert on its compact act -> Y (CB 18)
         for (uint32_t jj = 0; jj < n; ++jj) {
             const uint32_t ct = (read_tile_value(c_CTL, 0, 1 + j0 + jj) + 31) / 32;
-            cb_wait_front(c_D, 36 * MT);
+            cb_wait_front(c_D, 36 * CTM);
             tile_regs_acquire();
             fill_tile_init();
             for (uint32_t i = 0; i < 2 * ct; ++i) fill_tile(i, 0.0f);
@@ -134,14 +136,14 @@ void kernel_main() {
                     for (uint32_t i = 0; i < 6; ++i) matmul_block(c_D, c_W, kt0 + i, 2 * i, 0, 0, 2, ct, 36);
                 cb_pop_front(c_W, 12);
             }
-            for (uint32_t i = 2 * ct; i < 2 * MT; ++i) {  // block padding (never read)
+            for (uint32_t i = 2 * ct; i < 2 * CTM; ++i) {  // block padding (never read)
                 fill_tile_init();
                 fill_tile(i, 0.0f);
             }
             done();
-            for (uint32_t i = 0; i < 2 * MT; ++i) pack_to(i, c_Y);
+            for (uint32_t i = 0; i < 2 * CTM; ++i) pack_to(i, c_Y);
             tile_regs_release();
-            cb_pop_front(c_D, 36 * MT);
+            cb_pop_front(c_D, 36 * CTM);
         }
         // scatter-add the batch's Y rows to the token rows
         tile_regs_acquire();  // dst 2m + nn: output tile nn of row tile m
@@ -159,14 +161,14 @@ void kernel_main() {
         matmul_init(c_PS, c_Y, 0);
         for (uint32_t jj = 0; jj < n; ++jj) {
             const uint32_t ct = (read_tile_value(c_CTL, 0, 1 + j0 + jj) + 31) / 32;
-            cb_wait_front(c_PS, MT * MT);
-            cb_wait_front(c_Y, 2 * MT);
+            cb_wait_front(c_PS, MT * CTM);
+            cb_wait_front(c_Y, 2 * CTM);
             for (uint32_t m = 0; m < MT; ++m)
                 for (uint32_t mi = 0; mi < ct; ++mi)
                     for (uint32_t nn = 0; nn < 2; ++nn)
-                        matmul_tiles(c_PS, c_Y, m * MT + mi, 2 * mi + nn, 2 * m + nn);
-            cb_pop_front(c_PS, MT * MT);
-            cb_pop_front(c_Y, 2 * MT);
+                        matmul_tiles(c_PS, c_Y, m * CTM + mi, 2 * mi + nn, 2 * m + nn);
+            cb_pop_front(c_PS, MT * CTM);
+            cb_pop_front(c_Y, 2 * CTM);
         }
         done();
         const uint32_t out = (b + 1 == nbatch) ? c_O : c_ACC;

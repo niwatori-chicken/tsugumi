@@ -8,7 +8,7 @@
 // CB 0 X (72 MT), 1 W (weight ring), 2 D (2 x 36 MT), 6 ROUTE (4 MT), 7 scratch, 11 U for the writer, 12 counts,
 // 14 WC, 17 LISTS, 13 SHARE (base address only).
 // Semaphores: 0 ARRIVE (core 0), 1 GO (number of batches released).
-// CT: 0 B, 1 NBUF, 2 MAXF, 3 MT, accessors X, ROUTE, USED (row-major bf16 [1,1,1,128]: max routing weight per expert).
+// CT: 0 B, 1 NBUF, 2 MAXF, 3 MT, 4 X tile bytes, accessors X (bf16 or bfp8), ROUTE, USED (row-major bf16 [1,1,1,128]: max routing weight per expert).
 // RT: 0 x, 1 route, 2 used, 3 gu base, 4 dn base, 5 c, 6 page bytes, 7 NB, 8 ncores, 9.. NoC (x, y) of each core
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -18,6 +18,9 @@
 
 constexpr uint32_t B = get_compile_time_arg_val(0), NBUF = get_compile_time_arg_val(1), MAXF = get_compile_time_arg_val(2);
 constexpr uint32_t MT = get_compile_time_arg_val(3);  // row tiles (32 tokens each)
+constexpr uint32_t PX = get_compile_time_arg_val(4);  // bytes per X tile (bf16 2048, bfp8 1088)
+// compact tiles per entry: an expert with more than 32 CTM tokens is split into several entries (CB blocks stay small)
+constexpr uint32_t CTM = MT < 2 ? MT : 2;
 constexpr uint32_t E = 128, KT = 72, IT = 36;
 
 FORCE_INLINE uint32_t elem_off(uint32_t r, uint32_t c) {
@@ -53,7 +56,7 @@ struct Ring {
 };
 
 void kernel_main() {
-    constexpr auto aX = TensorAccessorArgs<4>();
+    constexpr auto aX = TensorAccessorArgs<5>();
     constexpr auto aR = TensorAccessorArgs<aX.next_compile_time_args_offset()>();
     constexpr auto aU = TensorAccessorArgs<aR.next_compile_time_args_offset()>();
     const auto sX = TensorAccessor(aX, get_arg_val<uint32_t>(0));
@@ -72,31 +75,43 @@ void kernel_main() {
     cr.reserve_back(4 * MT);
     for (uint32_t j = 0; j < 4 * MT; ++j) noc.async_read(sR, cr, TB, {.page_id = j}, {.offset_bytes = j * TB});
     cx.reserve_back(KT * MT);  // tile (m, kt) at m * KT + kt (row-major tiles of [T, H])
-    for (uint32_t j = 0; j < KT * MT; ++j) noc.async_read(sX, cx, TB, {.page_id = j}, {.offset_bytes = j * TB});
+    for (uint32_t j = 0; j < KT * MT; ++j) noc.async_read(sX, cx, PX, {.page_id = j}, {.offset_bytes = j * PX});
     noc.async_read_barrier();
     cx.push_back(KT * MT);
     // used experts
     volatile tt_l1_ptr uint16_t* used = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(sb);
-    uint32_t ue[E], U = 0;
+    uint32_t nu = 0;
+    uint8_t ue[E];
     for (uint32_t e = 0; e < E; ++e)
-        if (used[e] & 0x7FFF) ue[U++] = e;
+        if (used[e] & 0x7FFF) ue[nu++] = e;
     volatile tt_l1_ptr uint16_t* route = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(cr.get_write_ptr());
-    // token lists: LISTS = per used expert j: [n_j, t_0 .. t_{n-1}] at j * (T + 1) bytes
-    constexpr uint32_t T = 32 * MT, LS = T + 1;
+    // entries: (expert, up to 32 CTM of its tokens); LISTS = per entry j: [n_j, t_0 .. t_{n-1}] at j * LS bytes
+    constexpr uint32_t T = 32 * MT, LS = 32 * CTM + 1, NE = E * MT / CTM;
+    uint8_t ee[NE];  // expert of each entry
+    uint32_t U = 0;
     CircularBuffer cctw(11), cls(17);
     cls.reserve_back(1);
     volatile tt_l1_ptr uint8_t* lists = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(cls.get_write_ptr());
     cctl.reserve_back(1);
     volatile tt_l1_ptr uint32_t* ctl = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cctl.get_write_ptr());
-    ctl[0] = U;
-    for (uint32_t j = 0; j < U; ++j) {
-        const uint32_t e = ue[j];
+    for (uint32_t i = 0; i < nu; ++i) {
+        const uint32_t e = ue[i];
         uint32_t n = 0;
-        for (uint32_t t = 0; t < T; ++t)
-            if (route[((t >> 5) * 4 + (e >> 5)) * 1024 + elem_off(t & 31, e & 31)] & 0x7FFF) lists[j * LS + 1 + n++] = t;
-        lists[j * LS] = n;
-        ctl[1 + j] = n;
+        for (uint32_t t = 0; t < T; ++t) {
+            if (!(route[((t >> 5) * 4 + (e >> 5)) * 1024 + elem_off(t & 31, e & 31)] & 0x7FFF)) continue;
+            if (n == 32 * CTM) {  // entry full: the expert's next entry
+                lists[U * LS] = n;
+                ctl[1 + U] = n;
+                ee[U++] = e;
+                n = 0;
+            }
+            lists[U * LS + 1 + n++] = t;
+        }
+        lists[U * LS] = n;
+        ctl[1 + U] = n;
+        ee[U++] = e;
     }
+    ctl[0] = U;
     cctl.push_back(1);
     cls.push_back(1);
     cctw.reserve_back(1);
@@ -110,10 +125,10 @@ void kernel_main() {
     for (uint32_t b = 0; b < nbatch; ++b) {
         const uint32_t j0 = b * NB, j1 = (j0 + NB < U) ? j0 + NB : U;
         for (uint32_t j = j0; j < j1; ++j) {
-            const uint32_t e = ue[j];
+            const uint32_t e = ee[j];
             const uint32_t n = lists[j * LS], ct = (n + 31) / 32;
-            // fixed MT-tile blocks (variable blocks could wrap around a CB's end): ct tiles used
-            cwc.reserve_back(MT);  // compact: column 0 row r = routing weight of token L[r] (0 beyond n)
+            // fixed CTM-tile blocks (variable blocks could wrap around a CB's end): ct tiles used
+            cwc.reserve_back(CTM);  // compact: column 0 row r = routing weight of token L[r] (0 beyond n)
             volatile tt_l1_ptr uint16_t* wc = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(cwc.get_write_ptr());
             for (uint32_t r = 0; r < 32 * ct; ++r) {
                 uint16_t v = 0;
@@ -123,7 +138,7 @@ void kernel_main() {
                 }
                 wc[(r >> 5) * 1024 + elem_off(r & 31, 0)] = v;
             }
-            cwc.push_back(MT);
+            cwc.push_back(CTM);
             for (uint32_t hh = 0; hh < 2; ++hh) {
                 const uint32_t h = hh ^ first;
                 const uint32_t base = gu + (e * 9 + slot) * 72 * pb;
@@ -131,7 +146,7 @@ void kernel_main() {
             }
         }
         ring.flush();  // the compute needs the whole batch's gate_up before the barrier
-        const uint32_t base0 = dn + (ue[j0] * 9 + slot) * 36 * pb;
+        const uint32_t base0 = dn + (ee[j0] * 9 + slot) * 36 * pb;
         for (uint32_t g = 0; g < MAXF - 1 && g < 36 / B; ++g) ring.issue(c % 4 + 4 * first, base0 + g * B * pb);
         if (c == 0) {  // coordinator: release batch b once every core's writer arrived
             noc_semaphore_wait_min(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(0)), ncores * (b + 1));
@@ -143,17 +158,17 @@ void kernel_main() {
         }
         noc_semaphore_wait_min(go, b + 1);
         for (uint32_t j = j0; j < j1; ++j) {
-            const uint32_t e = ue[j];
+            const uint32_t e = ee[j];
             const uint32_t ct = (lists[j * LS] + 31) / 32;
-            const uint32_t sa = share + ((b % 2) * NB + (j - j0)) * MT * TB;  // this expert's act tiles, every core
-            cd.reserve_back(IT * MT);  // compact tile (m, kt) at m * IT + kt; m < ct read (fixed IT x MT blocks)
+            const uint32_t sa = share + ((b % 2) * NB + (j - j0)) * CTM * TB;  // this entry's act tiles, every core
+            cd.reserve_back(IT * CTM);  // compact tile (m, kt) at m * IT + kt; m < ct read (fixed IT x CTM blocks)
             const uint32_t dl = cd.get_write_ptr();
             for (uint32_t kt = 0; kt < IT && !(g_dbg & 4); ++kt)
                 for (uint32_t m = 0; m < ct; ++m)
                     noc_async_read(get_noc_addr(get_arg_val<uint32_t>(9 + 2 * kt), get_arg_val<uint32_t>(10 + 2 * kt),
                                                 sa + m * TB), dl + (m * IT + kt) * TB, TB);
             noc_async_read_barrier();
-            cd.push_back(IT * MT);
+            cd.push_back(IT * CTM);
             for (uint32_t hh = 0; hh < 2; ++hh) {
                 const uint32_t h = hh ^ first;
                 const uint32_t base = dn + (e * 9 + slot) * 36 * pb;
