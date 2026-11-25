@@ -110,12 +110,20 @@ class DecodeLinear:
         self.ck = compute_cfg(fidelity)
 
     def __call__(self, x, out_mem=ttnn.L1_MEMORY_CONFIG, dtype=ttnn.bfloat16):
-        """x: [1,1,32,K] tile layout, any memory config. Returns [1,1,32,Np] in out_mem."""
-        xs = x if x.memory_config() == self.xmem else ttnn.to_memory_config(x, self.xmem)
+        """x: [1,1,M,K] tile layout, any memory config. Returns [1,1,M,Np] in out_mem. M = 32; a multiple of 32 runs
+        as 32-row pieces (the DRAM-sharded matmul takes one tile row) concatenated in out_mem."""
+        m = x.shape[-2]
+        if m > TILE:
+            assert m % TILE == 0 and out_mem is not None
+            parts = [self(ttnn.slice(x, (0, 0, r, 0), (1, 1, r + TILE, self.K), memory_config=ttnn.L1_MEMORY_CONFIG),
+                          out_mem, dtype) for r in range(0, m, TILE)]
+            return ttnn.concat(parts, dim=-2, memory_config=out_mem)
+        xmem, pc = self.xmem, self.pc
+        xs = x if x.memory_config() == xmem else ttnn.to_memory_config(x, xmem)
         y = ttnn.linear(
             xs,
             self.w,
-            program_config=self.pc,
+            program_config=pc,
             compute_kernel_config=self.ck,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             dtype=dtype,

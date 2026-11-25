@@ -34,6 +34,7 @@ from .moe_kernel import InkMoE
 from .gate_kernel import InkGate, InkGate1
 from .route_kernel import InkRoute, InkRouter
 from .config import InklingConfig
+from .prefill import T as PT
 from .prefill import PrefillMixin
 from .convert import convert_layer, expert_dtype, expert_files
 from .weights import Checkpoint
@@ -61,12 +62,13 @@ class Engine(PrefillMixin):
         W = c.window
         assert max_seq % W == 0, f"max_seq must be a multiple of {W}"
         self.max_seq = max_seq
-        # ring KV of the sliding layers: R = W + 32 slots (a 32-token prefill chunk is written before its
+        # ring KV of the sliding layers: R = W + PT slots (a PT-token prefill chunk is written before its
         # attention; the positions it evicts are older than any of its tokens' windows), then a sink slot (K = V = 0;
         # the prefill attention puts the per-token sink logits into the mask there) and a scratch slot (padding rows of
         # a chunk write there), padded to RA = 9 x 128. Full layers: max_seq + one block of W (sink at max_seq,
         # scratch at max_seq + 1).
-        self.R, self.RA, self.SA = W + 32, 9 * 128, max_seq + W
+        self.R, self.RA, self.SA = W + PT, 9 * 128, max_seq + W  # PT: prefill chunk (32 or 64)
+        assert self.R + 2 <= self.RA
         self.wdtype = wdtype
         self.moek = None  # InkMoE (created with the first bfp8 / bfp4 expert layer)
         self.moeks = {}  # per weight format

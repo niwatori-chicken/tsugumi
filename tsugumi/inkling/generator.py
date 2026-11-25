@@ -7,7 +7,11 @@ the state is reset.
 """
 import time
 
-PREFILL_MIN = 6  # shorter prompt remainders go one token per decode step (a 32-row step costs ~5 decode steps)
+from .prefill import T as _PT
+
+# shorter prompt remainders go one token per decode step (a 32-row prefill step costs ~5 decode steps, a 64-row
+# one ~9)
+PREFILL_MIN = 6 if _PT == 32 else 10
 
 
 def _greedy(vals, ids):
@@ -53,7 +57,7 @@ class InklingGenerator:
         start = self._prepare(ids, stats)
         stats["reused"] = start
         todo = ids[start:]
-        if getattr(e, "has_prefill", False) and len(todo) >= PREFILL_MIN:  # 32 tokens per step
+        if getattr(e, "has_prefill", False) and len(todo) >= PREFILL_MIN:  # T tokens per step
             self.last = e.prefill(todo, logits=True, progress=self.progress)
             self.seq += todo
         else:

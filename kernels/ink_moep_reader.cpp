@@ -1,4 +1,4 @@
-// Inkling prefill MoE (32 token rows) on the bank-contiguous expert layout (ink_moe_reorder.cpp) — reader.
+// Inkling prefill MoE (MT x 32 token rows) on the bank-contiguous expert layout (ink_moe_reorder.cpp) — reader.
 // Same cores and weight streams as ink_moe_reader.cpp (core c: act column tile c, output tiles 2c, 2c + 1), but
 // for every USED expert (any token routed to it), in batches of NB experts:
 //   gate_up weights of the batch; then, after the batch barrier, per expert the 36 act tiles (32 token rows,
@@ -7,7 +7,7 @@
 //    [32 tokens, 128 experts]), 7 scratch, 11 / 12 number of used experts for the writer / compute, 14 WC (per expert:
 //    column 0 = the 32 tokens' routing weights), 13 SHARE (not touched here: its base address on every core).
 // Semaphores: 0 ARRIVE (core 0), 1 GO (number of batches released).
-// CT: 0 B, 1 NBUF, 2 MAXF, accessors X, ROUTE, USED (row-major bf16 [1,1,1,128]: max routing weight per expert).
+// CT: 0 B, 1 NBUF, 2 MAXF, 3 MT, accessors X, ROUTE, USED (row-major bf16 [1,1,1,128]: max routing weight per expert).
 // RT: 0 x, 1 route, 2 used, 3 gu base, 4 dn base, 5 c, 6 page bytes, 7 NB, 8 ncores, 9.. NoC (x, y) of each core
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -16,6 +16,7 @@
 #include "api/tensor/noc_traits.h"
 
 constexpr uint32_t B = get_compile_time_arg_val(0), NBUF = get_compile_time_arg_val(1), MAXF = get_compile_time_arg_val(2);
+constexpr uint32_t MT = get_compile_time_arg_val(3);  // row tiles (32 tokens each)
 constexpr uint32_t E = 128, KT = 72, IT = 36;
 
 FORCE_INLINE uint32_t elem_off(uint32_t r, uint32_t c) {
@@ -47,7 +48,7 @@ struct Ring {
 };
 
 void kernel_main() {
-    constexpr auto aX = TensorAccessorArgs<3>();
+    constexpr auto aX = TensorAccessorArgs<4>();
     constexpr auto aR = TensorAccessorArgs<aX.next_compile_time_args_offset()>();
     constexpr auto aU = TensorAccessorArgs<aR.next_compile_time_args_offset()>();
     const auto sX = TensorAccessor(aX, get_arg_val<uint32_t>(0));
@@ -62,12 +63,12 @@ void kernel_main() {
     csc.reserve_back(1);
     const uint32_t sb = csc.get_write_ptr();
     noc.async_read(sU, csc, E * 2, {.page_id = 0}, {.offset_bytes = 0});
-    cr.reserve_back(4);
-    for (uint32_t j = 0; j < 4; ++j) noc.async_read(sR, cr, TB, {.page_id = j}, {.offset_bytes = j * TB});
-    cx.reserve_back(KT);
-    for (uint32_t j = 0; j < KT; ++j) noc.async_read(sX, cx, TB, {.page_id = j}, {.offset_bytes = j * TB});
+    cr.reserve_back(4 * MT);
+    for (uint32_t j = 0; j < 4 * MT; ++j) noc.async_read(sR, cr, TB, {.page_id = j}, {.offset_bytes = j * TB});
+    cx.reserve_back(KT * MT);  // tile (m, kt) at m * KT + kt (row-major tiles of [T, H])
+    for (uint32_t j = 0; j < KT * MT; ++j) noc.async_read(sX, cx, TB, {.page_id = j}, {.offset_bytes = j * TB});
     noc.async_read_barrier();
-    cx.push_back(KT);
+    cx.push_back(KT * MT);
     // used experts
     volatile tt_l1_ptr uint16_t* used = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(sb);
     uint32_t ue[E], U = 0;
@@ -90,10 +91,12 @@ void kernel_main() {
         const uint32_t j0 = b * NB, j1 = (j0 + NB < U) ? j0 + NB : U;
         for (uint32_t j = j0; j < j1; ++j) {
             const uint32_t e = ue[j];
-            cwc.reserve_back(1);  // column 0 = routing weights of the 32 tokens (other columns unused)
+            cwc.reserve_back(MT);  // per row tile: column 0 = routing weights of its 32 tokens (other columns unused)
             volatile tt_l1_ptr uint16_t* wc = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(cwc.get_write_ptr());
-            for (uint32_t t = 0; t < 32; ++t) wc[elem_off(t, 0)] = route[(e >> 5) * 1024 + elem_off(t, e & 31)];
-            cwc.push_back(1);
+            for (uint32_t m = 0; m < MT; ++m)
+                for (uint32_t t = 0; t < 32; ++t)
+                    wc[m * 1024 + elem_off(t, 0)] = route[(m * 4 + (e >> 5)) * 1024 + elem_off(t, e & 31)];
+            cwc.push_back(MT);
             for (uint32_t hh = 0; hh < 2; ++hh) {
                 const uint32_t h = hh ^ first;
                 const uint32_t base = gu + (e * 9 + slot) * 72 * pb;
@@ -114,14 +117,15 @@ void kernel_main() {
         noc_semaphore_wait_min(go, b + 1);
         for (uint32_t j = j0; j < j1; ++j) {
             const uint32_t e = ue[j];
-            const uint32_t sa = share + ((b % 2) * NB + (j - j0)) * TB;  // this expert's act tile on every core
-            cd.reserve_back(IT);
+            const uint32_t sa = share + ((b % 2) * NB + (j - j0)) * MT * TB;  // this expert's act tiles, every core
+            cd.reserve_back(IT * MT);  // tile (m, kt) at m * IT + kt
             const uint32_t dl = cd.get_write_ptr();
             for (uint32_t kt = 0; kt < IT; ++kt)
-                noc_async_read(get_noc_addr(get_arg_val<uint32_t>(9 + 2 * kt), get_arg_val<uint32_t>(10 + 2 * kt), sa),
-                               dl + kt * TB, TB);
+                for (uint32_t m = 0; m < MT; ++m)
+                    noc_async_read(get_noc_addr(get_arg_val<uint32_t>(9 + 2 * kt), get_arg_val<uint32_t>(10 + 2 * kt),
+                                                sa + m * TB), dl + (m * IT + kt) * TB, TB);
             noc_async_read_barrier();
-            cd.push_back(IT);
+            cd.push_back(IT * MT);
             for (uint32_t hh = 0; hh < 2; ++hh) {
                 const uint32_t h = hh ^ first;
                 const uint32_t base = dn + (e * 9 + slot) * 36 * pb;
