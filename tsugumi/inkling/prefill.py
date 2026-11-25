@@ -61,6 +61,26 @@ class PrefillMixin:
         ars[:self.max_seq] = torch.arange(self.max_seq).float()
         ars[self.max_seq] = -1e7
         self.P_ARS = self.tt(ars.view(1, 1, 1, SA), ttnn.float32)
+        # context buckets for the full layers' prefill attention: a chunk whose positions are all below S_b attends to
+        # cache slots [0, S_b) + 32 zero K / V rows (the sink at column S_b) instead of all max_seq + W slots; one
+        # trace per bucket (TSUGUMI_INKLING_PREFILL_BUCKETS, comma separated, multiples of the window; "" = off)
+        W = c.window
+        bl = env("INKLING_PREFILL_BUCKETS", "4096,8192,16384")
+        self.p_buckets = [b for b in (int(x) for x in bl.split(",") if x) if b < self.max_seq]
+        assert all(b % W == 0 and b >= T for b in self.p_buckets)
+        self.p_bucket = None
+        self.P_ARS_B, self.P_ES_B = {}, {}
+        for b in self.p_buckets:
+            a_ = torch.full((b + 32,), 1e7)
+            a_[:b] = torch.arange(b).float()
+            a_[b] = -1e7
+            self.P_ARS_B[b] = self.tt(a_.view(1, 1, 1, b + 32), ttnn.float32)
+            e_ = torch.zeros(1, 1, 32, b + 32)
+            e_[0, 0, 0, b] = 1.0
+            self.P_ES_B[b] = self.tt(e_)
+        self.P_KZ = ttnn.from_torch(torch.zeros(1, NKV, 32, HD), dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT,
+                                    device=self.dev, memory_config=DRAM)
+        self.P_RZ = self.tt(torch.zeros(1, c.n_heads, T, 32), mem=DRAM)
         # dynamic conv: D[lag][t, c] = dyn[t, head(c) * 4 + lag] / sqrt(2k + 1)
         el = torch.zeros(1, k, 32, NKV * HD)
         for lag in range(k):
@@ -192,6 +212,7 @@ class PrefillMixin:
             self.kvw_ring(k, v, st["kc"], st["vc"], self.P_POSR, self.P_PT0)
         else:
             self.kvw_full(k, v, st["kc"], st["vc"], self.P_POSF, self.P_PT0)
+        kc, vc = st["kc"], st["vc"]
         # mask [1, NH, T, S] (units of 1 / scale)
         rel = self.mm(r, d["p_proj"])  # [1, NH, T, R or W] by distance
         if sliding:
@@ -200,16 +221,27 @@ class PrefillMixin:
             mask = ttnn.add(mask, self.mm(sink, self.P_ER), memory_config=DRAM)
         else:
             rel = ttnn.gather(rel, -1, index=pc["IDXF"], memory_config=DRAM)  # [1, NH, T, W] by position % W
-            rep = ttnn.repeat(rel, (1, 1, 1, self.SA // c.window), memory_config=DRAM)
+            b = self.p_bucket
+            if b is None:
+                rep = ttnn.repeat(rel, (1, 1, 1, self.SA // c.window), memory_config=DRAM)
+                es = self.P_ES
+            else:  # slots [0, b) + 32 (sink at b)
+                rep = ttnn.concat([ttnn.repeat(rel, (1, 1, 1, b // c.window), memory_config=DRAM), self.P_RZ], dim=-1,
+                                  memory_config=DRAM)
+                es = self.P_ES_B[b]
+                kc = ttnn.concat([ttnn.slice(kc, (0, 0, 0, 0), (1, NKV, b, HD), memory_config=DRAM), self.P_KZ],
+                                 dim=-2, memory_config=DRAM)
+                vc = ttnn.concat([ttnn.slice(vc, (0, 0, 0, 0), (1, NKV, b, HD), memory_config=DRAM), self.P_KZ],
+                                 dim=-2, memory_config=DRAM)
             mask = ttnn.add(ttnn.multiply(rep, pc["BWIN"], memory_config=DRAM), pc["AV"], memory_config=DRAM)
-            mask = ttnn.add(mask, self.mm(sink, self.P_ES, memory_config=DRAM), memory_config=DRAM)
+            mask = ttnn.add(mask, self.mm(sink, es, memory_config=DRAM), memory_config=DRAM)
         S = mask.shape[-1]
         mask = ttnn.reshape(mask, (1, NKV, (NH // NKV) * T, S))
         qg = ttnn.reshape(ttnn.permute(q, (0, 2, 1, 3), memory_config=L1), (1, NKV, (NH // NKV) * T, HD))
-        s = self.mm(qg, st["kc"], transpose_b=True, memory_config=DRAM)  # [1, NKV, 96, S]
+        s = self.mm(qg, kc, transpose_b=True, memory_config=DRAM)  # [1, NKV, 3T, S]
         s = ttnn.multiply(ttnn.add(s, mask, memory_config=DRAM), self.scale, memory_config=DRAM)
         p = ttnn.softmax(s, dim=-1, memory_config=DRAM, numeric_stable=True)
-        o = self.mm(p, st["vc"], memory_config=L1)  # [1, NKV, 96, HD]
+        o = self.mm(p, vc, memory_config=L1)  # [1, NKV, 3T, HD]
         o = ttnn.permute(ttnn.reshape(o, (1, NH, T, HD)), (0, 2, 1, 3), memory_config=L1)  # [1, T, NH, HD]
         o = ttnn.multiply(o, gate, input_tensor_b_activations=[UWP(U.SIGMOID)], memory_config=L1)
         return d["Lo"](ttnn.reshape(o, (1, 1, T, NH * HD)), out_mem=L1)
@@ -312,7 +344,8 @@ class PrefillMixin:
                            memory_config=L1)  # (P_t - s') mod W
         df = ttnn.clamp(df, min=0.0, max=float(W - 1), memory_config=L1)
         pc["IDXF"] = ttnn.repeat(ttnn.typecast(df, ttnn.uint32), (1, c.n_heads, 1, 1), memory_config=DRAM)
-        dp = ttnn.sub(self.P_PCOL, self.P_ARS, memory_config=DRAM)  # P_t - p, [1,1,T,SA]
+        ars = self.P_ARS if self.p_bucket is None else self.P_ARS_B[self.p_bucket]
+        dp = ttnn.sub(self.P_PCOL, ars, memory_config=DRAM)  # P_t - p, [1,1,T,SA or bucket + 32]
         win = ttnn.multiply(ttnn.ge(dp, 0.0, memory_config=DRAM), ttnn.lt(dp, float(W), memory_config=DRAM),
                             memory_config=DRAM)
         pc["BWIN"] = ttnn.typecast(win, ttnn.bfloat16)
@@ -388,7 +421,8 @@ class PrefillMixin:
             if self.pos + len(chunk) > self.max_seq:
                 raise RuntimeError(f"context full ({self.max_seq} tokens)")
             self.p_write_inputs(chunk, self.pos)
-            key = ("prefill", want)
+            self.p_bucket = next((b for b in self.p_buckets if self.pos + T <= b), None)
+            key = ("prefill", True, self.p_bucket)  # traced with the lm_head only (see Engine.capture)
             if traced and key in self.traces:
                 tid, o = self.traces[key]
                 ttnn.execute_trace(self.dev, tid, cq_id=0, blocking=False)

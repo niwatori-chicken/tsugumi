@@ -851,28 +851,33 @@ class Engine(PrefillMixin):
         run once (compile) before the first capture: an op's program-owned device buffers (created when it is
         first compiled) must not be allocated while a trace exists, or they can land in that trace's scratch
         memory and be overwritten when it replays (seen as a hang of the other trace)."""
-        variants = [("decode", True), ("decode", False)]
-        if self.has_prefill:
-            variants += [("prefill", True), ("prefill", False)]
+        variants = [("decode", True, None), ("decode", False, None)]
+        if self.has_prefill:  # one pair per context bucket of the prefill attention (None: the whole cache)
+            # with the lm_head only (~2 ms of a 64-token step): a no-logits copy per bucket would double the trace memory
+            variants += [("prefill", True, b) for b in [None] + self.p_buckets]
 
         def inputs(kind):
             self.write_inputs(0, 0) if kind == "decode" else self.p_write_inputs([0], 0)
 
-        def run(kind, logits):
-            return self.forward(logits) if kind == "decode" else self.p_forward(logits)
+        def run(kind, logits, b):
+            if kind == "decode":
+                return self.forward(logits)
+            self.p_bucket = b
+            return self.p_forward(logits)
 
-        for kind, logits in variants:
+        for kind, logits, b in variants:
             inputs(kind)
-            run(kind, logits)
+            run(kind, logits, b)
         ttnn.synchronize_device(self.dev)
-        for kind, logits in variants:
+        for kind, logits, b in variants:
             inputs(kind)
             ttnn.synchronize_device(self.dev)
             tid = ttnn.begin_trace_capture(self.dev, cq_id=0)
-            out = run(kind, logits)
+            out = run(kind, logits, b)
             ttnn.end_trace_capture(self.dev, tid, cq_id=0)
             ttnn.synchronize_device(self.dev)
-            self.traces[logits if kind == "decode" else ("prefill", logits)] = (tid, out)
+            self.traces[logits if kind == "decode" else ("prefill", logits, b)] = (tid, out)
+        self.p_bucket = None
         self.reset()
 
     def step(self, token, logits=True, traced=True):

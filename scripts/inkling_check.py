@@ -52,7 +52,7 @@ def main():
     else:
         ids = tok.encode(a.prompt, add_special_tokens=False)
     print(f"{len(ids)} prompt tokens")
-    dev = ttnn.open_device(device_id=0, l1_small_size=24576, trace_region_size=256 << 20)
+    dev = ttnn.open_device(device_id=0, l1_small_size=24576, trace_region_size=512 << 20)
     try:
         eng = Engine(dev, MODEL, CACHE, max_seq=a.max_seq)
         if a.traced:
