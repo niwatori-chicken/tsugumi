@@ -20,7 +20,7 @@ import ttnn
 
 from ..env import env
 from ..kv_kernel import KVWriteKernel, KVWriteRows
-from .relshift import RelShift
+from .relshift import MaskBuilder
 
 L1 = ttnn.L1_MEMORY_CONFIG
 DRAM = ttnn.DRAM_MEMORY_CONFIG
@@ -113,7 +113,7 @@ class PrefillMixin:
         self.P_PT0 = ttnn.from_torch(torch.zeros(1, 8, dtype=torch.int32), dtype=ttnn.int32, device=self.dev)
         # [p0 % R, p0 % W]: the relative bias shift (kernels/ink_relshift.cpp)
         self.P_BASE = ttnn.from_torch(torch.zeros(1, 8, dtype=torch.int32), dtype=ttnn.int32, device=self.dev)
-        self.relshift = RelShift(self.dev)
+        self.maskb = MaskBuilder(self.dev)
         self.P_C0 = self.tt(torch.zeros(1, 1, 1, 1), ttnn.float32)  # p0 % R
         self.P_THR = self.tt(torch.zeros(1, 1, T, 1), ttnn.float32)  # min(P_t, W - 1)
         self.P_PCOL = self.tt(torch.zeros(1, 1, T, 1), ttnn.float32)  # P_t
@@ -270,33 +270,19 @@ class PrefillMixin:
         # mask [1, NH, rows, S] (units of 1 / scale)
         rel = self.mm(r, d["p_proj"])  # [1, NH, T, R or W] by distance
         if sliding:
-            rel = self.relshift(rel, self.P_BASE, 0, self.RA, mod=self.R)  # [1, NH, T, RA] by slot
-            mask = ttnn.add(rel, pc["VR"], memory_config=DRAM)
-            mask = ttnn.add(mask, self.mm(sink, self.P_ER), memory_config=DRAM)
-            blocks = [(0, T, mask)]
+            # [1, NH, T, RA] by ring slot (kernels/ink_mask.cpp: bias / validity / sink by selection)
+            blocks = [(0, T, self.maskb(rel, sink, self.P_BASE, 0, self.RA, c.window, self.R, M=self.R))]
         else:
             b = self.p_bucket
-            if b is None:
-                es = self.P_ES
-            else:  # slots [0, b) + 32 (sink at b)
-                es = self.P_ES_B[b]
+            if b is not None:  # slots [0, b) + 32 (sink at b)
                 kc = ttnn.concat([ttnn.slice(kc, (0, 0, 0, 0), (1, NKV, b, HD), memory_config=DRAM), self.P_KZ],
                                  dim=-2, memory_config=DRAM)
                 vc = ttnn.concat([ttnn.slice(vc, (0, 0, 0, 0), (1, NKV, b, HD), memory_config=DRAM), self.P_KZ],
                                  dim=-2, memory_config=DRAM)
             blocks = []
-            for i, i0 in enumerate(range(0, T, TS)):  # query rows i0 .. i0 + TS
-                rows = lambda t: ttnn.slice(t, (0, 0, i0, 0), (1, t.shape[1], i0 + TS, t.shape[-1]),
-                                            memory_config=DRAM) if TS < T else t
-                rl = self.relshift(rel, self.P_BASE, 1, c.window, m0=i0 // 32, rows=TS, mod=c.window)  # by p % W
-                if b is None:
-                    rep = ttnn.repeat(rl, (1, 1, 1, self.SA // c.window), memory_config=DRAM)
-                else:
-                    rep = ttnn.concat([ttnn.repeat(rl, (1, 1, 1, b // c.window), memory_config=DRAM), self.P_RZ],
-                                      dim=-1, memory_config=DRAM)
-                mask = ttnn.add(ttnn.multiply(rep, pc["BWIN"][i], memory_config=DRAM), pc["AV"][i], memory_config=DRAM)
-                mask = ttnn.add(mask, self.mm(rows(sink), es, memory_config=DRAM), memory_config=DRAM)
-                blocks.append((i0, TS, mask))
+            S_, sc = (self.SA, self.max_seq) if b is None else (b + 32, b)  # cache columns, sink column
+            for i0 in range(0, T, TS):  # query rows i0 .. i0 + TS
+                blocks.append((i0, TS, self.maskb(rel, sink, self.P_BASE, 1, S_, c.window, sc, m0=i0 // 32, rows=TS)))
         os_ = []
         if ATT_STOP == "mask":
             return yq
@@ -404,30 +390,8 @@ class PrefillMixin:
         return ttnn.add(res, m, memory_config=PL), B
 
     def p_consts(self):
-        """Per-chunk mask inputs, from P_C0 (p0 % R), P_THR, P_PCOL."""
-        c = self.cfg
-        W, R = c.window, self.R
-        pc = {}
-        d0 = ttnn.neg(ttnn.sub(self.ARW, self.P_C0, memory_config=PL), memory_config=PL)  # (c0 - s), [1,1,1,RA]
-        d0 = ttnn.add(d0, ttnn.multiply(ttnn.lt(d0, 0.0, memory_config=PL), float(R), memory_config=PL),
-                      memory_config=PL)
-        dt = ttnn.add(d0, self.P_TCOL, memory_config=PL)  # [1,1,T,RA] distance of slot s from token t
-        dt = ttnn.subtract(dt, ttnn.multiply(ttnn.ge(dt, float(R), memory_config=PL), float(R), memory_config=PL),
-                           memory_config=PL)
-        valid = ttnn.le(dt, self.P_THR, memory_config=PL)
-        vr = ttnn.add(ttnn.multiply(ttnn.subtract(valid, 1.0, memory_config=PL), -NEG, memory_config=PL),
-                      self.P_SINKFIX, memory_config=PL)
-        pc["VR"] = ttnn.to_memory_config(ttnn.reshape(ttnn.typecast(vr, ttnn.bfloat16), (1, 1, T, self.RA)), DRAM)
-        blk = lambda t: [ttnn.slice(t, (0, 0, i0, 0), (1, t.shape[1], i0 + TS, t.shape[-1]), memory_config=DRAM)
-                         for i0 in range(0, T, TS)] if TS < T else [t]
-        ars = self.P_ARS if self.p_bucket is None else self.P_ARS_B[self.p_bucket]
-        dp = ttnn.sub(self.P_PCOL, ars, memory_config=DRAM)  # P_t - p, [1,1,T,SA or bucket + 32]
-        win = ttnn.multiply(ttnn.ge(dp, 0.0, memory_config=DRAM), ttnn.lt(dp, float(W), memory_config=DRAM),
-                            memory_config=DRAM)
-        pc["BWIN"] = blk(ttnn.typecast(win, ttnn.bfloat16))
-        pc["AV"] = blk(ttnn.typecast(ttnn.multiply(ttnn.lt(dp, 0.0, memory_config=DRAM), NEG, memory_config=DRAM),
-                                     ttnn.bfloat16))
-        return pc
+        """Per-chunk device inputs shared by the layers (the masks are built per layer by kernels/ink_mask.cpp)."""
+        return {}
 
     def p_forward(self, logits):
         self.mm_mem = PL
@@ -490,7 +454,7 @@ class PrefillMixin:
         put(self.P_POSF, torch.tensor(posf, dtype=torch.int32), ttnn.int32)
         put(self.P_C0, torch.full((1, 1, 1, 1), float(p0 % self.R)), ttnn.float32)
         bs = torch.zeros(1, 8, dtype=torch.int32)
-        bs[0, 0], bs[0, 1] = p0 % self.R, p0 % c.window
+        bs[0, 0], bs[0, 1], bs[0, 2] = p0 % self.R, p0 % c.window, p0
         put(self.P_BASE, bs, ttnn.int32)
         put(self.P_THR, torch.tensor([float(min(p, c.window - 1)) for p in P]).view(1, 1, T, 1), ttnn.float32)
         put(self.P_PCOL, torch.tensor([float(p) for p in P]).view(1, 1, T, 1), ttnn.float32)

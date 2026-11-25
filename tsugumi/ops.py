@@ -11,6 +11,7 @@ import torch
 import ttnn
 
 TILE = 32
+ROWS_LINEAR = os.environ.get("TSUGUMI_ROWS_LINEAR", "1") == "1"  # M > 128: 2D matmul (see DecodeLinear)
 
 
 def _in0_grid(k_tiles, max_cores=64, cores=None):
@@ -108,11 +109,18 @@ class DecodeLinear:
         if fidelity is None:
             fidelity = ttnn.MathFidelity.LoFi if dtype == ttnn.bfloat4_b else ttnn.MathFidelity.HiFi2
         self.ck = compute_cfg(fidelity)
+        self.ck_rows = compute_cfg(fidelity, fp32_acc=True)
 
     def __call__(self, x, out_mem=ttnn.L1_MEMORY_CONFIG, dtype=ttnn.bfloat16):
         """x: [1,1,M,K] tile layout, any memory config. Returns [1,1,M,Np] in out_mem. M = 32; a multiple of 32 runs
         as 32-row pieces (the DRAM-sharded matmul takes one tile row) concatenated in out_mem."""
         m = x.shape[-2]
+        if m > 4 * TILE and ROWS_LINEAR:  # many rows: one 2D matmul on an interleaved copy of the weight
+            assert out_mem is not None
+            w = ttnn.to_memory_config(self.w, ttnn.DRAM_MEMORY_CONFIG)
+            y = ttnn.linear(x, w, memory_config=out_mem, compute_kernel_config=self.ck_rows, dtype=dtype)
+            ttnn.deallocate(w)
+            return y
         if m > TILE:
             assert m % TILE == 0 and out_mem is not None
             parts = [self(ttnn.slice(x, (0, 0, r, 0), (1, 1, r + TILE, self.K), memory_config=ttnn.L1_MEMORY_CONFIG),
