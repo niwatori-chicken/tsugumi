@@ -32,14 +32,14 @@ void kernel_main() {
     const uint32_t c = get_arg_val<uint32_t>(1), cx = get_arg_val<uint32_t>(2), cy = get_arg_val<uint32_t>(3);
     const uint32_t NB = get_arg_val<uint32_t>(4), MT = get_arg_val<uint32_t>(5);
     constexpr uint32_t TB = 2048;
-    const uint32_t T = 32 * MT, LS = T + 1;
+    const uint32_t CTM = MT < 2 ? MT : 2, LS = 32 * CTM + 1;  // compact tiles per entry, list stride
     Noc noc;
     CircularBuffer cps(3), cg(4), cu(5), ccg(8), ccu(9), csh(13), co(16), cuu(11), cls(17);
     {  // compact tiles start finite (rows beyond n are never written)
         for (CircularBuffer* cb : {&ccg, &ccu}) {
-            cb->reserve_back(2 * MT);
+            cb->reserve_back(2 * CTM);
             volatile tt_l1_ptr uint32_t* z = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cb->get_write_ptr());
-            for (uint32_t i = 0; i < 2 * MT * 512; ++i) z[i] = 0;
+            for (uint32_t i = 0; i < 2 * CTM * 512; ++i) z[i] = 0;
         }
     }
     cuu.wait_front(1);
@@ -58,8 +58,8 @@ void kernel_main() {
             volatile tt_l1_ptr uint8_t* L = lists + j * LS + 1;
             cg.wait_front(MT);
             cu.wait_front(MT);
-            ccg.reserve_back(MT);  // fixed MT-tile blocks (ct used)
-            ccu.reserve_back(MT);
+            ccg.reserve_back(CTM);  // fixed CTM-tile blocks (ct used)
+            ccu.reserve_back(CTM);
             const uint32_t g = cg.get_read_ptr(), u = cu.get_read_ptr();
             const uint32_t dg = ccg.get_write_ptr(), du = ccu.get_write_ptr();
             for (uint32_t r = 0; r < cnt; ++r) {
@@ -67,28 +67,28 @@ void kernel_main() {
                 copy_row(dg + (r >> 5) * TB, r & 31, g + (t >> 5) * TB, t & 31);
                 copy_row(du + (r >> 5) * TB, r & 31, u + (t >> 5) * TB, t & 31);
             }
-            ccg.push_back(MT);
-            ccu.push_back(MT);
+            ccg.push_back(CTM);
+            ccu.push_back(CTM);
             cg.pop_front(MT);
             cu.pop_front(MT);
-            // placement tiles (m, mi) at m * MT + mi (fixed MT x MT blocks; mi < ct used)
-            cps.reserve_back(MT * MT);
+            // placement tiles (m, mi) at m * CTM + mi (fixed MT x CTM blocks; mi < ct used)
+            cps.reserve_back(MT * CTM);
             const uint32_t ps = cps.get_write_ptr();
             volatile tt_l1_ptr uint32_t* z = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ps);
             for (uint32_t m = 0; m < MT; ++m)
-                for (uint32_t i = 0; i < ct * 512; ++i) z[(m * MT) * 512 + i] = 0;
+                for (uint32_t i = 0; i < ct * 512; ++i) z[(m * CTM) * 512 + i] = 0;
             volatile tt_l1_ptr uint16_t* p = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(ps);
             for (uint32_t r = 0; r < cnt; ++r) {
                 const uint32_t t = L[r];
-                p[((t >> 5) * MT + (r >> 5)) * 1024 + elem_off(t & 31, r & 31)] = 0x3F80;  // 1.0
+                p[((t >> 5) * CTM + (r >> 5)) * 1024 + elem_off(t & 31, r & 31)] = 0x3F80;  // 1.0
             }
-            cps.push_back(MT * MT);
+            cps.push_back(MT * CTM);
         }
-        csh.wait_front(prev + n * MT);
+        csh.wait_front(prev + n * CTM);
         noc_semaphore_inc(arrive, 1);
         noc_semaphore_wait_min(go, b + 1);
         if (prev) csh.pop_front(prev);
-        prev = n * MT;
+        prev = n * CTM;
     }
     co.wait_front(2 * MT);
     for (uint32_t m = 0; m < MT; ++m)

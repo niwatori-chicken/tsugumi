@@ -209,8 +209,9 @@ export TSUGUMI_CACHE_DIR=/path/to/tsugumi_cache/inkling   # 変換済み重み (
   NVFP4 を bfp4 に詰め直すと重みの誤差が約 11% 増えるため (bfp8 なら 0.7%)、既定は bfp8 です。注意の重みと lm_head は bfp8、KV は bfp8。
   P150A (32GB) で DRAM 使用 26.8 GiB (`--max-seq 32768`)。mixed は P100A (28GB) 向けですが、P100A では未確認です。
 - 速度 (P150A、`--max-seq 32768`、計測は各 1〜数回): デコード **約 27 tok/s** (1 ステップ約 31ms。文脈 30k でも
-  ほぼ同じ)、prefill **約 250〜290 tok/s** (64 トークンずつ。4k で 14 秒、30k で 120 秒)、短いプロンプトの応答開始
-  約 0.3 秒。prefill の全注意層は文脈の長さに応じたバケット (4k / 8k / 16k / 全体、`TSUGUMI_INKLING_PREFILL_BUCKETS`)
+  ほぼ同じ)、prefill **約 290〜335 tok/s** (128 トークンずつ。4k で 12 秒、30k で 103 秒)、短いプロンプトの応答開始
+  約 0.4 秒 (`TSUGUMI_INKLING_PREFILL_T=64` なら長い prefill 250〜290 tok/s、短いプロンプト約 0.3 秒)。
+  prefill の MoE は各エキスパートに振られたトークンだけを詰めて計算します (`ink_moec_*`)。prefill の全注意層は文脈の長さに応じたバケット (4k / 8k / 16k / 全体、`TSUGUMI_INKLING_PREFILL_BUCKETS`)
   のトレースで、使っている範囲のキャッシュだけを相手にします。
   小さな op は自作カーネル (`kernels/ink_*.cpp`) にまとめています: 注意、q/r/k/v の前処理 (ヘッドごとに 16 コア)、
   ルーター (ロジットとルーティングを 1 プログラム)、メッセージゲート (1 プログラム)、conv + 残差、
@@ -301,7 +302,7 @@ export TSUGUMI_CACHE_DIR=/path/to/tsugumi_cache/inkling   # 変換済み重み (
 | `tsugumi/board.py` | ボードの温度・電力・ファン (`tt-smi -s` を定期的に読む、`/health` の `board`) |
 | `tsugumi/prefill.py`、`tsugumi/conv_kernel.py`、`tsugumi/page_copy.py` | 大きい T の prefill、因果 conv カーネル、ページコピー |
 | `kernels/*.cpp` | 自作カーネル (generic_op で起動) |
-| `tsugumi/inkling/` | Inkling 2 Mini: 設定 (`config.py`)、チェックポイントの読み込みと NVFP4 / MXFP8 の復号 (`weights.py`、`convert.py`)、CPU 参照実装 (`ref.py`)、デコード (`engine.py`)、32 トークンずつの prefill (`prefill.py`)、生成ループと会話の再利用 (`generator.py`)、チャット形式 (`chat.py`) |
+| `tsugumi/inkling/` | Inkling 2 Mini: 設定 (`config.py`)、チェックポイントの読み込みと NVFP4 / MXFP8 の復号 (`weights.py`、`convert.py`)、CPU 参照実装 (`ref.py`)、デコード (`engine.py`)、128 トークンずつの prefill (`prefill.py`)、生成ループと会話の再利用 (`generator.py`)、チャット形式 (`chat.py`) |
 | `server.py` | OpenAI 互換サーバー |
 | `run_server.sh` | サーバーの起動とハング後の自動復帰 (デバイスのリセット → 再起動) |
 | `debugging.md` | デバッグのためのヒント、および環境変数 |
