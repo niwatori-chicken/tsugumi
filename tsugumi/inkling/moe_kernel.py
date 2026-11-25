@@ -170,3 +170,46 @@ class InkMoE:
         ], semaphores=sems, cbs=self.pcbs(MT))
         ttnn.generic_op([x, route, used, gu, dn, out], prog)
         return out
+
+    def prefill_compact(self, x, route, used, gu, dn, out, dbg=0):
+        """As prefill, with each expert's routed tokens packed into compact row tiles (kernels/ink_moec_*): the act,
+        the act-tile exchange and the down projection run on ceil(n_e / 32) tiles instead of T / 32 (an expert
+        takes ~5 of 64 tokens), the rows go back to their tokens with 0/1 placement matmuls."""
+        cores = _cores(self.coords)
+        MT = x.shape[-2] // 32
+        assert x.shape[-2] == 32 * MT and 1 <= MT <= 2
+        bf, f32 = ttnn.bfloat16, ttnn.float32
+        NB, ring = self.NB, self.ring
+        ls = ((self.E * (32 * MT + 1) + 31) // 32) * 32
+        cbs = [_cbd(cores, 0, 72 * MT, bf), _cbd(cores, 1, ring[0] * ring[1], self.wdtype),
+               _cbd(cores, 2, 72 * MT, bf), _cbd(cores, 3, NB * MT * MT, bf), _cbd(cores, 4, 2 * MT, bf),
+               _cbd(cores, 5, 2 * MT, bf), _cbd(cores, 6, 4 * MT, bf), _cbd(cores, 7, 1, bf),
+               _cbd(cores, 8, 2 * MT, bf), _cbd(cores, 9, 2 * MT, bf), _cbd(cores, 10, 1, bf),
+               _cbd(cores, 11, 1, bf), _cbd(cores, 12, 1, bf), _cbd(cores, 13, 2 * NB * MT, bf),
+               _cbd(cores, 14, 3 * MT, bf), _cbd(cores, 15, 2 * MT, f32), _cbd(cores, 16, 2 * MT, bf),
+               ttnn.CBDescriptor(total_size=ls, core_ranges=cores, format_descriptors=[
+                   ttnn.CBFormatDescriptor(buffer_index=17, data_format=bf, page_size=ls)]),
+               _cbd(cores, 18, 2 * NB * MT, bf)]
+        Kd = lambda src, ct, rt, cfg: ttnn.KernelDescriptor(
+            kernel_source=os.path.join(KDIR, src), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores, compile_time_args=ct, runtime_args=rt, config=cfg)
+        r_ct = list(ring) + [MT]
+        for t in (x, route, used):
+            r_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
+        nocxy = [v for n in self.noc for v in (n.x, n.y)]
+        r_rt, c_rt, w_rt = [], [], []
+        for c, xy in enumerate(self.coords):
+            r_rt.append((xy, [x.buffer_address(), route.buffer_address(), used.buffer_address(), gu.buffer_address(),
+                              dn.buffer_address(), c, self.pb, NB, self.NC] + nocxy + [dbg]))
+            c_rt.append((xy, [fbits(1.0 / self.gc), fbits(1.0 / self.uc), (c // 4) % 2, NB, MT, dbg]))
+            w_rt.append((xy, [out.buffer_address(), c, self.noc[0].x, self.noc[0].y, NB, MT]))
+        sems = [ttnn.SemaphoreDescriptor(id=0, core_ranges=cores, initial_value=0),
+                ttnn.SemaphoreDescriptor(id=1, core_ranges=cores, initial_value=0)]
+        prog = ttnn.ProgramDescriptor(kernels=[
+            Kd("ink_moec_reader.cpp", r_ct, r_rt, ttnn.ReaderConfigDescriptor()),
+            Kd("ink_moec_writer.cpp", ttnn.TensorAccessorArgs(out).get_compile_time_args(), w_rt,
+               ttnn.WriterConfigDescriptor()),
+            Kd("ink_moec_compute.cpp", [], c_rt, self.ccfg),
+        ], semaphores=sems, cbs=cbs)
+        ttnn.generic_op([x, route, used, gu, dn, out], prog)
+        return out
