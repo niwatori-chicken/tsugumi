@@ -272,7 +272,7 @@ class LargePrefill:
     # ---------------- attention ----------------
     def _qkv_heads(self, A, h, T, cos, sin):
         NH, NKV, HD = A.NH, A.NKV, A.HD
-        y = self._mm(h, A.wqkvg, n=(2 * NH + 2 * NKV) * HD)
+        y = self._mm(h, A.wqkvg, n=False)  # padded N: q/k/v and the gate are sliced straight out of it
         qkv = ttnn.slice(y, (0, 0, 0, 0), (1, 1, T, (NH + 2 * NKV) * HD), memory_config=DRAM)
         gate = ttnn.slice(y, (0, 0, 0, (NH + 2 * NKV) * HD), (1, 1, T, (2 * NH + 2 * NKV) * HD), memory_config=DRAM)
         ttnn.deallocate(y)
