@@ -68,11 +68,14 @@ class Engine(PrefillMixin):
         # scratch at max_seq + 1).
         self.R, self.RA, self.SA = W + 32, 9 * 128, max_seq + W
         self.wdtype = wdtype
-        self.moek = None  # InkMoE (created with the first bfp8 expert layer)
+        self.moek = None  # InkMoE (created with the first bfp8 / bfp4 expert layer)
+        self.moeks = {}  # per weight format
         self.hi = _ck(ttnn.MathFidelity.HiFi4)
         self.hi2 = _ck(ttnn.MathFidelity.HiFi2)
         self.scale = c.head_dim ** -0.5
-        if experts in (None, "auto"):  # all-bfp8 experts need ~24.2 GiB (P150A: 31.6 GiB; P100A: 28 GB)
+        if experts is None:
+            experts = env("INKLING_EXPERTS", "auto")
+        if experts == "auto":  # all-bfp8 experts need ~24.2 GiB (P150A: 31.6 GiB; P100A: 28 GB)
             v = ttnn.get_memory_view(dev, ttnn.BufferType.DRAM)
             experts = "bfp8" if v.total_bytes_free_per_bank * v.num_banks >= 30 * (1 << 30) else "mixed"
         self.experts = experts
@@ -325,11 +328,14 @@ class Engine(PrefillMixin):
         fgu, fdn = expert_files(self.cache, i)
         d["Egu"] = ttnn.to_device(ttnn.load_tensor(cache_path(fgu, edt)), self.dev, memory_config=DRAM)
         d["Edn"] = ttnn.to_device(ttnn.load_tensor(cache_path(fdn, edt)), self.dev, memory_config=DRAM)
-        if edt == ttnn.bfloat8_b and env("INKLING_MOE_KERNEL", "1") == "1":
+        if edt in (ttnn.bfloat8_b, ttnn.bfloat4_b) and env("INKLING_MOE_KERNEL", "1") == "1":
             # one-program MoE kernels (decode and 32-row prefill) on a bank-contiguous copy of the experts; the
-            # interleaved tensors are freed (DRAM cannot hold both)
-            if self.moek is None:
-                self.moek = InkMoE(self.dev, c.n_experts, c.hidden, c.inter, c.gate_softcap, c.up_softcap)
+            # interleaved tensors are freed (DRAM cannot hold both). One kernel object per weight format.
+            if edt not in self.moeks:
+                self.moeks[edt] = InkMoE(self.dev, c.n_experts, c.hidden, c.inter, c.gate_softcap, c.up_softcap,
+                                         wdtype=edt)
+            self.moek = self.moeks[edt]
+            d["moek"] = self.moek
             d["Mgu"], d["Mdn"] = self.moek.prepare(d["Egu"], d["Edn"])
             ttnn.deallocate(d.pop("Egu"))
             ttnn.deallocate(d.pop("Edn"))
@@ -409,7 +415,8 @@ class Engine(PrefillMixin):
         self.cvk = InkConv(self.dev, c.hidden)
         self.fuse_moe = True  # act kernel + expert combine in the post-MLP conv (False: ttnn ops, for comparisons)
         # (unused, and its 590 KB of L1 not allocated, when the MoE kernels run)
-        self.act = InkAct(self.dev, c.top_k, c.inter, c.gate_softcap, c.up_softcap) if self.moek is None else None
+        self.act = InkAct(self.dev, c.top_k, c.inter, c.gate_softcap, c.up_softcap) \
+            if any("Mgu" not in d for d in self.layers) else None
         # attention output gate -> the o projections' (shared) width-sharded input layout. Off by default: no faster
         # in the full step (the slice / multiply / conversion it replaces overlap their neighbours' dispatch) and its
         # persistent sharded buffer (12 KB per core) breaks the L1 budget of the prefill programs
@@ -633,7 +640,7 @@ class Engine(PrefillMixin):
             logits = self.rowdot(d["WgT"], x)  # [1,1,1,E] float32
             ids, wcol = self.route(logits, d["gbias"])  # uint16 [1,1,1,K] expert ids, bf16 [1,K,1,1] weights
         if "Mgu" in d:  # kernels/ink_moe_*: experts, act and combine in one program (row 0, combined)
-            return self.moek(x, ids, wcol, d["Mgu"], d["Mdn"])
+            return d["moek"](x, ids, wcol, d["Mgu"], d["Mdn"])
         gu = ttnn.sparse_matmul(x, d["Egu"], sparsity=self.SPARSITY, indices=ids, is_input_a_sparse=False,
                                 is_input_b_sparse=True, memory_config=L1, program_config=self.pc_gu,
                                 compute_kernel_config=d["eck"])

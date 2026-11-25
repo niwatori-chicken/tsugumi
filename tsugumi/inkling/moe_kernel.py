@@ -44,7 +44,7 @@ def fbits(x):
 
 
 class InkMoE:
-    def __init__(self, dev, E, H, I, gc, uc, K=8, placement=None, ring=(12, 4, 3), NB=4):
+    def __init__(self, dev, E, H, I, gc, uc, K=8, placement=None, ring=(12, 4, 3), NB=4, wdtype=ttnn.bfloat8_b):
         assert (H, I, K) == (2304, 1152, 8)
         self.dev, self.E, self.H, self.I, self.gc, self.uc = dev, E, H, I, gc, uc
         self.ring = ring  # weight blocks: tiles per block, blocks in the CB, blocks in flight
@@ -52,15 +52,17 @@ class InkMoE:
         self.coords = PLACEMENTS[placement or os.environ.get("TSUGUMI_MOE_PLACEMENT", "stride2")]
         self.NC = len(self.coords)
         assert self.NC == I // 32 and len(set(self.coords)) == self.NC
-        self.pb = 1088  # bfp8 tile
+        self.wdtype = wdtype
+        self.pb = {ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}[wdtype]  # bytes per weight tile
         cores = _cores(self.coords)
-        bf, b8 = ttnn.bfloat16, ttnn.bfloat8_b
+        bf, b8 = ttnn.bfloat16, wdtype
         self.cbs = [_cbd(cores, 0, 72, bf), _cbd(cores, 1, ring[0] * ring[1], b8), _cbd(cores, 2, 36, bf), _cbd(cores, 3, K, bf),
                     _cbd(cores, 4, 2, bf), _cbd(cores, 5, 2, bf), _cbd(cores, 7, 1, bf), _cbd(cores, 8, 1, bf),
                     _cbd(cores, 9, 1, bf), _cbd(cores, 10, 1, bf), _cbd(cores, 11, 2 * K, bf),
                     _cbd(cores, 16, 2, bf)]
         c = ttnn.ComputeConfigDescriptor()
-        c.math_fidelity = ttnn.MathFidelity.HiFi2  # bfp8 weights (as the sparse matmuls)
+        # as the sparse matmuls: HiFi2 covers bfp8's mantissa, bfp4 needs only LoFi
+        c.math_fidelity = ttnn.MathFidelity.HiFi2 if wdtype == ttnn.bfloat8_b else ttnn.MathFidelity.LoFi
         c.fp32_dest_acc_en = True
         c.math_approx_mode = False
         self.ccfg = c
@@ -83,7 +85,7 @@ class InkMoE:
         grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(7, 0))})
         mem = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.DRAM,
                                 ttnn.ShardSpec(grid, (32, 32 * T), ttnn.ShardOrientation.ROW_MAJOR))
-        return ttnn.allocate_tensor_on_device(ttnn.Shape([1, 1, 32, 32 * T * 8]), ttnn.bfloat8_b, ttnn.TILE_LAYOUT,
+        return ttnn.allocate_tensor_on_device(ttnn.Shape([1, 1, 32, 32 * T * 8]), self.wdtype, ttnn.TILE_LAYOUT,
                                               self.dev, mem)
 
     def _reorder(self, src, kind):
@@ -99,12 +101,12 @@ class InkMoE:
                                   source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH, core_ranges=cores,
                                   compile_time_args=ttnn.TensorAccessorArgs(src).get_compile_time_args(),
                                   runtime_args=rt, config=ttnn.ReaderConfigDescriptor())
-        p = ttnn.ProgramDescriptor(kernels=[k], semaphores=[], cbs=[_cbd(cores, 0, T, ttnn.bfloat8_b)])
+        p = ttnn.ProgramDescriptor(kernels=[k], semaphores=[], cbs=[_cbd(cores, 0, T, self.wdtype)])
         ttnn.generic_op([src, dst], p)
         return dst
 
     def prepare(self, Egu, Edn):
-        assert Egu.dtype == ttnn.bfloat8_b and Edn.dtype == ttnn.bfloat8_b
+        assert Egu.dtype == self.wdtype and Edn.dtype == self.wdtype
         return self._reorder(Egu, 0), self._reorder(Edn, 1)
 
     def __call__(self, x, ids, wcol, gu, dn, stage=3):

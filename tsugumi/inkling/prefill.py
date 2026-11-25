@@ -223,7 +223,7 @@ class PrefillMixin:
         w = ttnn.typecast(w, ttnn.bfloat16)
         sp = ttnn.to_layout(ttnn.max(w, dim=-2, keepdim=True, memory_config=L1), ttnn.ROW_MAJOR_LAYOUT)
         if "Mgu" in d:  # kernels/ink_moep_*: the used experts in batches, act, routing weights and sum in one program
-            return self.moek.prefill(x, w, sp, d["Mgu"], d["Mdn"], self.p_moe_out)
+            return d["moek"].prefill(x, w, sp, d["Mgu"], d["Mdn"], self.p_moe_out)
         E, I = c.n_experts, c.inter
         gu = ttnn.sparse_matmul(x, d["Egu"], sparsity=sp, is_input_b_sparse=True, memory_config=DRAM,
                                 program_config=self.p_pc_gu, compute_kernel_config=d["eck"])

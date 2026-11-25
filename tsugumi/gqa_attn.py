@@ -23,7 +23,7 @@ KDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "kernels")
 
 
 def _cbd(cores, index, ntiles, dtype):
-    ps = {ttnn.float32: 4096, ttnn.bfloat8_b: 1088}.get(dtype, 2048)
+    ps = {ttnn.float32: 4096, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}.get(dtype, 2048)
     return ttnn.CBDescriptor(total_size=ntiles * ps, core_ranges=cores, format_descriptors=[
         ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=ps)])
 
