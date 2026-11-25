@@ -166,8 +166,10 @@
     レーンでの n-gram 下書き (8 行のレーン)。GDN カーネルをレーンでコアに分ける (8 レーンで約 20ms/ステップの再帰)。
 
 - [ ] **6. 大きい T の prefill の細かい改善**
-  - slice と要素ごとの op が 1 チャンクで約 250ms。融合する。
-    - 例: w2 の K を 17472 にパディングして MLP の slice をなくす (decode 側の slice も消える)。
+  - [x] slice と要素ごとの op の融合 (2026-11-25): GDN の gated RMSNorm カーネル (cgdr の head-major 出力から)、conv の q/k/v
+    分割出力と履歴の取り出し、w2 の K 詰め。1 チャンク (T=2048) 911 → 765ms、prefill +17〜19%、PPL 不変 (doc/11)。
+    残り: 行列積の出力の N (5152 → 5120) の slice 15ms (全重みの K を詰め直す必要がありデコードに響く)、attention の RoPE 約 17ms、
+    cgdr 内の g/β の並べ替え 12ms (ttnn 側)。
   - [x] T=2048 のバケット (2026-11-24、既定にした): 作業用の DRAM のピーク 298 → 422 MiB (+124 MiB)、常駐 +10 MiB。
     prefill 8K +10%、32K +18%、13.1 万 84 秒 (1,561 tok/s)、24.5 万 307 → 205 秒 (干し草山テスト正解)。
     出力は T=1024 と同じ。起動のウォームアップ +20 秒。`scripts/measure_prefill_dram.py`。

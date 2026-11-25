@@ -58,9 +58,9 @@ class CausalConvKernel:
             self._plans[NT] = (rps, coords, cores, ranges, cbs)
         return self._plans[NT]
 
-    def __call__(self, x, carry, taps, out, x_width=None):
+    def __call__(self, x, carry, taps, out, x_width=None, kd=None):
         """x [1,1,T,>=C] (the first C columns are the conv input), carry [1,1,32,C] (rows 29..31),
-        taps: 4 x [1,1,32,C] (row 0), out [1,1,T,C]."""
+        taps: 4 x [1,1,32,C] (row 0), out [1,1,T,C], or a tuple (q, k, v) of [1,T,kd], [1,T,kd], [1,T,C-2kd]."""
         NT = x.shape[-2] // 32
         XW = (x_width or self.C) // 32
         rps, coords, cores, ranges, cbs = self._plan(NT)
@@ -70,16 +70,68 @@ class CausalConvKernel:
         for t in ins:
             r_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
         addrs = [t.buffer_address() for t in ins]
-        w_ct = ct + ttnn.TensorAccessorArgs(out).get_compile_time_args()
+        outs = list(out) if isinstance(out, (tuple, list)) else [out]
+        writer = "conv_writer3.cpp" if len(outs) == 3 else "conv_writer.cpp"
+        w_ct = ct + ([kd // 32] if len(outs) == 3 else [])
+        for t in outs:
+            w_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
+        oaddrs = [t.buffer_address() for t in outs]
         K = lambda src, cta, rt, cfg: ttnn.KernelDescriptor(
             kernel_source=os.path.join(KDIR, src), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores, compile_time_args=cta, runtime_args=rt, config=cfg)
         prog = ttnn.ProgramDescriptor(kernels=[
             K("conv_reader.cpp", r_ct, [(c, addrs + [a, b]) for c, (a, b) in zip(coords, ranges)],
               ttnn.ReaderConfigDescriptor()),
-            K("conv_writer.cpp", w_ct, [(c, [out.buffer_address(), a, b]) for c, (a, b) in zip(coords, ranges)],
+            K(writer, w_ct, [(c, oaddrs + [a, b]) for c, (a, b) in zip(coords, ranges)],
               ttnn.WriterConfigDescriptor()),
             K("conv_compute.cpp", ct, [(c, [a, b]) for c, (a, b) in zip(coords, ranges)], self.ck),
         ], cbs=cbs)
+        ttnn.generic_op(ins + outs, prog)
+        return out
+
+
+class RowSelectKernel:
+    """out [1,1,32,C] = MA @ xa[row tile ra] + MB @ xb[row tile rb] over the first C columns (xa, xb: [1,1,R,>=C],
+    MA, MB: 0/1 row-selection tiles in m [1,1,64,32]). Reads 2 row tiles instead of a whole tensor; the row tiles are
+    runtime arguments, so one program serves every position."""
+
+    def __init__(self, dev, C):
+        self.dev, self.CT = dev, C // 32
+        g = dev.compute_with_storage_grid_size()
+        ncore = min(g.x * g.y, self.CT)
+        per, rem = divmod(self.CT, ncore)
+        self.ranges, u = [], 0
+        for k in range(ncore):
+            n = per + (1 if k < rem else 0)
+            self.ranges.append((u, u + n))
+            u += n
+        self.coords = [(k % g.x, k // g.x) for k in range(ncore)]
+        self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y))
+                                        for x, y in self.coords])
+        cb = lambda i, n: ttnn.CBDescriptor(total_size=n * 2048, core_ranges=self.cores, format_descriptors=[
+            ttnn.CBFormatDescriptor(buffer_index=i, data_format=ttnn.bfloat16, page_size=2048)])
+        self.cbs = [cb(0, 4), cb(1, 2), cb(2, 2)]
+        self.ck = ttnn.ComputeConfigDescriptor()
+        self.ck.math_fidelity = ttnn.MathFidelity.HiFi4
+        self.ck.fp32_dest_acc_en = True
+        self.ck.math_approx_mode = False
+
+    def __call__(self, xa, ra, xb, rb, m, out):
+        ins = [xa, xb, m]
+        r_ct = [xa.shape[-1] // 32, xb.shape[-1] // 32]
+        for t in ins:
+            r_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
+        addrs = [t.buffer_address() for t in ins]
+        K = lambda src, cta, rt, cfg: ttnn.KernelDescriptor(
+            kernel_source=os.path.join(KDIR, src), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=self.cores, compile_time_args=cta, runtime_args=rt, config=cfg)
+        cr = list(zip(self.coords, self.ranges))
+        prog = ttnn.ProgramDescriptor(kernels=[
+            K("rowsel_reader.cpp", r_ct, [(c, addrs + [ra, rb, a, b]) for c, (a, b) in cr],
+              ttnn.ReaderConfigDescriptor()),
+            K("rowsel_writer.cpp", ttnn.TensorAccessorArgs(out).get_compile_time_args(),
+              [(c, [out.buffer_address(), a, b]) for c, (a, b) in cr], ttnn.WriterConfigDescriptor()),
+            K("rowsel_compute.cpp", [], [(c, [a, b]) for c, (a, b) in cr], self.ck),
+        ], cbs=self.cbs)
         ttnn.generic_op(ins + [out], prog)
         return out
