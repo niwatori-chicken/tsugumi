@@ -40,7 +40,7 @@ def reply(tok, gen, ids, n):
 def main():
     traced = "--untraced" not in sys.argv
     tok = AutoTokenizer.from_pretrained(MODEL)
-    dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
+    dev = ttnn.open_device(device_id=0, trace_region_size=1024 << 20, l1_small_size=24576)
     try:
         eng = Engine(dev, MODEL, CACHE, max_seq=int(env("MAX_SEQ", "8192")))
         if traced:

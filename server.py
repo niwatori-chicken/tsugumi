@@ -424,7 +424,7 @@ class InklingBackend(Backend):
         t_all = time.perf_counter()
         self.tok = AutoTokenizer.from_pretrained(MODEL_DIR)
         self.lanes = 1
-        trace_mb = int(env("TRACE_MB", "512"))
+        trace_mb = int(env("TRACE_MB", "1024"))  # 512-row prefill traces (one per context bucket): ~650 MB
         self.dev = ttnn.open_device(device_id=0, trace_region_size=trace_mb << 20, l1_small_size=24576)
         t = time.perf_counter()
         self.eng = Engine(self.dev, MODEL_DIR, CACHE, max_seq=max_seq, log=log.info,

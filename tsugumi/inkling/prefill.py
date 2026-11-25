@@ -19,20 +19,24 @@ import torch
 import ttnn
 
 from ..env import env
-from ..kv_kernel import KVWriteKernel
+from ..kv_kernel import KVWriteKernel, KVWriteRows
+from .relshift import RelShift
 
 L1 = ttnn.L1_MEMORY_CONFIG
 DRAM = ttnn.DRAM_MEMORY_CONFIG
 NEG = -1e9
 U, UWP = ttnn.UnaryOpType, ttnn.UnaryWithParam
-# prompt tokens per prefill step (rows = tokens): 128 (default), 64 or 32 (TSUGUMI_INKLING_PREFILL_T). The per-step
-# cost of most prefill ops grows much less than the rows (max_seq 32768, 4k prompt: 334 tok/s at 128, 290 at 64);
-# a short remainder costs one full step (27 tokens: 0.42 s at 128, 0.26 s at 64)
-T = int(env("INKLING_PREFILL_T", "128"))
-assert T in (32, 64, 128)
+# prompt tokens per prefill step (rows = tokens): 512 (default), 256, 128, 64 or 32 (TSUGUMI_INKLING_PREFILL_T). The
+# per-step cost of most prefill ops grows much less than the rows (max_seq 32768, 4k prompt: 620 tok/s at 512, 334 at
+# 128, 290 at 64); a short remainder costs one full step (27 tokens: 0.77 s at 512, 0.42 s at 128, 0.26 s at 64)
+T = int(env("INKLING_PREFILL_T", "512"))
+assert T in (32, 64, 128, 256, 512)
+# the full layers' attention runs on blocks of TS query rows (the [rows, context] scores of 512 rows would not fit)
+TS = min(T, 128)
 # where the prefill's activations go: DRAM at T = 128 (in L1 the residual stream / q / k / v starve the
 # attention softmax's CBs)
 PL = L1 if T <= 64 else DRAM
+ATT_STOP = None  # (profiling) stop p_attention after a stage
 
 
 class PrefillMixin:
@@ -50,6 +54,17 @@ class PrefillMixin:
                 else:
                     mall[0, 0, lag * T + t, T + (lag - t)] = 1.0
         self.P_MALL = self.tt(mall)
+        # convolution by row tiles (p_conv): XP[i] = [x tile i - 1 (hist for i = 0); x tile i] (64 rows); row l * 32 + r
+        # of SHIFT @ XP[i] = x[32 i + r - l]
+        sh = torch.zeros(1, 1, k * 32, 64)
+        for lag in range(k):
+            for r in range(32):
+                sh[0, 0, lag * 32 + r, 32 + r - lag] = 1.0
+        self.P_SHIFT = self.tt(sh)
+        fl = torch.zeros(1, 1, 32, 32)  # hist row j (x at p0 - j) -> row 32 - j (the previous tile's last rows)
+        for j in range(1, k):
+            fl[0, 0, 32 - j, j] = 1.0
+        self.P_FLIP = self.tt(fl)
         self.P_TCOL = self.tt(torch.arange(T).float().view(1, 1, T, 1), ttnn.float32)
         er = torch.zeros(1, 1, 32, RA)
         er[0, 0, 0, R] = 1.0
@@ -83,7 +98,8 @@ class PrefillMixin:
             self.P_ES_B[b] = self.tt(e_)
         self.P_KZ = ttnn.from_torch(torch.zeros(1, NKV, 32, HD), dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT,
                                     device=self.dev, memory_config=DRAM)
-        self.P_RZ = self.tt(torch.zeros(1, c.n_heads, T, 32), mem=DRAM)
+        self.P_RZ = self.tt(torch.zeros(1, c.n_heads, TS, 32), mem=DRAM)
+        self.P_VALID = self.tt(torch.zeros(1, 1, T, 1), mem=DRAM)  # 1 for the chunk's real rows (MoE routing)
         # dynamic conv: D[lag][t, c] = dyn[t, head(c) * 4 + lag] / sqrt(2k + 1)
         el = torch.zeros(1, k, 32, NKV * HD)
         for lag in range(k):
@@ -95,14 +111,18 @@ class PrefillMixin:
         self.P_POSR = ttnn.from_torch(torch.zeros(T, dtype=torch.int32), dtype=ttnn.int32, device=self.dev)
         self.P_POSF = ttnn.from_torch(torch.zeros(T, dtype=torch.int32), dtype=ttnn.int32, device=self.dev)
         self.P_PT0 = ttnn.from_torch(torch.zeros(1, 8, dtype=torch.int32), dtype=ttnn.int32, device=self.dev)
+        # [p0 % R, p0 % W]: the relative bias shift (kernels/ink_relshift.cpp)
+        self.P_BASE = ttnn.from_torch(torch.zeros(1, 8, dtype=torch.int32), dtype=ttnn.int32, device=self.dev)
+        self.relshift = RelShift(self.dev)
         self.P_C0 = self.tt(torch.zeros(1, 1, 1, 1), ttnn.float32)  # p0 % R
         self.P_THR = self.tt(torch.zeros(1, 1, T, 1), ttnn.float32)  # min(P_t, W - 1)
         self.P_PCOL = self.tt(torch.zeros(1, 1, T, 1), ttnn.float32)  # P_t
         self.P_TAU = self.tt(torch.ones(1, T, 1, 1))  # tau(P_t), [1, T, 1, 1] (token-major q / r)
         self.P_MH = self.tt(torch.zeros(1, 1, 32, T + 32))  # XH -> the new 32-row history
         self.P_SEL = self.tt(torch.zeros(1, 1, 32, T))  # the last real row -> row 0 (32 rows for the head)
-        self.kvw_ring = KVWriteKernel(self.dev, T, NKV, HD, RA, 1, ttnn.bfloat8_b)
-        self.kvw_full = KVWriteKernel(self.dev, T, NKV, HD, SA, 1, ttnn.bfloat8_b)
+        # K / V rows -> the caches (head-major sources, one read-modify-write per cache tile on every core)
+        self.kvw_ring = KVWriteRows(self.dev, T, NKV, HD, RA, ttnn.bfloat8_b)
+        self.kvw_full = KVWriteRows(self.dev, T, NKV, HD, SA, ttnn.bfloat8_b)
         self.p_pc_gu = self._spc(2 * c.inter, (9, 8), 6)
         self.p_pc_dn = self._spc(H, (9, 8), 6)
         # output of the prefill MoE kernel (DRAM: written as whole tiles, consumed by ttnn ops)
@@ -133,7 +153,9 @@ class PrefillMixin:
                 t = ttnn.to_torch(d[name]).float()[0, 0, :k]
                 d["p_" + name] = self.tt(t.view(1, k, 1, -1))
         # the relative bias by distance: [1, NH, 32, R] (sliding; distances >= W are 0) / [.., W] (full)
-        d["p_proj"] = ttnn.slice(d["proj"], (0, 0, 0, 0), (1, 1, c.d_rel, d["proj"].shape[-1]))
+        # columns reversed for kernels/ink_relshift.cpp
+        pr = ttnn.to_torch(d["proj"]).float()[:, :, :c.d_rel]
+        d["p_proj"] = self.tt(torch.flip(pr, dims=[-1]))
 
     # ------------------------------------------------------------------------------------------------ pieces
     def p_attn_res(self, q, B):
@@ -148,10 +170,26 @@ class PrefillMixin:
         return x_norm if B is None else ttnn.concat([B, x_norm], dim=1, memory_config=PL)
 
     def p_conv(self, x, hist, taps4, dyn4=None):
-        XH = ttnn.concat([x, hist], dim=-2, memory_config=PL)  # [1,1,T+32,C]
-        Y = ttnn.reshape(self.mm(self.P_MALL, XH), (1, self.cfg.conv_k, T, x.shape[-1]))
-        taps = taps4 if dyn4 is None else ttnn.add(dyn4, taps4, memory_config=PL)
-        y = ttnn.sum(ttnn.multiply(Y, taps, memory_config=PL), dim=1, keepdim=True, memory_config=PL)
+        k, C = self.cfg.conv_k, x.shape[-1]
+        XH = ttnn.concat([x, hist], dim=-2, memory_config=PL)  # [1,1,T+32,C] (the new history)
+        if T <= 32:
+            Y = ttnn.reshape(self.mm(self.P_MALL, XH), (1, k, T, C))
+            taps = taps4 if dyn4 is None else ttnn.add(dyn4, taps4, memory_config=PL)
+            y = ttnn.sum(ttnn.multiply(Y, taps, memory_config=PL), dim=1, keepdim=True, memory_config=PL)
+        else:  # by row tiles: [NT, 64, C] pairs (previous tile, tile), one [128, 64] shift matrix
+            NT = T // 32
+            prev = ttnn.concat([self.mm(self.P_FLIP, hist), ttnn.slice(x, (0, 0, 0, 0), (1, 1, T - 32, C),
+                                                                       memory_config=PL)], dim=-2, memory_config=PL)
+            XP = ttnn.concat([ttnn.reshape(prev, (1, NT, 32, C)), ttnn.reshape(x, (1, NT, 32, C))], dim=2,
+                             memory_config=PL)
+            Y = ttnn.reshape(self.mm(self.P_SHIFT, XP), (NT, k, 32, C))  # [i, lag, r]: x[32 i + r - lag]
+            if dyn4 is None:
+                taps = taps4  # [1, k, 1, C]
+            else:  # [1, k, T, C] -> [NT, k, 32, C]
+                taps = ttnn.add(ttnn.permute(ttnn.reshape(dyn4, (k, NT, 32, C)), (1, 0, 2, 3), memory_config=PL),
+                                taps4, memory_config=PL)
+            y = ttnn.reshape(ttnn.sum(ttnn.multiply(Y, taps, memory_config=PL), dim=1, keepdim=True, memory_config=PL),
+                             (1, 1, T, C))
         self.mm(self.P_MH, XH, optional_output_tensor=hist, memory_config=hist.memory_config())
         return y
 
@@ -177,6 +215,8 @@ class PrefillMixin:
             yq = d["Lq"](q_in, out_mem=PL)
             yk = d["Lk"](k_in, out_mem=PL)
             yv = d["Lv"](v_in, out_mem=PL)
+        if ATT_STOP == "lin":
+            return yq
         part = lambda y, lo, hi, nh, hd: ttnn.reshape(ttnn.slice(y, (0, 0, 0, lo), (1, 1, T, hi), memory_config=PL),
                                                       (1, T, nh, hd))
         tau = None if sliding else self.P_TAU
@@ -190,6 +230,8 @@ class PrefillMixin:
         sink = ttnn.slice(yq, (0, 0, 0, o0 + NH * DR), (1, 1, T, o0 + NH * DR + NH), memory_config=PL)  # [1,1,T,NH]
         sink = ttnn.reshape(ttnn.transpose(sink, -2, -1, memory_config=PL), (1, NH, T, 1))
         sink = ttnn.pad(sink, [(0, 0), (0, 0), (0, 0), (0, 31)], 0.0)  # [1, NH, T, 32], col 0 = sink / scale
+        if ATT_STOP == "qr":
+            return yq
         C = NKV * HD
         if sliding:
             if fused:
@@ -198,7 +240,11 @@ class PrefillMixin:
                 kvraw = ttnn.concat([ttnn.slice(yk, (0, 0, 0, 0), (1, 1, T, C), memory_config=PL),
                                      ttnn.slice(yv, (0, 0, 0, 0), (1, 1, T, C), memory_config=PL)], dim=-1,
                                     memory_config=PL)
+            if ATT_STOP == "kvraw":
+                return yq
             kv = self.p_conv(kvraw, st["hkv"], d["p_tkv"])
+            if ATT_STOP == "conv":
+                return yq
             k = ttnn.slice(kv, (0, 0, 0, 0), (1, 1, T, C), memory_config=PL)
             v = ttnn.slice(kv, (0, 0, 0, C), (1, 1, T, 2 * C), memory_config=PL)
         else:
@@ -211,41 +257,62 @@ class PrefillMixin:
             v = self.p_conv(vraw, st["hv"], d["p_tv"], dyn4(yv))
         k = self.p_l2clip(ttnn.reshape(k, (1, T, NKV, HD)), c.qk_clip)
         v = self.rmsu(ttnn.reshape(v, (1, T, NKV, HD)))
+        if ATT_STOP == "kn":
+            return yq
+        hm = lambda t: ttnn.permute(t, (0, 2, 1, 3), memory_config=PL)  # [1, NKV, T, HD]
         if sliding:
-            self.kvw_ring(k, v, st["kc"], st["vc"], self.P_POSR, self.P_PT0)
+            self.kvw_ring(hm(k), hm(v), st["kc"], st["vc"], self.P_POSR)
         else:
-            self.kvw_full(k, v, st["kc"], st["vc"], self.P_POSF, self.P_PT0)
+            self.kvw_full(hm(k), hm(v), st["kc"], st["vc"], self.P_POSF)
         kc, vc = st["kc"], st["vc"]
-        # mask [1, NH, T, S] (units of 1 / scale)
+        if ATT_STOP == "kv":
+            return yq
+        # mask [1, NH, rows, S] (units of 1 / scale)
         rel = self.mm(r, d["p_proj"])  # [1, NH, T, R or W] by distance
         if sliding:
-            rel = ttnn.gather(rel, -1, index=pc["IDXR"], memory_config=DRAM)  # [1, NH, T, RA] by slot
+            rel = self.relshift(rel, self.P_BASE, 0, self.RA, mod=self.R)  # [1, NH, T, RA] by slot
             mask = ttnn.add(rel, pc["VR"], memory_config=DRAM)
             mask = ttnn.add(mask, self.mm(sink, self.P_ER), memory_config=DRAM)
+            blocks = [(0, T, mask)]
         else:
-            rel = ttnn.gather(rel, -1, index=pc["IDXF"], memory_config=DRAM)  # [1, NH, T, W] by position % W
             b = self.p_bucket
             if b is None:
-                rep = ttnn.repeat(rel, (1, 1, 1, self.SA // c.window), memory_config=DRAM)
                 es = self.P_ES
             else:  # slots [0, b) + 32 (sink at b)
-                rep = ttnn.concat([ttnn.repeat(rel, (1, 1, 1, b // c.window), memory_config=DRAM), self.P_RZ], dim=-1,
-                                  memory_config=DRAM)
                 es = self.P_ES_B[b]
                 kc = ttnn.concat([ttnn.slice(kc, (0, 0, 0, 0), (1, NKV, b, HD), memory_config=DRAM), self.P_KZ],
                                  dim=-2, memory_config=DRAM)
                 vc = ttnn.concat([ttnn.slice(vc, (0, 0, 0, 0), (1, NKV, b, HD), memory_config=DRAM), self.P_KZ],
                                  dim=-2, memory_config=DRAM)
-            mask = ttnn.add(ttnn.multiply(rep, pc["BWIN"], memory_config=DRAM), pc["AV"], memory_config=DRAM)
-            mask = ttnn.add(mask, self.mm(sink, es, memory_config=DRAM), memory_config=DRAM)
-        S = mask.shape[-1]
-        mask = ttnn.reshape(mask, (1, NKV, (NH // NKV) * T, S))
-        qg = ttnn.reshape(ttnn.permute(q, (0, 2, 1, 3), memory_config=PL), (1, NKV, (NH // NKV) * T, HD))
-        s = self.mm(qg, kc, transpose_b=True, memory_config=DRAM)  # [1, NKV, 3T, S]
-        s = ttnn.multiply(ttnn.add(s, mask, memory_config=DRAM), self.scale, memory_config=DRAM)
-        p = ttnn.softmax(s, dim=-1, memory_config=DRAM, numeric_stable=True)
-        o = self.mm(p, vc, memory_config=PL)  # [1, NKV, 3T, HD]
-        o = ttnn.permute(ttnn.reshape(o, (1, NH, T, HD)), (0, 2, 1, 3), memory_config=PL)  # [1, T, NH, HD]
+            blocks = []
+            for i, i0 in enumerate(range(0, T, TS)):  # query rows i0 .. i0 + TS
+                rows = lambda t: ttnn.slice(t, (0, 0, i0, 0), (1, t.shape[1], i0 + TS, t.shape[-1]),
+                                            memory_config=DRAM) if TS < T else t
+                rl = self.relshift(rel, self.P_BASE, 1, c.window, m0=i0 // 32, rows=TS, mod=c.window)  # by p % W
+                if b is None:
+                    rep = ttnn.repeat(rl, (1, 1, 1, self.SA // c.window), memory_config=DRAM)
+                else:
+                    rep = ttnn.concat([ttnn.repeat(rl, (1, 1, 1, b // c.window), memory_config=DRAM), self.P_RZ],
+                                      dim=-1, memory_config=DRAM)
+                mask = ttnn.add(ttnn.multiply(rep, pc["BWIN"][i], memory_config=DRAM), pc["AV"][i], memory_config=DRAM)
+                mask = ttnn.add(mask, self.mm(rows(sink), es, memory_config=DRAM), memory_config=DRAM)
+                blocks.append((i0, TS, mask))
+        os_ = []
+        if ATT_STOP == "mask":
+            return yq
+        for i0, n, mask in blocks:
+            S = mask.shape[-1]
+            mask = ttnn.reshape(mask, (1, NKV, (NH // NKV) * n, S))
+            qb = ttnn.slice(q, (0, i0, 0, 0), (1, i0 + n, NH, HD), memory_config=PL) if n < T else q
+            qg = ttnn.reshape(ttnn.permute(qb, (0, 2, 1, 3), memory_config=PL), (1, NKV, (NH // NKV) * n, HD))
+            s = self.mm(qg, kc, transpose_b=True, memory_config=DRAM)  # [1, NKV, 3n, S]
+            s = ttnn.multiply(ttnn.add(s, mask, memory_config=DRAM), self.scale, memory_config=DRAM)
+            p = ttnn.softmax(s, dim=-1, memory_config=DRAM, numeric_stable=True)
+            o = self.mm(p, vc, memory_config=PL)  # [1, NKV, 3n, HD]
+            os_.append(ttnn.permute(ttnn.reshape(o, (1, NH, n, HD)), (0, 2, 1, 3), memory_config=PL))  # [1,n,NH,HD]
+        o = os_[0] if len(os_) == 1 else ttnn.concat(os_, dim=1, memory_config=PL)  # [1, T, NH, HD]
+        if ATT_STOP == "score":
+            return o
         o = ttnn.multiply(o, gate, input_tensor_b_activations=[UWP(U.SIGMOID)], memory_config=PL)
         return d["Lo"](ttnn.reshape(o, (1, 1, T, NH * HD)), out_mem=PL)
 
@@ -254,10 +321,19 @@ class PrefillMixin:
         logits = self.mm(x, d["Wg"], dtype=ttnn.float32)
         s = ttnn.sigmoid(logits, memory_config=PL)
         sb = ttnn.add(s, d["gbias"], memory_config=PL)
+        kk = c.route_scale * c.gate_softcap * c.up_softcap
+        if "Mgu" in d and T > 128:  # kernels/ink_moex_*: only the routed (token, expert) pairs, X rows by token
+            _, ids = ttnn.topk(sb, c.top_k, dim=-1, largest=True, sorted=True, memory_config=DRAM)
+            sg = ttnn.gather(s, -1, index=ids, memory_config=DRAM)  # [T, 8] the chosen experts' sigmoids
+            wk = ttnn.multiply(sg, ttnn.sum(sg, dim=-1, keepdim=True, memory_config=DRAM),
+                               input_tensor_b_activations=[UWP(U.RECIP), UWP(U.MUL_UNARY_SFPU, kk)],
+                               memory_config=DRAM)
+            wk = ttnn.multiply(ttnn.typecast(wk, ttnn.bfloat16), self.P_VALID, memory_config=DRAM)  # padding: skipped
+            xr = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT, memory_config=DRAM)
+            return d["moek"].prefill_moex(xr, ids, wk, d["Mgu"], d["Mdn"], self.p_moe_out, nb=8)
         vals, _ = ttnn.topk(sb, c.top_k, dim=-1, largest=True, sorted=True, memory_config=PL)
         kth = ttnn.slice(vals, (0, 0, 0, c.top_k - 1), (1, 1, T, c.top_k), memory_config=PL)
         w = ttnn.multiply(s, ttnn.ge(sb, kth, memory_config=PL), memory_config=PL)  # dense routing weights
-        kk = c.route_scale * c.gate_softcap * c.up_softcap
         w = ttnn.multiply(w, ttnn.sum(w, dim=-1, keepdim=True, memory_config=PL),
                           input_tensor_b_activations=[UWP(U.RECIP), UWP(U.MUL_UNARY_SFPU, kk)], memory_config=PL)
         w = ttnn.typecast(w, ttnn.bfloat16)
@@ -342,24 +418,15 @@ class PrefillMixin:
         vr = ttnn.add(ttnn.multiply(ttnn.subtract(valid, 1.0, memory_config=PL), -NEG, memory_config=PL),
                       self.P_SINKFIX, memory_config=PL)
         pc["VR"] = ttnn.to_memory_config(ttnn.reshape(ttnn.typecast(vr, ttnn.bfloat16), (1, 1, T, self.RA)), DRAM)
-        idx = ttnn.clamp(dt, min=0.0, max=float(R - 1), memory_config=PL)
-        # [NH, T, RA] / [NH, T, W] index tensors: DRAM (in L1 they starve the prefill matmuls' CBs, worse at T = 64)
-        pc["IDXR"] = ttnn.repeat(ttnn.typecast(idx, ttnn.uint32), (1, c.n_heads, 1, 1), memory_config=DRAM)
-        # full layers: distance by position % W; window / causal masks over the cache
-        arw = ttnn.slice(self.ARW, (0, 0, 0, 0), (1, 1, 1, W), memory_config=PL)  # s' = 0..W-1
-        df = ttnn.sub(self.P_PCOL, arw, memory_config=PL)  # P_t - s'
-        df = ttnn.subtract(df, ttnn.multiply(ttnn.floor(ttnn.multiply(df, 1.0 / W, memory_config=PL),
-                                                        memory_config=PL), float(W), memory_config=PL),
-                           memory_config=PL)  # (P_t - s') mod W
-        df = ttnn.clamp(df, min=0.0, max=float(W - 1), memory_config=PL)
-        pc["IDXF"] = ttnn.repeat(ttnn.typecast(df, ttnn.uint32), (1, c.n_heads, 1, 1), memory_config=DRAM)
+        blk = lambda t: [ttnn.slice(t, (0, 0, i0, 0), (1, t.shape[1], i0 + TS, t.shape[-1]), memory_config=DRAM)
+                         for i0 in range(0, T, TS)] if TS < T else [t]
         ars = self.P_ARS if self.p_bucket is None else self.P_ARS_B[self.p_bucket]
         dp = ttnn.sub(self.P_PCOL, ars, memory_config=DRAM)  # P_t - p, [1,1,T,SA or bucket + 32]
         win = ttnn.multiply(ttnn.ge(dp, 0.0, memory_config=DRAM), ttnn.lt(dp, float(W), memory_config=DRAM),
                             memory_config=DRAM)
-        pc["BWIN"] = ttnn.typecast(win, ttnn.bfloat16)
-        pc["AV"] = ttnn.typecast(ttnn.multiply(ttnn.lt(dp, 0.0, memory_config=DRAM), NEG, memory_config=DRAM),
-                                 ttnn.bfloat16)
+        pc["BWIN"] = blk(ttnn.typecast(win, ttnn.bfloat16))
+        pc["AV"] = blk(ttnn.typecast(ttnn.multiply(ttnn.lt(dp, 0.0, memory_config=DRAM), NEG, memory_config=DRAM),
+                                     ttnn.bfloat16))
         return pc
 
     def p_forward(self, logits):
@@ -418,9 +485,13 @@ class PrefillMixin:
         put = lambda t, v, dt: ttnn.copy_host_to_device_tensor(
             ttnn.from_torch(v, dtype=dt, layout=ttnn.TILE_LAYOUT if dt != ttnn.int32 else ttnn.ROW_MAJOR_LAYOUT), t)
         put(self.P_X0, x, ttnn.bfloat16)
+        put(self.P_VALID, (torch.arange(T) < n).float().view(1, 1, T, 1), ttnn.bfloat16)
         put(self.P_POSR, torch.tensor(posr, dtype=torch.int32), ttnn.int32)
         put(self.P_POSF, torch.tensor(posf, dtype=torch.int32), ttnn.int32)
         put(self.P_C0, torch.full((1, 1, 1, 1), float(p0 % self.R)), ttnn.float32)
+        bs = torch.zeros(1, 8, dtype=torch.int32)
+        bs[0, 0], bs[0, 1] = p0 % self.R, p0 % c.window
+        put(self.P_BASE, bs, ttnn.int32)
         put(self.P_THR, torch.tensor([float(min(p, c.window - 1)) for p in P]).view(1, 1, T, 1), ttnn.float32)
         put(self.P_PCOL, torch.tensor([float(p) for p in P]).view(1, 1, T, 1), ttnn.float32)
         put(self.P_TAU, torch.tensor([c.tau(p) for p in P]).view(1, T, 1, 1), ttnn.bfloat16)

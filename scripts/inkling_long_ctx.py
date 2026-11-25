@@ -33,7 +33,7 @@ def main():
     a = ap.parse_args()
     tok = AutoTokenizer.from_pretrained(MODEL)
     unit = tok.encode(TEXT, add_special_tokens=False)
-    dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
+    dev = ttnn.open_device(device_id=0, trace_region_size=1024 << 20, l1_small_size=24576)
     try:
         eng = Engine(dev, MODEL, CACHE, max_seq=a.max_seq, log=lambda *x: None)
         eng.capture()
