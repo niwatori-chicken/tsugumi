@@ -260,7 +260,10 @@ class PrefillMixin:
         w = ttnn.typecast(w, ttnn.bfloat16)
         sp = ttnn.to_layout(ttnn.max(w, dim=-2, keepdim=True, memory_config=L1), ttnn.ROW_MAJOR_LAYOUT)
         if "Mgu" in d:  # kernels/ink_moep_*: the used experts in batches, act, routing weights and sum in one program
-            return d["moek"].prefill(x, w, sp, d["Mgu"], d["Mdn"], self.p_moe_out)
+            # compact: each expert's routed tokens packed into row tiles (kernels/ink_moec_*; TSUGUMI_INKLING_MOE_COMPACT=0:
+            # all rows of every used expert, ink_moep_*)
+            f = d["moek"].prefill_compact if env("INKLING_MOE_COMPACT", "1") == "1" else d["moek"].prefill
+            return f(x, w, sp, d["Mgu"], d["Mdn"], self.p_moe_out)
         E, I = c.n_experts, c.inter
         gu = ttnn.sparse_matmul(x, d["Egu"], sparsity=sp, is_input_b_sparse=True, memory_config=DRAM,
                                 program_config=self.p_pc_gu, compute_kernel_config=d["eck"])
