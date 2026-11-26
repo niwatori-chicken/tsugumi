@@ -132,6 +132,7 @@ class PrefillMixin:
         self.p_pc_dn = self._spc(H, (9, 8), 6)
         # output of the prefill MoE kernel (DRAM: written as whole tiles, consumed by ttnn ops)
         self.p_moe_out = self.tt(torch.zeros(1, 1, T, H), mem=DRAM)
+        self.p_moe_out2 = self.tt(torch.zeros(1, 1, T, H), mem=DRAM)  # the second core group's partial sum
         for d in self.layers:
             self._prefill_layer_consts(d)
         self.p_qf = ttnn.slice(self.Qf, (0, 0, 0, 0), (1, 1, 1, H))
@@ -309,7 +310,7 @@ class PrefillMixin:
         s = ttnn.sigmoid(logits, memory_config=PL)
         sb = ttnn.add(s, d["gbias"], memory_config=PL)
         kk = c.route_scale * c.gate_softcap * c.up_softcap
-        if "Mgu" in d and T > 128:  # kernels/ink_moex_*: only the routed (token, expert) pairs, X rows by token
+        if "Mgu" in d and T >= 128:  # kernels/ink_moex_*: only the routed (token, expert) pairs, X rows by token
             _, ids = ttnn.topk(sb, c.top_k, dim=-1, largest=True, sorted=True, memory_config=DRAM)
             sg = ttnn.gather(s, -1, index=ids, memory_config=DRAM)  # [T, 8] the chosen experts' sigmoids
             wk = ttnn.multiply(sg, ttnn.sum(sg, dim=-1, keepdim=True, memory_config=DRAM),
@@ -317,7 +318,11 @@ class PrefillMixin:
                                memory_config=DRAM)
             wk = ttnn.multiply(ttnn.typecast(wk, ttnn.bfloat16), self.P_VALID, memory_config=DRAM)  # padding: skipped
             xr = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT, memory_config=DRAM)
-            return d["moek"].prefill_moex(xr, ids, wk, d["Mgu"], d["Mdn"], self.p_moe_out, nb=8)
+            # two groups of 36 cores, every other expert entry each (partial sums added); settings measured best
+            # at 512 rows (4.1 ms vs 5.5 ms for one group without the pipelining; fits the L1 left by the decode buffers)
+            d["moek"].prefill_moex(xr, ids, wk, d["Mgu"], d["Mdn"], self.p_moe_out, nb=6, sblk=4, dblk=1,
+                                   out2=self.p_moe_out2)
+            return ttnn.add(self.p_moe_out, self.p_moe_out2, memory_config=PL)
         vals, _ = ttnn.topk(sb, c.top_k, dim=-1, largest=True, sorted=True, memory_config=PL)
         kth = ttnn.slice(vals, (0, 0, 0, c.top_k - 1), (1, 1, T, c.top_k), memory_config=PL)
         w = ttnn.multiply(s, ttnn.ge(sb, kth, memory_config=PL), memory_config=PL)  # dense routing weights

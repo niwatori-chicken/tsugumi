@@ -24,6 +24,7 @@ constexpr uint32_t MT = get_compile_time_arg_val(3);
 constexpr uint32_t IDB = get_compile_time_arg_val(4);
 constexpr uint32_t DBLK = get_compile_time_arg_val(5);
 constexpr uint32_t SBLK = get_compile_time_arg_val(6);  // staging blocks
+constexpr uint32_t NS = 4;  // batches in SHARE (b - 2 .. b + 1 live: the pipeline)
 constexpr uint32_t CTM = MT < 2 ? MT : 2;
 constexpr uint32_t E = 128, KT = 72, IT = 36, T = 32 * MT, K = 8, PMAX = T * K;
 constexpr uint32_t HALFB = 2304, ROWB = 4608;  // half a row / a row of X (bf16)
@@ -34,21 +35,29 @@ FORCE_INLINE uint32_t elem_off(uint32_t r, uint32_t c) {
     return ((r >> 4) * 2 + (c >> 4)) * 256 + (r & 15) * 16 + (c & 15);
 }
 
-uint32_t g_dbg = 0;  // 1 no weight reads, 4 no act-tile gather, 8 no X reads
+#define TSC() (*reinterpret_cast<volatile uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L))
+#define PROF(i, ...)                \
+    {                               \
+        const uint32_t _t = TSC();  \
+        __VA_ARGS__;                \
+        prof[i] += TSC() - _t;      \
+    }
+uint32_t g_dbg = 0;
+uint32_t prof[16];  // (profiling) wall-clock cycles per wait kind  // 1 no weight reads, 4 no act-tile gather, 8 no X reads
 
 struct Ring {
     CircularBuffer& cw;
     uint32_t pb, base, wr = 0, inflight = 0, issued = 0;
     Ring(CircularBuffer& c, uint32_t pb_) : cw(c), pb(pb_), base(c.get_write_ptr()) {}
     void push_oldest() {
-        noc_async_read_barrier_with_trid(1 + (issued - inflight) % NBUF);
+        PROF(1, noc_async_read_barrier_with_trid(1 + (issued - inflight) % NBUF));
         cw.push_back(B);
         wr = (wr + 1) % NBUF;
         --inflight;
     }
     void issue(uint32_t bank, uint32_t addr) {
         if (inflight == MAXF) push_oldest();
-        cw.reserve_back((inflight + 1) * B);
+        PROF(2, cw.reserve_back((inflight + 1) * B));
         const uint32_t l1 = base + ((wr + inflight) % NBUF) * B * pb;
         if (!(g_dbg & 1)) {
             noc_async_read_set_trid(1 + issued % NBUF);
@@ -78,6 +87,8 @@ void kernel_main() {
     const uint32_t gu = get_arg_val<uint32_t>(3), dn = get_arg_val<uint32_t>(4), c = get_arg_val<uint32_t>(5);
     const uint32_t pb = get_arg_val<uint32_t>(6), NB = get_arg_val<uint32_t>(7), ncores = get_arg_val<uint32_t>(8);
     g_dbg = get_arg_val<uint32_t>(9 + 2 * ncores);
+    const uint32_t t_start = TSC();
+    for (uint32_t i = 0; i < 16; ++i) prof[i] = 0;
     // core groups: group g of NG takes the entries j with j % NG == g (its own barrier, X shares, partial output)
     const uint32_t NG = get_arg_val<uint32_t>(10 + 2 * ncores), grp = get_arg_val<uint32_t>(11 + 2 * ncores);
     constexpr uint32_t TB = 2048;
@@ -164,9 +175,6 @@ void kernel_main() {
     table[0] = U;
     cctl.push_back(1);
     cls.push_back(1);
-    // staging starts finite (rows beyond an entry's tokens are stale, multiplied by a zero routing weight)
-    cstg.reserve_back(SBLK * IT);
-    zero_l1(cstg.get_write_ptr(), SBLK * IT * TB);
     const uint32_t first = (c / 4) % 2;
     const uint32_t slot = c / 4;
     volatile tt_l1_ptr uint32_t* go = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(1));
@@ -183,32 +191,17 @@ void kernel_main() {
     noc_semaphore_inc(get_noc_addr(get_arg_val<uint32_t>(9), get_arg_val<uint32_t>(10), get_semaphore(0)), 1);
     noc_async_atomic_barrier();
     if (c == 0) release(1);
-    noc_semaphore_wait_min(go, 1);
+    PROF(5, noc_semaphore_wait_min(go, 1));
+    prof[8] = TSC() - t_start;  // pairs, lists, X share, round 1
     Ring ring(cw, pb);
     const uint32_t nbatch = (U + NB - 1) / NB;
-    for (uint32_t b = 0; b < nbatch; ++b) {
+    // software pipeline as the compute: gate_up weights of batch b + 1, then the down of batch b
+    auto gate_up_batch = [&](uint32_t b) {
         const uint32_t j0 = b * NB, j1 = (j0 + NB < U) ? j0 + NB : U;
         for (uint32_t j = j0; j < j1; ++j) {
             const uint32_t e = ee[j];
             const uint32_t o = table[1 + j] & 0xFFFF, n = table[1 + j] >> 16, ct = (n + 31) / 32;
-            for (uint32_t m = 0; m < ct; ++m) {
-                const uint32_t rows = (n - 32 * m) < 32 ? n - 32 * m : 32;
-                for (uint32_t h = 0; h < 2; ++h) {
-                    // the compute frees staging only after the previous entry's gate_up: push the weights first
-                    if (!cstg.pages_reservable_at_back(IT)) ring.flush();
-                    cstg.reserve_back(IT);  // 32 rows x 1152 columns, row-major
-                    const uint32_t l1 = cstg.get_write_ptr();
-                    noc_async_read_set_trid(TR_X);
-                    if (!(g_dbg & 8))
-                        for (uint32_t r = 0; r < rows; ++r) {
-                            const uint32_t t = tok[o + 32 * m + r], ow = t % NC;
-                            noc_async_read(get_noc_addr(get_arg_val<uint32_t>(9 + 2 * ow), get_arg_val<uint32_t>(10 + 2 * ow),
-                                                        xs + (t / NC) * ROWB + h * HALFB), l1 + r * HALFB, HALFB);
-                        }
-                    noc_async_read_barrier_with_trid(TR_X);
-                    cstg.push_back(IT);
-                }
-            }
+            // (the tokens' rows of X: the writer)
             cwc.reserve_back(CTM);  // column 0 row r = routing weight of token L[r] (0 beyond n)
             volatile tt_l1_ptr uint16_t* wc = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(cwc.get_write_ptr());
             for (uint32_t r = 0; r < 32 * ct; ++r) wc[(r >> 5) * 1024 + elem_off(r & 31, 0)] = r < n ? ws[o + r] : 0;
@@ -219,25 +212,28 @@ void kernel_main() {
                 for (uint32_t g = 0; g < 72 / B; ++g) ring.issue(c % 4 + 4 * h, base + g * B * pb);
             }
         }
-        ring.flush();  // the compute needs the whole batch's gate_up before the barrier
+    };
+    auto down_batch = [&](uint32_t b) {
+        const uint32_t j0 = b * NB, j1 = (j0 + NB < U) ? j0 + NB : U;
+        ring.flush();  // the compute needs its gate_up weights while this core waits at the barrier
         const uint32_t base0 = dn + (ee[j0] * 9 + slot) * 36 * pb;
         for (uint32_t g = 0; g < MAXF - 1 && g < 36 / B; ++g) ring.issue(c % 4 + 4 * first, base0 + g * B * pb);
         if (c == 0) release(b + 2);  // coordinator: release batch b once every core's writer arrived
-        noc_semaphore_wait_min(go, b + 2);
+        PROF(5, noc_semaphore_wait_min(go, b + 2));
         for (uint32_t j = j0; j < j1; ++j) {
             const uint32_t e = ee[j];
             const uint32_t ct = ((table[1 + j] >> 16) + 31) / 32;
-            const uint32_t sa = share + ((b % 2) * NB + (j - j0)) * CTM * TB;  // this entry's act tiles, every core
+            const uint32_t sa = share + ((b % NS) * NB + (j - j0)) * CTM * TB;  // this entry's act tiles, every core
             // the compute frees a D block only after its down: push the weights first
             if (!cd.pages_reservable_at_back(IT * CTM)) ring.flush();
-            cd.reserve_back(IT * CTM);  // compact tile (m, kt) at m * IT + kt; m < ct read
+            PROF(6, cd.reserve_back(IT * CTM));  // compact tile (m, kt) at m * IT + kt; m < ct read
             const uint32_t dl = cd.get_write_ptr();
             noc_async_read_set_trid(TR_D);
             for (uint32_t kt = 0; kt < IT && !(g_dbg & 4); ++kt)
                 for (uint32_t m = 0; m < ct; ++m)
                     noc_async_read(get_noc_addr(get_arg_val<uint32_t>(9 + 2 * kt), get_arg_val<uint32_t>(10 + 2 * kt),
                                                 sa + m * TB), dl + (m * IT + kt) * TB, TB);
-            noc_async_read_barrier_with_trid(TR_D);
+            PROF(7, noc_async_read_barrier_with_trid(TR_D));
             cd.push_back(IT * CTM);
             for (uint32_t hh = 0; hh < 2; ++hh) {
                 const uint32_t h = hh ^ first;
@@ -248,11 +244,26 @@ void kernel_main() {
                 }
             }
         }
+    };
+    if (nbatch) gate_up_batch(0);
+    for (uint32_t b = 0; b < nbatch; ++b) {
+        if (b + 1 < nbatch) gate_up_batch(b + 1);
+        down_batch(b);
     }
     ring.flush();
     if (c == 0) release(nbatch + 2);  // final round: every core has read every share slot and X row
-    noc_semaphore_wait_min(go, nbatch + 2);
+    PROF(5, noc_semaphore_wait_min(go, nbatch + 2));
     cxs.push_back(1);
+    const uint32_t pa = get_arg_val<uint32_t>(12 + 2 * ncores);
+    if (pa) {  // (profiling) [0] total, [9] U, [10] batches -> row c * 3 of PROF
+        prof[0] = TSC() - t_start;
+        prof[9] = U;
+        prof[10] = nbatch;
+        volatile tt_l1_ptr uint32_t* pl = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cidx.get_write_ptr());
+        for (uint32_t i = 0; i < 16; ++i) pl[i] = prof[i];
+        noc_async_write(cidx.get_write_ptr(), get_noc_addr_from_bank_id<true>(0, pa + (grp * 36 + c) * 3 * 64), 64);
+        noc_async_write_barrier();
+    }
     ctmp.push_back(1);
     cidx.push_back(2);
 }

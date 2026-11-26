@@ -226,7 +226,8 @@ class InkMoE:
         ttnn.generic_op([x, route, used, gu, dn, out], prog)
         return out
 
-    def prefill_moex(self, xr, ids, wk, gu, dn, out, dbg=0, nps=8, dblk=1, nb=None, sblk=2, out2=None):
+    def prefill_moex(self, xr, ids, wk, gu, dn, out, dbg=0, nps=8, dblk=1, nb=None, sblk=2, out2=None, prof=None,
+                     ring=None):
         """Long chunks (kernels/ink_moex_*): only the routed (token, expert) pairs. xr: row-major bf16 [1,1,T,H] in
         DRAM (the tokens' rows are read per expert); ids / wk: the top-k expert ids (uint16 / uint32) and routing
         weights (bf16, 0 = skip) as [1,1,T,8] tiles; out [1,1,T,H] bf16 tiles. T = 32 MT, MT <= 16."""
@@ -238,7 +239,7 @@ class InkMoE:
         assert T == 32 * MT and MT <= 16 and xr.layout == ttnn.ROW_MAJOR_LAYOUT
         CTM = min(MT, 2)
         bf, f32 = ttnn.bfloat16, ttnn.float32
-        NB, ring = nb or self.NB, self.ring
+        NB, ring = nb or self.NB, ring or self.ring
         idb = {ttnn.uint16: 2, ttnn.uint32: 4}[ids.dtype]
         PMAX = T * 8
         raw = lambda i, size: ttnn.CBDescriptor(total_size=size, core_ranges=cores, format_descriptors=[
@@ -249,9 +250,9 @@ class InkMoE:
                ttnn.CBDescriptor(total_size=8192, core_ranges=cores, format_descriptors=[
                    ttnn.CBFormatDescriptor(buffer_index=6, data_format=bf, page_size=4096)]),
                _cbd(cores, 8, CTM, bf), _cbd(cores, 9, CTM, bf), _cbd(cores, 10, 1, bf), _cbd(cores, 12, 1, bf),
-               _cbd(cores, 13, 2 * NB * CTM, bf), _cbd(cores, 14, 2 * CTM, bf), _cbd(cores, 15, 2 * MT, f32),
+               _cbd(cores, 13, 4 * NB * CTM, bf), _cbd(cores, 14, 2 * CTM, bf), _cbd(cores, 15, 2 * MT, f32),
                _cbd(cores, 16, 4, bf), raw(17, 1024 + 4 * PMAX), _cbd(cores, 18, 4 * CTM, bf),
-               raw(19, ((5 * PMAX + 768 + 31) // 32) * 32), raw(20, ((nps * 65 + 31) // 32) * 32)]
+               raw(19, ((5 * PMAX + 768 + 31) // 32) * 32), raw(20, ((nps * 65 + 31) // 32) * 32), raw(21, 128)]
         Kd = lambda src, ct, rt, cfg: ttnn.KernelDescriptor(
             kernel_source=os.path.join(KDIR, src), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores, compile_time_args=ct, runtime_args=rt, config=cfg)
@@ -264,9 +265,12 @@ class InkMoE:
             nocxy = [v for n in noc for v in (n.x, n.y)]
             for c, xy in enumerate(coords):
                 r_rt.append((xy, [xr.buffer_address(), ids.buffer_address(), wk.buffer_address(), gu.buffer_address(),
-                                  dn.buffer_address(), c, self.pb, NB, self.NC] + nocxy + [dbg, len(groups), g]))
+                                  dn.buffer_address(), c, self.pb, NB, self.NC] + nocxy +
+                              [dbg, len(groups), g, prof.buffer_address() if prof is not None else 0]))
                 c_rt.append((xy, [fbits(1.0 / self.gc), fbits(1.0 / self.uc), (c // 4) % 2, NB, MT, dbg]))
-                w_rt.append((xy, [o.buffer_address(), c, noc[0].x, noc[0].y, NB, MT, dbg]))
+                w_rt.append((xy, [o.buffer_address(), c, noc[0].x, noc[0].y, NB, MT, dbg,
+                                  prof.buffer_address() if prof is not None else 0, g * 36 + c, len(coords)] + nocxy +
+                             [sblk]))
         sems = [ttnn.SemaphoreDescriptor(id=0, core_ranges=cores, initial_value=0),
                 ttnn.SemaphoreDescriptor(id=1, core_ranges=cores, initial_value=0)]
         prog = ttnn.ProgramDescriptor(kernels=[

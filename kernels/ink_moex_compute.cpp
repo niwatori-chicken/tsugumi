@@ -25,6 +25,20 @@
 constexpr uint32_t c_STG = 0, c_W = 1, c_D = 2, c_PS = 3, c_X = 4, c_CG = 8, c_CU = 9, c_A = 10, c_CTL = 12,
                    c_SH = 13, c_WC = 14, c_ACC = 15, c_O = 16, c_Y = 18;
 
+#ifdef TRISC_UNPACK
+#define TSC() (*reinterpret_cast<volatile uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L))
+#define PROF(i, ...)                \
+    {                               \
+        const uint32_t _t = TSC();  \
+        __VA_ARGS__;                \
+        prof[i] += TSC() - _t;      \
+    }
+#else
+#define TSC() 0u
+#define PROF(i, ...) __VA_ARGS__;
+#endif
+uint32_t prof[16];
+
 FORCE_INLINE void pack_to(uint32_t dst, uint32_t cb) {
     cb_reserve_back(cb, 1);
     pack_reconfig_data_format(cb);
@@ -43,6 +57,8 @@ void kernel_main() {
     const uint32_t dbg = get_arg_val<uint32_t>(5);
     const uint32_t CTM = MT < 2 ? MT : 2;
     compute_kernel_hw_startup(c_W, c_X, c_CG);
+    const uint32_t t_start = TSC();
+    for (uint32_t i = 0; i < 16; ++i) prof[i] = 0;
     // ACC = 0
     cb_reserve_back(c_ACC, 2 * MT);
     pack_reconfig_data_format(c_ACC);
@@ -57,7 +73,9 @@ void kernel_main() {
     cb_wait_front(c_CTL, 1);
     const uint32_t U = read_tile_value(c_CTL, 0, 0);
     const uint32_t nbatch = (U + NB - 1) / NB;
-    for (uint32_t b = 0; b < nbatch; ++b) {
+    // software pipeline: gate_up / act of batch b + 1 before the down of batch b (hides the barrier and the
+    // act-tile gather)
+    auto gate_up_batch = [&](uint32_t b) {
         const uint32_t j0 = b * NB, n = (j0 + NB < U) ? NB : U - j0;
         for (uint32_t jj = 0; jj < n; ++jj) {
             const uint32_t ct = (read_tile_value(c_CTL, 0, 1 + 2 * (j0 + jj)) + 31) / 32;
@@ -69,7 +87,7 @@ void kernel_main() {
             for (uint32_t blk = 0; blk < 2 * CTM; ++blk) {
                 cb_reserve_back(c_X, 36);
                 if (blk < 2 * ct) {
-                    cb_wait_front(c_STG, 36);
+                    PROF(2, cb_wait_front(c_STG, 36));
                     if (!(dbg & 16)) tilize_block(c_STG, 36, c_X);
                     cb_pop_front(c_STG, 36);
                 }
@@ -84,7 +102,7 @@ void kernel_main() {
             reconfig_data_format(c_W, c_X);
             matmul_block_init(c_X, c_W, 0, 2, ct, 72);
             for (uint32_t g = 0; g < 6; ++g) {
-                cb_wait_front(c_W, 24);
+                PROF(1, cb_wait_front(c_W, 24));
                 const uint32_t kt0 = ((g + 3 * first) % 6) * 12;
                 if (!(dbg & 2))
                     for (uint32_t i = 0; i < 12; ++i) matmul_block(c_X, c_W, kt0 + i, 2 * i, 0, 0, 2, ct, 72);
@@ -105,7 +123,7 @@ void kernel_main() {
             // act on the compact tiles
             cb_wait_front(c_CG, CTM);
             cb_wait_front(c_CU, CTM);
-            cb_wait_front(c_WC, CTM);
+            PROF(6, cb_wait_front(c_WC, CTM));
             for (uint32_t m = 0; m < ct && !(dbg & 64); ++m) {
                 tile_regs_acquire();
                 reconfig_data_format_srca(c_CG);
@@ -155,18 +173,21 @@ void kernel_main() {
             cb_pop_front(c_CU, CTM);
             cb_pop_front(c_WC, CTM);
         }
+    };
+    auto down_batch = [&](uint32_t b) {
+        const uint32_t j0 = b * NB, n = (j0 + NB < U) ? NB : U - j0;
         for (uint32_t jj = 0; jj < n; ++jj) {
             const uint32_t ct = (read_tile_value(c_CTL, 0, 1 + 2 * (j0 + jj)) + 31) / 32;
             const uint32_t mask = read_tile_value(c_CTL, 0, 2 + 2 * (j0 + jj));
             // down -> Y (compact tile (mi, nn) at 2 mi + nn)
-            cb_wait_front(c_D, 36 * CTM);
+            PROF(3, cb_wait_front(c_D, 36 * CTM));
             tile_regs_acquire();
             fill_tile_init();
             for (uint32_t i = 0; i < 2 * ct; ++i) fill_tile(i, 0.0f);
             reconfig_data_format(c_W, c_D);
             matmul_block_init(c_D, c_W, 0, 2, ct, 36);
             for (uint32_t g = 0; g < 6; ++g) {
-                cb_wait_front(c_W, 12);
+                PROF(4, cb_wait_front(c_W, 12));
                 const uint32_t kt0 = ((g + 3 * first) % 6) * 6;
                 if (!(dbg & 2))
                     for (uint32_t i = 0; i < 6; ++i) matmul_block(c_D, c_W, kt0 + i, 2 * i, 0, 0, 2, ct, 36);
@@ -185,7 +206,7 @@ void kernel_main() {
             matmul_init(c_PS, c_Y, 0);
             for (uint32_t m = 0; m < MT; ++m) {
                 if (!((mask >> m) & 1)) continue;
-                cb_wait_front(c_PS, CTM);
+                PROF(5, cb_wait_front(c_PS, CTM));
                 if (!(dbg & 32)) {
                     tile_regs_acquire();
                     for (uint32_t nn = 0; nn < 2; ++nn)
@@ -202,7 +223,19 @@ void kernel_main() {
             }
             cb_pop_front(c_Y, 2 * CTM);
         }
+    };
+    if (nbatch) gate_up_batch(0);
+    for (uint32_t b = 0; b < nbatch; ++b) {
+        if (b + 1 < nbatch) gate_up_batch(b + 1);
+        down_batch(b);
     }
+#ifdef TRISC_UNPACK
+    {  // (profiling) counters -> CB 21 for the writer
+        prof[0] = TSC() - t_start;
+        volatile uint32_t* pl = reinterpret_cast<volatile uint32_t*>(get_local_cb_interface(21).fifo_rd_ptr << 4);
+        for (uint32_t i = 0; i < 16; ++i) pl[i] = prof[i];
+    }
+#endif
     cb_push_back(c_ACC, 2 * MT);
     cb_wait_front(c_ACC, 2 * MT);
     reconfig_data_format_srca(c_ACC);
