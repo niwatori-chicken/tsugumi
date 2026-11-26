@@ -209,11 +209,12 @@ export TSUGUMI_CACHE_DIR=/path/to/tsugumi_cache/inkling   # 変換済み重み (
   NVFP4 を bfp4 に詰め直すと重みの誤差が約 11% 増えるため (bfp8 なら 0.7%)、既定は bfp8 です。注意の重みと lm_head は bfp8、KV は bfp8。
   P150A (32GB) で DRAM 使用 26.8 GiB (`--max-seq 32768`)。mixed は P100A (28GB) 向けですが、P100A では未確認です。
 - 速度 (P150A、`--max-seq 32768`、計測は各 1〜数回): デコード **約 27 tok/s** (1 ステップ約 31ms。文脈 30k でも
-  ほぼ同じ)、prefill **約 615〜770 tok/s** (512 トークンずつ。4k で 5.3 秒、30k で 49 秒)、短いプロンプトの応答開始
-  約 0.6 秒 (`TSUGUMI_INKLING_PREFILL_T=128` なら長い prefill 約 380 tok/s、短いプロンプト約 0.4 秒)。
+  ほぼ同じ)、prefill **約 630〜800 tok/s** (512 トークンずつ。4k で 5.1 秒、30k で 48 秒)、短いプロンプトの応答開始
+  約 0.6 秒 (`TSUGUMI_INKLING_PREFILL_T=128` なら長い prefill 約 450 tok/s、短いプロンプト約 0.4 秒)。
   prefill の MoE は各エキスパートに振られたトークンだけを詰めて計算します (512 行は `ink_moex_*`: トークンの X 行を
   MoE コア群の L1 に分散した X から集めてタイル化、gate_up / act / down をその行だけ、0/1 配置タイルと packer の
-  L1 累積で元の行へ足し戻し)。注意のマスク (窓内の相対バイアス、窓外 0 / -1e9、sink 列) は選択だけのカーネル
+  L1 累積で元の行へ足し戻し。36 コアの 2 グループが交互にエキスパートを担当し、次のバッチの gate_up を
+  前のバッチの down より先に流してバリア待ちを隠します)。注意のマスク (窓内の相対バイアス、窓外 0 / -1e9、sink 列) は選択だけのカーネル
   (`ink_mask.cpp`) で層ごとに作り、ttnn の SDPA に渡します。K / V はキャッシュのタイル単位で全コアに分けて書きます
   (`kv_write_rows.cpp`)。
   prefill の全注意層は文脈の長さに応じたバケット (4k / 8k / 16k / 全体、`TSUGUMI_INKLING_PREFILL_BUCKETS`)
