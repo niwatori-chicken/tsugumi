@@ -67,6 +67,7 @@
 | `make_draft_vocab.py [N]` | MTP 下書き用の語彙表 `tsugumi/draft_vocab.pt` を作る (分野ごとに重みを揃えた頻度)。評価用テキストでのカバー率も表示 |
 | `mmbench.py` | デコード用行列積 (DRAM シャーディング) の実効帯域。ワーカー数・in0_block_w の掃引 |
 | `bench_small_matmul.py [--sweep] [--shapes KxN,...]` | 小さい行列積 (MoE の専門家の大きさ) の 1 本あたりの時間をトレースで測る。DecodeLinear / ttnn.matmul の比較と固定費の当てはめ。`--sweep` は in0 のコア数と in0_block_w の掃引 (doc/12) |
+| `moe_route_stats.py collect|analyze` | MoE (Qwen3.6-35B-A3B) が実テキストで選ぶ専門家を CPU で 1 層ずつ記録し、連続 T トークンの和集合、無関係な B リクエストの和集合、prefill の専門家ごとの行数の偏りを集計 (doc/12) |
 | `mmlarge.py [M ...]` | 大きい M の行列積 (`minimal_matmul` / `ttnn.linear`) を bfp4 重みで計測 |
 | `bench_parts.py` | デコード 1 ステップの部品ごとのデバイス時間 |
 | `bench_spec_parts.py` | T 行モードの部品ごとのデバイス時間 |
