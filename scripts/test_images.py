@@ -77,6 +77,7 @@ def text_image(text, size=(1000, 240)):
 def ask(parts, max_tokens=80, **kw):
     content = [{"type": "image_url", "image_url": {"url": p}} if p.startswith("data:") else {"type": "text", "text": p}
                for p in parts]
+    kw.setdefault("temperature", 0)  # greedy: the checks compare outputs
     return dict(messages=[{"role": "user", "content": content}], max_tokens=max_tokens, **kw)
 
 

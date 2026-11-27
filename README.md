@@ -2,7 +2,7 @@
 
 名前はツグミ (*Turdus eunomus*) に由来します。冬になるとシベリアから海を越えて日本に渡ってくる、身近な小さな鳥です。
 
-27B の dense モデル (Gated DeltaNet 48 層 + full attention 16 層) を、Blackhole **P100A 1 枚 (28GB、448GB/s)** でできるだけ速く動かすためのtt-metal / ttnn 上に構築された推論エンジンです。
+27B の dense モデル (Gated DeltaNet 48 層 + full attention 16 層) を、Blackhole **P100A 1 枚 (28GB、448GB/s) / P150A 1 枚 (32GB、512GB/s)** でできるだけ速く動かすためのtt-metal / ttnn 上に構築された推論エンジンです。
 
 HTTP経由でOpenAI 互換サーバーとして使うことができます。
 
@@ -13,10 +13,10 @@ HTTP経由でOpenAI 互換サーバーとして使うことができます。
 | デコード (コード生成、貪欲法) | **40〜50 tok/s** |
 | デコード (コードの修正・文章の校正など、プロンプトを写す応答) | **75〜115 tok/s** (n-gram 下書き) |
 | デコード (日本語の説明文 / 英語の物語) | 30~40 tok/s |
-| prefill (数千トークンのプロンプト) | **約 1,500〜2,000 tok/s** (4,000 トークンで応答開始まで約 2 秒) |
+| prefill (数千トークンのプロンプト) | **約 2,000〜2,700 tok/s** (4,000 トークンで応答開始まで約 2 秒) |
 | 最大文脈 | **262,144 トークン** (モデルの上限。KV は bfp8 で約 9GiBで、ボード上に収まります) |
-| 12.7 万トークンのプロンプト | prefill 110 秒 (1,150 tok/s)、デコード 36 tok/s、「干し草山(Needle-in-a-haystack)」テスト合格 |
-| 24.5 万トークンのプロンプト | prefill 307 秒 (800 tok/s)、デコード 30 tok/s、「干し草山」テスト合格 |
+| 12.7 万トークンのプロンプト | prefill 約 72 秒 (約 1,750 tok/s)、デコード 36 tok/s、「干し草山(Needle-in-a-haystack)」テスト合格 |
+| 24.5 万トークンのプロンプト | prefill 191 秒 (1,290 tok/s)、デコード 30 tok/s、「干し草山」テスト合格 |
 | 複数リクエストの同時処理 (`TSUGUMI_BATCH=8`、**P150A で計測**、条件は「複数リクエストの同時処理」) | 8 並列で**合計 152 tok/s** (1 リクエストあたりのデコード 22.6 tok/s)、4 並列で合計 102 tok/s。同じ条件で 1 本だけなら合計 37.9 tok/s |
 
 - 投機的デコードの出力は、通常の貪欲法 (1 トークンずつ) の出力と一致します (コードのプロンプトで確認)。サンプリングも同じ分布です。
@@ -105,8 +105,14 @@ export TSUGUMI_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(
   (ステップの切れ目で判定するので最大 7 トークン超える)。上限を指定したときは `max_tokens` は答えの分だけを数えます。
 - `logprobs` / `top_logprobs` (20 まで、completions は `logprobs: n`): デバイスの上位 64 の logits での log-softmax なので
   少し高めに出ます (64 の外は差し込んだトークンだけで -9999)。chat では本文のトークンだけです (思考は含まない)。
-- サンプリングは `temperature` > 0 で `top_p`、`top_k` (64 まで)、`min_p`、`seed` が有効になります。`temperature` がなければ貪欲法となります。
-  MTP の投機的デコードのまま厳密です (1 トークンずつ引いたのと同じ分布)。Qwen の推奨は thinking オフで 0.7 / 0.8 / 20、オンで 0.6 / 0.95 / 20です。
+- サンプリング: リクエストに `temperature` がないときは、Qwen3.8 のモデルカードの推奨値を thinking のオン / オフで使い分けます。
+  thinking オフは temperature 0.7 / top_p 0.8 / top_k 20 / `presence_penalty` 1.5 (繰り返しの抑制)、オンは 1.0 / 0.95 / 20 です。
+  Inkling 2 Mini では、モデルの `generation_config.json` の推奨どおり temperature 1.0 (top_p / top_k の指定なし) です。
+  リクエストで指定した項目はそちらが優先されます。`temperature` を指定したときは指定どおりで、0 なら貪欲法です。
+  以前のように「`temperature` がなければ貪欲法」にするには `--sampling-defaults greedy` (`TSUGUMI_SAMPLING_DEFAULTS`)。
+  `top_p`、`top_k` (64 まで)、`min_p`、`seed` と、`presence_penalty`・`frequency_penalty` (-2〜2、生成したトークンが対象。貪欲法でも有効)
+  に対応します。どれも MTP の投機的デコードのまま厳密です (1 トークンずつ引いたのと同じ分布・同じ出力)。
+  ペナルティはデバイスが返す上位 64 の logits にかけるので、上位の多くが大きく下がったときだけ近似になります。
 - ツール呼び出し: `tools` / `tool_choice` / 履歴の `tool_calls` と `role: tool` に対応しています (OpenAI 形式、ストリーミングも)。
   モデルが出す `<tool_call>` の XML を `tool_calls` に変換します (`tsugumi/toolcall.py`)。
   `tool_choice` は auto / none。required と関数名の指定は thinking オフのときだけ有効です (応答の先頭を `<tool_call>` にする)。
@@ -182,6 +188,7 @@ TSUGUMIサーバーが起動時に読み取る環境変数
 | `TSUGUMI_SERVED_MODEL_NAME` | サーバーが返すモデル名称を上書きする。デフォルトはモデルのディレクトリ名です。 |
 | `TSUGUMI_HANG_BACKSTOP` | トークンがこの環境変数以上の秒数出力されない場合、強制終了する。デフォルトは300秒です。 |
 | `TSUGUMI_BOARD_POLL` | サーバーが`tt-smi`からボードの状態を読み取る間隔。デフォルトは10秒です。 |
+| `TSUGUMI_SAMPLING_DEFAULTS` | `temperature` のないリクエストの扱い。`model` (既定) はモデルの推奨値、`greedy` は貪欲法。 |
 | `TSUGUMI_THINKING_BUDGET` | モデルが思考(CoT)に使えるトークン数の上限。デフォルトは無制限です。 |
 | `TSUGUMI_IMAGES=0` | 画像入力を無効にする (ViT を読み込まない。DRAM 0.52 GiB の節約) |
 | `TSUGUMI_VISION_DEVICE=0` | ViT を CPU で動かす (fp32、ホストの RAM 約 1.8GB、1024×1024 で約 14 秒と遅くなります) |
@@ -255,7 +262,7 @@ export TSUGUMI_CACHE_DIR=/path/to/tsugumi_cache/inkling   # 変換済み重み (
   各トークン後の状態をスロットに残すので、投機的デコードで「確定した位置」から次を再開できる。
 - **T 行モード** (`forward_spec`): T 行のトークンをまとめて流す。検証は T=4 (n-gram 下書きのときは T=8)
   conv の履歴はホストが書く 0/1 の選択行列との行列積でずらすので、トレースを固定したまま採択数に追従できる。
-- **大きい T の prefill** (`tsugumi/prefill.py`): プロンプトは最大 1024 行ずつ、`minimal_matmul` (同じ bfp4 重み)、
+- **大きい T の prefill** (`tsugumi/prefill.py`): プロンプトは最大 2048 行ずつ、`minimal_matmul` (同じ bfp4 重み)、
   チャンク並列の GDN (`ttnn.transformer.chunk_gated_delta_rule`)、自作の因果 conv カーネル (`kernels/conv_*.cpp`)、
   chunked SDPA で流す。終わったら GDN の状態と conv 履歴を T 行モードの形式に戻して、そのままデコードに入る。
 - **MTP 投機的デコード** (`MTPHead`、`tsugumi/generator.py`): 付属の MTP 層で 3 トークン先まで下書きし、本体で一括検証。

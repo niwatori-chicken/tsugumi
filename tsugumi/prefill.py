@@ -34,7 +34,7 @@ class LargePrefill:
     """Create before eng.capture_all(): its constant tensors must not be allocated after a trace capture
     (a replay can overwrite buffers allocated after the capture)."""
 
-    def __init__(self, eng, t_max=1024, t_min=64):
+    def __init__(self, eng, t_max=2048, t_min=64):
         self.eng, self.dev = eng, eng.dev
         self.t_max, self.t_min = t_max, t_min
         self.BS = 64
@@ -65,11 +65,21 @@ class LargePrefill:
             hs[h * self.Dv:(h + 1) * self.Dv, h] = 1.0 / self.Dv
         self.head_mean = up(hs.view(1, 1, self.vd, nvp))  # 1/Dv entries: exact in bf16
         hb = (hs.T * self.Dv).contiguous()  # [nvp, vd] 0/1 head -> columns
-        self.gnorm_w = {}  # per layer: head broadcast with the gated-norm weight folded in [1,1,nvp,vd]
+        # gated RMSNorm: one kernel on the head-major cgdr output (TSUGUMI_PREFILL_GNORM=0: the op sequence)
+        self.gnorm = None
+        self.gnorm_w, self.gnorm_c = {}, {}  # per layer: op path [1,1,nvp,vd] / kernel constants
+        if env("PREFILL_GNORM", "1") == "1":
+            from .gnorm_kernel import GatedNormKernel, gnorm_consts
+
+            self.gnorm = GatedNormKernel(self.dev, self.Nv, self.qkv_dim)
         for i, L in enumerate(eng.layers):
             if L["type"] == "linear_attention":
                 m = L["mix"]
-                self.gnorm_w[i] = up((hb * m._norm_w_host.float().repeat(self.Nv)[None]).view(1, 1, nvp, self.vd))
+                if self.gnorm is not None:
+                    self.gnorm_c[i] = gnorm_consts(self.dev, m._norm_w_host)
+                else:
+                    self.gnorm_w[i] = up((hb * m._norm_w_host.float().repeat(self.Nv)[None]).view(1, 1, nvp,
+                                                                                                    self.vd))
         self._shift_by_T = {}
         T = t_min
         while T <= t_max:  # persistent tensors must exist before the engine's traces are captured
@@ -79,6 +89,11 @@ class LargePrefill:
         from .conv_kernel import CausalConvKernel
 
         self.convk = CausalConvKernel(self.dev, self.qkv_dim)
+        self.rowsel = None  # conv output split into q/k/v + carry rows by a row gather (0: slices / selection matmul)
+        if env("PREFILL_CONV_SPLIT", "1") == "1":
+            from .conv_kernel import RowSelectKernel
+
+            self.rowsel = RowSelectKernel(self.dev, self.qkv_dim)
         self.timing = {}
         self.keep = None  # list: keep each chunk's final-normed hidden (eval)
         # SDPA chunk start as a device tensor: one program for every start position (an int start compiles a new
@@ -142,9 +157,33 @@ class LargePrefill:
 
     # ---------------- GDN ----------------
     def _conv(self, i, m, qkv, T, n):
-        """Causal conv + SiLU over [carry; qkv]; carry <- input rows n-3..n-1 (rows 29..31 of a tile)."""
-        out = ttnn.allocate_tensor_on_device(ttnn.Shape([1, 1, T, self.qkv_dim]), ttnn.bfloat16, ttnn.TILE_LAYOUT,
-                                             self.dev, DRAM)
+        """Causal conv + SiLU over [carry; qkv]; carry <- input rows n-3..n-1 (rows 29..31 of a tile).
+        Returns q [1,T,kd], k [1,T,kd], v [1,T,vd] (the conv kernel writes them separately), or with
+        TSUGUMI_PREFILL_CONV_SPLIT=0 the [1,1,T,qkv_dim] output."""
+        alloc = lambda shape: ttnn.allocate_tensor_on_device(ttnn.Shape(shape), ttnn.bfloat16, ttnn.TILE_LAYOUT,
+                                                             self.dev, DRAM)
+        if self.rowsel is not None:
+            out = (alloc([1, T, self.kd]), alloc([1, T, self.kd]), alloc([1, T, self.vd]))
+            self.convk(qkv, self.carry[i], m.taps, out, x_width=qkv.shape[-1], kd=self.kd)
+            # carry rows 29..31 <- input rows n-3..n-1: from at most 2 row tiles (of qkv, or the old carry if n < 3)
+            K1 = self.Kc - 1
+            srcs = []  # (tensor, row tile, row in tile) per output row
+            for r in range(K1):
+                src = n - K1 + r
+                srcs.append((qkv, src // 32, src % 32) if src >= 0 else (self.carry[i], 0, 32 + src))
+            (xa, ra), (xb, rb) = (srcs[0][0], srcs[0][1]), (srcs[-1][0], srcs[-1][1])
+            M = torch.zeros(1, 1, 64, 32)
+            for r, (x_, t_, w_) in enumerate(srcs):
+                half = 0 if (x_ is xa and t_ == ra) else 32
+                M[0, 0, half + 32 - K1 + r, w_] = 1.0
+            Mt = ttnn.from_torch(M, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.dev)
+            c = alloc([1, 1, 32, self.qkv_dim])
+            self.rowsel(xa, ra, xb, rb, Mt, c)
+            ttnn.deallocate(Mt)
+            ttnn.deallocate(self.carry[i])
+            self.carry[i] = c
+            return out
+        out = alloc([1, 1, T, self.qkv_dim])
         self.convk(qkv, self.carry[i], m.taps, out, x_width=qkv.shape[-1])
         M = torch.zeros(1, 1, 32, T)
         for r in range(self.Kc - 1):
@@ -163,7 +202,8 @@ class LargePrefill:
     def _gdn(self, i, m, h, T, n, mask):
         qd, zd, nv = self.qkv_dim, self.qkv_dim + self.vd, self.Nv
         y = self._mm(h, m.w_in, n=False)  # [1,1,T,Np]: qkv | z | a | b | pad (the conv kernel reads qkv in place)
-        z = ttnn.slice(y, (0, 0, 0, qd), (1, 1, T, zd), memory_config=DRAM)
+        fused = self.gnorm is not None  # the gated-norm kernel reads z from y: keep y instead of slicing z out
+        z = None if fused else ttnn.slice(y, (0, 0, 0, qd), (1, 1, T, zd), memory_config=DRAM)
         ab = ttnn.typecast(ttnn.slice(y, (0, 0, 0, zd), (1, 1, T, zd + 2 * nv), memory_config=DRAM), ttnn.float32)
         u = ttnn.add(ab, m.ab_bias, memory_config=DRAM)  # [a + dt_bias | b]
         ttnn.deallocate(ab)
@@ -180,22 +220,35 @@ class LargePrefill:
         _dbg(self.dev, 'gdn pre-conv done')
         conv = self._conv(i, m, y, T, n)
         _dbg(self.dev, 'conv done')
-        ttnn.deallocate(y)
-        kd = self.kd
-        q = ttnn.reshape(ttnn.slice(conv, (0, 0, 0, 0), (1, 1, T, kd), memory_config=DRAM), (1, T, kd))
-        k = ttnn.reshape(ttnn.slice(conv, (0, 0, 0, kd), (1, 1, T, 2 * kd), memory_config=DRAM), (1, T, kd))
-        v = ttnn.reshape(ttnn.slice(conv, (0, 0, 0, 2 * kd), (1, 1, T, qd), memory_config=DRAM), (1, T, self.vd))
-        ttnn.deallocate(conv)
+        if not fused:
+            ttnn.deallocate(y)
+        if isinstance(conv, tuple):
+            q, k, v = conv
+        else:
+            kd = self.kd
+            q = ttnn.reshape(ttnn.slice(conv, (0, 0, 0, 0), (1, 1, T, kd), memory_config=DRAM), (1, T, kd))
+            k = ttnn.reshape(ttnn.slice(conv, (0, 0, 0, kd), (1, 1, T, 2 * kd), memory_config=DRAM), (1, T, kd))
+            v = ttnn.reshape(ttnn.slice(conv, (0, 0, 0, 2 * kd), (1, 1, T, qd), memory_config=DRAM), (1, T, self.vd))
+            ttnn.deallocate(conv)
         eye, tril, ones, masks = self.consts
         o, fs = ttnn.transformer.chunk_gated_delta_rule(
             q, k, v, g2, b2, scale=m.scale, initial_state=self.state[i], output_final_state=True, chunk_size=32,
             eye=eye, tril=tril, ones=ones, masks=masks,
-            use_mcast=env("CGDR_MCAST", "1") == "1")
+            use_mcast=env("CGDR_MCAST", "1") == "1", output_head_major=fused)
         _dbg(self.dev, 'cgdr done')
         for t in (q, k, v, g2, b2):
             ttnn.deallocate(t)
         ttnn.deallocate(self.state[i])
         self.state[i] = fs
+        if fused:  # o [NV, T, Dv] TILE -> gated RMSNorm -> [1,1,T,vd] in one kernel (tsugumi/gnorm_kernel.py)
+            gated = ttnn.allocate_tensor_on_device(ttnn.Shape([1, 1, T, self.vd]), ttnn.bfloat16, ttnn.TILE_LAYOUT,
+                                                   self.dev, DRAM)
+            self.gnorm(o, y, self.gnorm_c[i], gated)
+            ttnn.deallocate(o)
+            ttnn.deallocate(y)
+            out = self._mm(gated, m.w_out, n=self.eng.H)
+            ttnn.deallocate(gated)
+            return out
         # gated RMSNorm per head in the [T, Nv*Dv] layout: o * rsqrt(mean_head(o^2) + eps) * w * silu(z)
         o = ttnn.to_layout(ttnn.reshape(o, (1, 1, T, self.vd)), ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16, memory_config=DRAM)
         sq = ttnn.multiply(o, o, memory_config=DRAM)
@@ -219,7 +272,7 @@ class LargePrefill:
     # ---------------- attention ----------------
     def _qkv_heads(self, A, h, T, cos, sin):
         NH, NKV, HD = A.NH, A.NKV, A.HD
-        y = self._mm(h, A.wqkvg, n=(2 * NH + 2 * NKV) * HD)
+        y = self._mm(h, A.wqkvg, n=False)  # padded N: q/k/v and the gate are sliced straight out of it
         qkv = ttnn.slice(y, (0, 0, 0, 0), (1, 1, T, (NH + 2 * NKV) * HD), memory_config=DRAM)
         gate = ttnn.slice(y, (0, 0, 0, (NH + 2 * NKV) * HD), (1, 1, T, (2 * NH + 2 * NKV) * HD), memory_config=DRAM)
         ttnn.deallocate(y)

@@ -11,7 +11,7 @@ from safetensors import safe_open
 from .attn import AttnDecode
 from .env import env
 from .gdn import GDNDecode, GDNWeights
-from .ops import DecodeLinear, has_cache
+from .ops import DecodeLinear, cache_path, has_cache
 
 _L1 = ttnn.L1_MEMORY_CONFIG
 TOPK = 64  # main-model logits kept per row for sampling (top_k is capped at this)
@@ -67,8 +67,21 @@ class MLPDecode:
         w3 = None if has_cache(cp("up"), gu) else sd[prefix + "up_proj.weight"].T.contiguous().to(torch.bfloat16)
         self.w3 = DecodeLinear(dev, w3, gu, cache_file=cp("up"), shape=(H, I), name="mlp_up")
         del w3
-        w2 = None if has_cache(cp("down"), dn) else sd[prefix + "down_proj.weight"].T.contiguous().to(torch.bfloat16)
-        self.w2 = DecodeLinear(dev, w2, dn, cache_file=cp("down"), shape=(I, H), name="mlp_down")
+        # down_proj with K zero-padded to gate/up's padded N (Np): the SiLU(g)*u activation is used as it is, without
+        # slicing it back to I (padded columns are SiLU(0)*0 = 0). Cached separately ("down_kp"); built once from the
+        # unpadded cache when there is one (bfp4/bfp8 values are exact in bf16, and re-quantizing them is exact).
+        Kp = self.w1.Np
+        pad = env("PAD_DOWN_K", "1") == "1" and Kp != I
+        name = "down_kp" if pad else "down"
+        w2 = None
+        if not has_cache(cp(name), dn):
+            if pad and has_cache(cp("down"), dn):
+                w2 = ttnn.to_torch(ttnn.load_tensor(cache_path(cp("down"), dn))).to(torch.bfloat16)[:I, :H]
+            else:
+                w2 = sd[prefix + "down_proj.weight"].T.contiguous().to(torch.bfloat16)
+            if pad:
+                w2 = torch.nn.functional.pad(w2, (0, 0, 0, Kp - I))
+        self.w2 = DecodeLinear(dev, w2, dn, cache_file=cp(name), shape=(Kp if pad else I, H), name="mlp_down")
 
     def __call__(self, x):
         g = self.w1(x, out_mem=None)  # width-sharded L1
@@ -820,7 +833,7 @@ class Qwen35Engine:
         self.use_T(self.T_dec)
         return last, start + pos, draft
 
-    def init_large_prefill(self, t_max=1024):
+    def init_large_prefill(self, t_max=2048):
         """Large-T prompt prefill (tsugumi/prefill.py); used by prefill() for prompts of 64+ tokens."""
         from .prefill import LargePrefill
 

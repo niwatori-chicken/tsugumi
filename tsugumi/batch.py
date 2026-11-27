@@ -577,6 +577,8 @@ class BatchScheduler:
         u = self.lanes.index(None)
         lane = Lane(u, job, gen.cur, list(eng.mrope))
         lane.p, lane.cur = len(job.ids), nxt
+        if job.sampler is not None:
+            job.sampler.observe(nxt)
         job.put((nxt, row))
         if lane.account(nxt, gen.eos) or job.cancelled:
             job.put(END)  # the conversation stays the Generator's current one (single-sequence state)
@@ -702,7 +704,10 @@ class BatchScheduler:
             u, job = ln.u, ln.job
             kk = len(ln.drafts)
             r0 = u * seg
-            pick = (lambda r: eng._greedy(v[r], i[r])) if job.sampler is None else (lambda r: job.sampler(v[r], i[r]))
+            if job.sampler is None:
+                pick = lambda r: eng._greedy(v[r], i[r])
+            else:  # row r0 + j: its prefix is the generated tokens + drafts[:j] (repetition penalties)
+                pick = lambda r, smp=job.sampler, ds=ln.drafts, r0=r0: smp.pick(v[r], i[r], ds[:r - r0])
             if ln.kind == "forced":
                 n = kk
                 del ln.queue[:kk]
@@ -717,6 +722,8 @@ class BatchScheduler:
                 job.stats["accepted"] += n
             stop = False
             for j, t in enumerate(new):
+                if job.sampler is not None:
+                    job.sampler.observe(t)
                 job.put((t, (v[r0 + j], i[r0 + j])))
                 if ln.account(t, gen.eos):
                     stop = True

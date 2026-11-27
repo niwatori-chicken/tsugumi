@@ -38,7 +38,9 @@
 | `test_kv_bfp8.py [max_seq]` | bfp8 の KV: 書き込みカーネルがホストの変換とビット単位で一致すること (タイル・ブロック境界、シャッフルしたページ表)、bfp8 の KV での GQA アテンション |
 | `test_gqa.py [max_seq]` | GQA split-K アテンション (自作) を torch と比較 (物理ブロックをシャッフルしたページ表で) |
 | `test_attn_large.py [T] [N]` | 大きい T の attention を torch fp32 と比較。<br>q/k (RoPE 後) と K キャッシュは要素ごとにも比較 |
+| `test_gnorm.py [T]` | GDN の gated RMSNorm カーネル (head-major の cgdr 出力 → [T, NV·128]) を torch fp64 と比較 |
 | `test_conv.py` | 因果 conv カーネル (大きい T の prefill 用) を torch fp64 と比較 |
+| `measure_prefill_dram.py T_MAX [N ...]` | 大きい T の prefill の作業用 DRAM のピーク (最小の空き・最大の連続空き) と速度。サーバーと同じ構成 (ViT、トレース取得後) |
 | `test_prefill_large.py [N] [t_max] [max_new]` | 大きい T の prefill と T=32 の経路を比較 (次トークン、MTP 下書き、続きの生成、速度) |
 | `test_multiconv.py` | 複数の会話を交互に流しても単独と出力が一致すること、切り替え時間、KV が足りないときの追い出し |
 | `test_reuse.py [--off]` | 会話の再利用: 3 ターン (thinking オフ/オン) の再利用の種類、応答開始までの時間、最初からとの出力比較 |
@@ -58,11 +60,14 @@
 
 | スクリプト | 内容 |
 |---|---|
+| `profile_prefill.py [T] [P0] [--wall]` | 大きい T の prefill 1 チャンクの op ごとのデバイス時間。`python -m tracy -r -p` で実行し、`TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT=4000` を付ける (`summarize_profile.py --segments 1`)。`--wall` は実時間だけ |
 | `profile_step.py [T] [P0] [--traced]` | 1 ステップ (本体の検証 + MTP) の op ごとのデバイス時間。`python -m tracy -r -p` で実行し、`TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT=6000` を付ける。`--traced` はトレース実行の時間だけ |
 | `summarize_profile.py [--segments N] [--seq]` | 上のプロファイルを op 名ごとに集計 (`--seq` で op の並び) |
 | `bench_decode.py [max_new] [--copy\|--all] [--dump FILE]` | 決まったプロンプト集でのデコード速度 (日英の文章、コード、thinking、`--copy` で写しの多い応答)。`--dump` で出力を保存 (下書き方式のオフライン試算用) |
 | `make_draft_vocab.py [N]` | MTP 下書き用の語彙表 `tsugumi/draft_vocab.pt` を作る (分野ごとに重みを揃えた頻度)。評価用テキストでのカバー率も表示 |
 | `mmbench.py` | デコード用行列積 (DRAM シャーディング) の実効帯域。ワーカー数・in0_block_w の掃引 |
+| `bench_small_matmul.py [--sweep] [--shapes KxN,...]` | 小さい行列積 (MoE の専門家の大きさ) の 1 本あたりの時間をトレースで測る。DecodeLinear / ttnn.matmul の比較と固定費の当てはめ。`--sweep` は in0 のコア数と in0_block_w の掃引 (doc/12) |
+| `moe_route_stats.py collect` / `analyze` | MoE (Qwen3.6-35B-A3B) が実テキストで選ぶ専門家を CPU で 1 層ずつ記録し、連続 T トークンの和集合、無関係な B リクエストの和集合、prefill の専門家ごとの行数の偏りを集計 (doc/12) |
 | `mmlarge.py [M ...]` | 大きい M の行列積 (`minimal_matmul` / `ttnn.linear`) を bfp4 重みで計測 |
 | `bench_parts.py` | デコード 1 ステップの部品ごとのデバイス時間 |
 | `bench_spec_parts.py` | T 行モードの部品ごとのデバイス時間 |
