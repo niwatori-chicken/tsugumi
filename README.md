@@ -2,7 +2,7 @@
 
 名前はツグミ (*Turdus eunomus*) に由来します。冬になるとシベリアから海を越えて日本に渡ってくる、身近な小さな鳥です。
 
-27B の dense モデル (Gated DeltaNet 48 層 + full attention 16 層) を、Blackhole **P100A 1 枚 (28GB、448GB/s) / P150A 1 枚 (32GB、512BG/s)** でできるだけ速く動かすためのtt-metal / ttnn 上に構築された推論エンジンです。
+27B の dense モデル (Gated DeltaNet 48 層 + full attention 16 層) を、Blackhole **P100A 1 枚 (28GB、448GB/s) / P150A 1 枚 (32GB、512GB/s)** でできるだけ速く動かすためのtt-metal / ttnn 上に構築された推論エンジンです。
 
 HTTP経由でOpenAI 互換サーバーとして使うことができます。
 
