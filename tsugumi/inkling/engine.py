@@ -79,8 +79,10 @@ class Engine(PrefillMixin):
         self.hi2 = _ck(ttnn.MathFidelity.HiFi2)
         self.scale = c.head_dim ** -0.5
         if experts is None:
-            experts = env("INKLING_EXPERTS", "auto")
-        if experts == "auto":  # all-bfp8 experts need ~24.2 GiB (P150A: 31.6 GiB; P100A: 28 GB)
+            experts = env("INKLING_EXPERTS", "bfp4")
+        # bfp4 (default): decode +10%, prefill +3%, top-1 = bfp8 at 95.9% of teacher-forced positions (mostly
+        # near-ties); auto: bfp8 if the DRAM holds all-bfp8 experts (~24.2 GiB), else mixed
+        if experts == "auto":
             v = ttnn.get_memory_view(dev, ttnn.BufferType.DRAM)
             experts = "bfp8" if v.total_bytes_free_per_bank * v.num_banks >= 30 * (1 << 30) else "mixed"
         self.experts = experts

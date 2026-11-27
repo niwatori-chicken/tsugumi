@@ -204,10 +204,11 @@ export TSUGUMI_CACHE_DIR=/path/to/tsugumi_cache/inkling   # 変換済み重み (
 ./run_server.sh --port 8010                                # 既定の --max-seq は 32768
 ```
 
-- 重み: エキスパートは公式の NVFP4 (層 0-19) / MXFP8 (層 20-23) を復号して **bfp8** に変換します (`TSUGUMI_INKLING_EXPERTS`:
-  `auto` (既定。DRAM が 30 GiB 以上なら bfp8、それ以下なら mixed) / `bfp8` / `mixed` (ループの層 6-17 と MXFP8 の層を bfp8、残りを bfp4) / `bfp4`)。
-  NVFP4 を bfp4 に詰め直すと重みの誤差が約 11% 増えるため (bfp8 なら 0.7%)、既定は bfp8 です。注意の重みと lm_head は bfp8、KV は bfp8。
-  P150A (32GB) で DRAM 使用 26.8 GiB (`--max-seq 32768`)。mixed は P100A (28GB) 向けですが、P100A では未確認です。
+- 重み: エキスパートは公式の NVFP4 (層 0-19) / MXFP8 (層 20-23) を復号して **bfp4** に変換します (MXFP8 の層は bfp8。
+  `TSUGUMI_INKLING_EXPERTS`: `bfp4` (既定) / `bfp8` / `mixed` (ループの層 6-17 と MXFP8 の層を bfp8、残りを bfp4) / `auto`
+  (DRAM が 30 GiB 以上なら bfp8、それ以下なら mixed))。NVFP4 を bfp4 に詰め直すと重みの誤差が約 11% 増えますが (bfp8 なら
+  0.7%)、teacher forcing での top-1 は bfp8 と 95.9% 一致 (外れる位置の多くは上位 2 候補がほぼ同点) で、デコードが約 10%、
+  prefill が約 3% 速くなります。注意の重みと lm_head は bfp8、KV は bfp8。
 - 速度 (P150A、`--max-seq 32768`、計測は各 1〜数回): デコード **約 27 tok/s** (1 ステップ約 31ms。文脈 30k でも
   ほぼ同じ)、prefill **約 630〜800 tok/s** (512 トークンずつ。4k で 5.1 秒、30k で 48 秒)、短いプロンプトの応答開始
   約 0.6 秒 (`TSUGUMI_INKLING_PREFILL_T=128` なら長い prefill 約 450 tok/s、短いプロンプト約 0.4 秒)。

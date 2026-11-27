@@ -28,7 +28,7 @@ def main():
     ap.add_argument("--against")
     a = ap.parse_args()
     seqs = torch.load(SEQS)
-    dev = ttnn.open_device(device_id=0, trace_region_size=512 << 20, l1_small_size=24576)
+    dev = ttnn.open_device(device_id=0, trace_region_size=1024 << 20, l1_small_size=24576)
     res = []
     try:
         eng = Engine(dev, MODEL, CACHE, max_seq=8192, log=lambda *x: None, prefill=False)
