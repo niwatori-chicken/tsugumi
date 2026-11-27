@@ -28,8 +28,8 @@ class MaskBuilder:
                                              self.dev, mem)
         nu, nr = NH * MTo, 2 * len(self.coords)
         bf = ttnn.bfloat16
-        cbs = [_cbd(self.cores, 0, LT + 1, bf), _cbd(self.cores, 1, 2, bf), _cbd(self.cores, 2, LT + 1, bf),
-               _cbd(self.cores, 3, 2, bf)]
+        cbs = [_cbd(self.cores, 0, LT + 1, bf), _cbd(self.cores, 1, 4, bf), _cbd(self.cores, 2, LT + 1, bf),
+               _cbd(self.cores, 3, 4, bf)]
         acc = []
         for t in (rel, sink, out, base):
             acc += ttnn.TensorAccessorArgs(t).get_compile_time_args()

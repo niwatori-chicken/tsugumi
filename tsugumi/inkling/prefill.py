@@ -38,6 +38,7 @@ USE_SDPA = env("INKLING_PREFILL_SDPA", "1") == "1"
 # where the prefill's activations go: DRAM at T = 128 (in L1 the residual stream / q / k / v starve the
 # attention softmax's CBs)
 PL = L1 if T <= 64 else DRAM
+ATT_STOP = None  # (profiling) stop p_attention after a stage
 
 
 class PrefillMixin:
@@ -223,6 +224,8 @@ class PrefillMixin:
             yq = d["Lq"](q_in, out_mem=PL)
             yk = d["Lk"](k_in, out_mem=PL)
             yv = d["Lv"](v_in, out_mem=PL)
+        if ATT_STOP == "lin":
+            return yq
         part = lambda y, lo, hi, nh, hd: ttnn.reshape(ttnn.slice(y, (0, 0, 0, lo), (1, 1, T, hi), memory_config=PL),
                                                       (1, T, nh, hd))
         tau = None if sliding else self.P_TAU
@@ -238,6 +241,8 @@ class PrefillMixin:
         sink = ttnn.pad(sink, [(0, 0), (0, 0), (0, 0), (0, 31)], 0.0)  # [1, NH, T, 32], col 0 = sink / scale
         if USE_SDPA:  # the SDPA adds the mask after scaling q k: masks in units of 1 (the bias: p_proj pre-scaled)
             sink = ttnn.multiply(sink, self.scale, memory_config=PL)
+        if ATT_STOP == "qr":
+            return yq
         C = NKV * HD
         if sliding:
             if fused:
@@ -265,6 +270,8 @@ class PrefillMixin:
         else:
             self.kvw_full(hm(k), hm(v), st["kc"], st["vc"], self.P_POSF)
         kc, vc = st["kc"], st["vc"]
+        if ATT_STOP == "kv":
+            return yq
         # mask [1, NH, rows, S] (units of 1 / scale)
         rel = self.mm(r, d["p_proj"])  # [1, NH, T, R or W] by distance
         if sliding:
@@ -282,6 +289,8 @@ class PrefillMixin:
             for i0 in range(0, T, TS):  # query rows i0 .. i0 + TS
                 blocks.append((i0, TS, self.maskb(rel, sink, self.P_BASE, 1, S_, c.window, sc, m0=i0 // 32, rows=TS)))
         os_ = []
+        if ATT_STOP == "mask":
+            return yq
         for i0, n, mask in blocks:
             if USE_SDPA:  # fused q k + mask + softmax + p v by key chunks (GQA)
                 qb = ttnn.slice(q, (0, i0, 0, 0), (1, i0 + n, NH, HD), memory_config=PL) if n < T else q
@@ -301,6 +310,8 @@ class PrefillMixin:
             o = self.mm(p, vc, memory_config=PL)  # [1, NKV, 3n, HD]
             os_.append(ttnn.permute(ttnn.reshape(o, (1, NH, n, HD)), (0, 2, 1, 3), memory_config=PL))  # [1,n,NH,HD]
         o = os_[0] if len(os_) == 1 else ttnn.concat(os_, dim=1, memory_config=PL)  # [1, T, NH, HD]
+        if ATT_STOP == "score":
+            return o
         o = ttnn.multiply(o, gate, input_tensor_b_activations=[UWP(U.SIGMOID)], memory_config=PL)
         return d["Lo"](ttnn.reshape(o, (1, 1, T, NH * HD)), out_mem=PL)
 

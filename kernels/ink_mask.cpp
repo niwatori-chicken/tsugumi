@@ -42,8 +42,16 @@ void kernel_main() {
     const uint16_t* src = reinterpret_cast<const uint16_t*>(in);
     const uint32_t* srcw = reinterpret_cast<const uint32_t*>(in);
     const uint16_t* sink = reinterpret_cast<const uint16_t*>(sk);
-    co.reserve_back(2);
-    const uint32_t obase = co.get_write_ptr();
+    co.reserve_back(4);  // two output buffers, a zero tile, a NEG tile
+    const uint32_t obase = co.get_write_ptr(), zt = obase + 2 * TB, nt = obase + 3 * TB;
+    {
+        uint32_t* z = reinterpret_cast<uint32_t*>(zt);
+        uint32_t* q = reinterpret_cast<uint32_t*>(nt);
+        for (uint32_t i = 0; i < 512; ++i) {
+            z[i] = 0;
+            q[i] = ((uint32_t)NEG << 16) | NEG;
+        }
+    }
     constexpr uint32_t NEGW = ((uint32_t)NEG << 16) | NEG;
     for (uint32_t u = u0; u < nu; u += us) {
         const uint32_t h = u / MTo, mo = u % MTo, m = m0 + mo;
@@ -51,8 +59,28 @@ void kernel_main() {
         for (uint32_t j = 0; j < LT; ++j) noc_async_read(sI.get_noc_addr((h * MTi + m) * LT + j), in + j * TB, TB);
         noc_async_read(sS.get_noc_addr(h * MTi + m), sk, TB);
         noc_async_read_barrier();
+        uint32_t nb = 0;  // tiles built in the output buffers (alternating)
         for (uint32_t jt = 0; jt < OT; ++jt) {
-            const uint32_t ob = obase + (jt & 1) * TB;
+            // whole tile constant (no sink column, every row all NEG / all 0): written from the constant tiles
+            {
+                const uint32_t s0 = 32 * jt;
+                int32_t kind = -1;  // 0: zeros, 1: NEG
+                if (s0 > SC) {
+                    kind = 1;
+                } else if (s0 + 31 < SC) {
+                    if constexpr (MODE == 1) {
+                        const int32_t dmax = (int32_t)(p0 + 32 * m + 31) - (int32_t)s0;   // last row, first slot
+                        const int32_t dmin = (int32_t)(p0 + 32 * m) - (int32_t)(s0 + 31);  // first row, last slot
+                        if (dmax < 0) kind = 1;                      // future for every row
+                        else if (dmin >= (int32_t)W) kind = 0;       // beyond the window for every row
+                    }
+                }
+                if (kind >= 0) {
+                    noc_async_write(kind ? nt : zt, sO.get_noc_addr((h * MTo + mo) * OT + jt), TB);
+                    continue;
+                }
+            }
+            const uint32_t ob = obase + (nb++ & 1) * TB;
             uint16_t* dst = reinterpret_cast<uint16_t*>(ob);
             uint32_t* dstw = reinterpret_cast<uint32_t*>(ob);
             const uint32_t s0 = 32 * jt;
