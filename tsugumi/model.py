@@ -11,7 +11,8 @@ from safetensors import safe_open
 from .attn import AttnDecode
 from .env import env
 from .gdn import GDNDecode, GDNWeights
-from .ops import DecodeLinear, cache_path, has_cache
+from .moe import make_mlp
+from .ops import DecodeLinear, _in0_grid, cache_path, has_cache
 
 _L1 = ttnn.L1_MEMORY_CONFIG
 TOPK = 64  # main-model logits kept per row for sampling (top_k is capped at this)
@@ -102,7 +103,7 @@ class SpecShared:
 
     batch = False  # batched decode (tsugumi/batch.py: BatchShared) shares the layer code with these modes
 
-    def __init__(self, dev, T, HD, max_seq, pager, block_size=64):
+    def __init__(self, dev, T, HD, max_seq, pager, block_size=64, NH=24, NKV=4):
         self.T = T
         self.key = T  # mode key: per-mode kernels and traces
         bf = lambda t: ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=dev)
@@ -125,7 +126,8 @@ class SpecShared:
 
             from .attn import kv_dtype
 
-            self.gqa = GQAAttention(dev, T, HD=HD, block_size=block_size, nblocks=nb, kv_dtype=kv_dtype())
+            self.gqa = GQAAttention(dev, T, NH=NH, NKV=NKV, HD=HD, block_size=block_size, nblocks=nb,
+                                    kv_dtype=kv_dtype())
         self.cos = bf(torch.ones(1, T, 1, HD))
         self.sin = bf(torch.zeros(1, T, 1, HD))
         self.sel_ck = ttnn.WormholeComputeKernelConfig(math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False,
@@ -171,7 +173,7 @@ class MTPHead:
         self.fc = DecodeLinear(dev, wfc, dt, cache_file=c + ".fc", shape=(2 * H, H), name="mtp_fc")
         self.attn = AttnDecode(dev, sd, p + "layers.0.self_attn.", tc, eng.max_seq, wdtype=prec["attn_qkvg"],
                                cache_prefix=c + ".attn")
-        self.mlp = MLPDecode(dev, sd, p + "layers.0.mlp.", H, eng.I, prec, c + ".mlp")
+        self.mlp = make_mlp(dev, sd, p + "layers.0.mlp.", H, tc, prec, c + ".mlp")
         self.x_emb = ttnn.from_torch(torch.zeros(1, 1, 32, H), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                                      device=dev, memory_config=eng.resid_mem)
         self.m_sel = ttnn.from_torch(torch.zeros(1, 1, 32, 32), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
@@ -297,9 +299,10 @@ class Qwen35Engine:
         tc = cfg.get("text_config", cfg)
         self.cfg = tc
         self.H = tc["hidden_size"]
-        self.I = tc["intermediate_size"]
+        self.I = tc.get("intermediate_size") or tc["moe_intermediate_size"]
         self.V = tc["vocab_size"]
         self.HD = tc["head_dim"]
+        self._heads = dict(NH=tc["num_attention_heads"], NKV=tc["num_key_value_heads"])
         self.rope_dim = int(self.HD * tc.get("partial_rotary_factor", 0.25))
         rp = tc.get("rope_parameters", {})
         self.theta = rp.get("rope_theta", tc.get("rope_theta", 1e7))
@@ -323,7 +326,8 @@ class Qwen35Engine:
         self.cache_dir = cache_dir
 
         # residual stream: width-sharded over the K=hidden in0 grid of the decode matmuls (40 cores for 5120)
-        probe = DecodeLinear(dev, None, ttnn.bfloat8_b, shape=(self.H, 32 * 7 * 3), name="probe", no_weight=True)
+        probe = DecodeLinear(dev, None, ttnn.bfloat8_b, shape=(self.H, 32 * 7 * 3), name="probe", no_weight=True,
+                             in0_cores=_in0_grid(self.H // 32)[0])
         self.resid_mem = probe.xmem
         rc = probe.in0_cores
         grid = self.resid_mem.shard_spec.grid.bounding_box()
@@ -347,7 +351,7 @@ class Qwen35Engine:
                                       cache_prefix=c + ".attn")
                 if prec["attn_o"] != prec["attn_qkvg"]:
                     raise NotImplementedError("separate attn_o dtype")
-            L["mlp"] = MLPDecode(dev, sd, p + "mlp.", self.H, self.I, prec, c + ".mlp")
+            L["mlp"] = make_mlp(dev, sd, p + "mlp.", self.H, tc, prec, c + ".mlp")
             self.layers.append(L)
             log(f"loaded layer {i + 1}/{len(self.layer_types)} ({lt}), {time.time() - t0:.0f}s")
         self.final_norm = norm_w(LM_PREFIX + "norm.weight")
@@ -530,7 +534,7 @@ class Qwen35Engine:
         from .kvpager import KVPager
 
         self.pager = KVPager(self.dev, self.max_seq // 64)
-        self.sh_by = {T: SpecShared(self.dev, T, self.HD, self.max_seq, self.pager)}
+        self.sh_by = {T: SpecShared(self.dev, T, self.HD, self.max_seq, self.pager, **self._heads)}
         self.spec_traces, self.spec_outs = {}, {}
         self._last_snap_all = True
         self.use_T(T)
@@ -560,7 +564,7 @@ class Qwen35Engine:
         assert self.layers[0]["mix"].snap.shape[1] >= TV * self.layers[0]["mix"].Nv or \
             self.layers[0]["type"] != "linear_attention", "init_spec(verify_T=TV) first"
         self.T_verify = TV
-        self.sh_by[TV] = SpecShared(self.dev, TV, self.HD, self.max_seq, self.pager)
+        self.sh_by[TV] = SpecShared(self.dev, TV, self.HD, self.max_seq, self.pager, **self._heads)
         for L in self.layers:
             L["mix"].init_spec(TV)
         if self.mtp is not None:
@@ -569,7 +573,7 @@ class Qwen35Engine:
     def init_prefill(self, TP=32):
         """Add a TP-row mode for prompt prefill (GDN kernel writes only the final state)."""
         self.T_pre = TP
-        self.sh_by[TP] = SpecShared(self.dev, TP, self.HD, self.max_seq, self.pager)
+        self.sh_by[TP] = SpecShared(self.dev, TP, self.HD, self.max_seq, self.pager, **self._heads)
         for L in self.layers:
             if L["type"] == "linear_attention":
                 L["mix"].init_spec(TP, snap_all=False)

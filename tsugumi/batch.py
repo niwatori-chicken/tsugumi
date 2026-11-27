@@ -64,7 +64,7 @@ class BatchShared:
         from .attn import kv_dtype
         from .gqa_attn import GQAAttention
 
-        self.gqa = GQAAttention(dev, seg, HD=eng.HD, block_size=64, nblocks=bm.nb, kv_dtype=kv_dtype(), lanes=lanes)
+        self.gqa = GQAAttention(dev, seg, **eng._heads, HD=eng.HD, block_size=64, nblocks=bm.nb, kv_dtype=kv_dtype(), lanes=lanes)
         self.sel_ck = ttnn.WormholeComputeKernelConfig(math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False,
                                                        fp32_dest_acc_en=True, packer_l1_acc=False)
 

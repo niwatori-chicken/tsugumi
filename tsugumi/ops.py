@@ -10,6 +10,8 @@ import os
 import torch
 import ttnn
 
+from .env import env
+
 TILE = 32
 
 
@@ -71,6 +73,22 @@ class DecodeLinear:
         )
         self.w = None if no_weight else load_or_convert(dev, w_kn, dtype, self.wmem, cache_file, pad_n=self.Np)
         k_tiles = K // TILE
+        tuned = False
+        if in0_cores is None and K <= 4096 and env("IN0_TUNE", "1") == "1":
+            # Small K (MoE / hidden 2048 models; the 27B's K are all >= 5120 and keep the old grid): the K loop costs
+            # ~0.8us per in0 block, so use few in0 cores with wide blocks, but enough cores that each one's share of
+            # N stays <= 12 tiles (scripts/bench_small_matmul.py --sweep, doc/12)
+            cands = []
+            for c in range(1, 65):
+                if k_tiles % c == 0:
+                    try:
+                        _in0_grid(k_tiles, cores=c)
+                        cands.append(c)
+                    except ValueError:
+                        pass
+            n_t = self.Np // TILE
+            in0_cores = next((c for c in cands if math.ceil(n_t / c) <= 12), cands[-1])
+            tuned = True
         c, rows, cols = _in0_grid(k_tiles, cores=in0_cores)
         self.in0_cores = c
         self.xmem = ttnn.create_sharded_memory_config(
@@ -81,6 +99,8 @@ class DecodeLinear:
             use_height_and_width_as_shard_shape=True,
         )
         per_core_k = k_tiles // c
+        if in0_block_w is None and tuned:
+            in0_block_w = max(d for d in range(1, 17) if per_core_k % d == 0)
         if in0_block_w is None:
             in0_block_w = 2 if per_core_k % 2 == 0 else per_core_k
         self.pc = ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
