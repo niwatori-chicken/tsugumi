@@ -3,6 +3,7 @@ only the second half is scored).  python scripts/eval_ppl.py IDS.pt OUT.pt [--pr
 
 IDS.pt: {name: LongTensor [N, C]}. Saves per chunk: target log-probs of scored positions and the top-K
 log-probs (values, indices) for KL against a reference (see ref_ppl.py)."""
+import os as _os_fl; _os_fl.environ.setdefault("TSUGUMI_FULL_LOGITS", "1")  # reads eng.last_spec[0] (full logits)
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, for `import tsugumi`
 import argparse

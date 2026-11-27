@@ -14,6 +14,8 @@ PRESETS = {
     "thinking": dict(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=0.0),
     "instruct": dict(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5),
     "completion": dict(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=0.0),
+    # Inkling 2 Mini (generation_config.json: do_sample, temperature 1.0; no top-p / top-k)
+    "inkling": dict(temperature=1.0),
 }
 SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty")
 

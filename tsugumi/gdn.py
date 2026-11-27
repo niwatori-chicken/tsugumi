@@ -188,7 +188,11 @@ class GDNDecode:
             self.Hc_b = z((1, 1, 32, self.qkv_dim))
             self.Bp_b = z((1, 1, 32, self.qkv_dim))
             self.snap_b = z((1, max_lanes * seg * self.Nv, self.Dk, self.Dv), ttnn.float32)
-        self.kern_T[key] = GDNFusedKernel(self.dev, self.Nv, self.Nk, T, self.qkv_dim, self.kd, seg=seg)
+        # 2+ lanes: the lanes in 2 groups on 2 x Nv cores (TSUGUMI_GDN_GROUPS); the recurrence is the per-lane cost
+        from .env import env
+        g = int(env("GDN_GROUPS", "2"))
+        g = g if T // seg >= g and (T // seg) % g == 0 else 1
+        self.kern_T[key] = GDNFusedKernel(self.dev, self.Nv, self.Nk, T, self.qkv_dim, self.kd, seg=seg, groups=g)
         self.consts_by_T[key] = GDNFusedKernel.make_consts(self.dev, self._norm_w_host, T)
 
     def reset_spec(self):

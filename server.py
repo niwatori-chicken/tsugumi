@@ -62,6 +62,7 @@ EXIT_HANG = 75
 THINK_FORCE = ("\n\nConsidering the limited time by the user, I have to give the solution based on the thinking "
                "directly now.\n</think>\n\n")
 THINK_BUDGET = [None]  # server default (--thinking-budget); None = no cap
+INKLING_EFFORT = [None]  # Inkling: default reasoning_effort (--reasoning-effort); None = the template's (0.9)
 SAMPLING_DEFAULTS = ["model"]  # --sampling-defaults: model (Qwen presets when temperature is not set) / greedy
 # must be set before tt-metal reads its runtime options (first ttnn import)
 os.environ.setdefault("TT_METAL_OPERATION_TIMEOUT_SECONDS", "30")
@@ -402,6 +403,140 @@ class Backend:
                        finish="stop" if eos or stopped else "length", total=time.perf_counter() - t0), []
 
 
+def model_type(model_dir):
+    try:
+        with open(os.path.join(model_dir, "config.json")) as f:
+            return json.load(f).get("model_type", "")
+    except OSError:
+        return ""
+
+
+class InklingBackend(Backend):
+    """Inkling 2 Mini (tsugumi/inkling/): one request at a time, decode-only engine (the prompt is fed one token per
+    step). Shares the device / hang / shutdown handling and the completions stream of Backend; chat goes through
+    chat_events (the reply's special tokens -> reasoning_content / content / tool_calls)."""
+    kind = "inkling"
+
+    def __init__(self, max_seq):
+        import ttnn
+        from transformers import AutoTokenizer
+
+        from tsugumi.inkling.chat import ReplyParser
+        from tsugumi.inkling.engine import Engine
+        from tsugumi.inkling.generator import InklingGenerator
+
+        t_all = time.perf_counter()
+        self.tok = AutoTokenizer.from_pretrained(MODEL_DIR)
+        self.lanes = 1
+        trace_mb = int(env("TRACE_MB", "1024"))  # 512-row prefill traces (one per context bucket): ~650 MB
+        self.dev = ttnn.open_device(device_id=0, trace_region_size=trace_mb << 20, l1_small_size=24576)
+        t = time.perf_counter()
+        self.eng = Engine(self.dev, MODEL_DIR, CACHE, max_seq=max_seq, log=log.info,
+                          experts=env("INKLING_EXPERTS", "bfp4"))
+        log.info(f"engine: {time.perf_counter() - t:.0f}s; trace capture ...")
+        t = time.perf_counter()
+        self.eng.capture()
+        log.info(f"trace capture: done in {time.perf_counter() - t:.1f}s")
+        self.gen = InklingGenerator(self.eng, eos=(self.eng.cfg.eos,), progress=self._arm)
+        self.parser = lambda: ReplyParser(self.tok)
+        self.lock = threading.Lock()
+        self.sched = None
+        self.vision = None
+        self.think_end = None
+        self._tok_cache = {}
+        self._byte_dec = byte_decoder()
+        self.max_seq = max_seq
+        self.waiting = 0
+        self.stopping = False
+        self.active = None
+        self.dead = None
+        self.backstop = int(env("HANG_BACKSTOP", "300"))
+        self.guard = None
+        v = ttnn.get_memory_view(self.dev, ttnn.BufferType.DRAM)
+        G = 1 << 30
+        log.info(f"DRAM: used {v.total_bytes_allocated_per_bank * v.num_banks / G:.2f} GiB, "
+                 f"free {v.total_bytes_free_per_bank * v.num_banks / G:.2f} GiB; "
+                 f"startup {time.perf_counter() - t_all:.0f}s")
+
+    def _tokens(self, ids, max_new, stats, sampler=None, think=None, row_cb=None):
+        try:
+            for t in self.gen.generate(ids, max_new, stats=stats, sampler=sampler,
+                                       row_cb=(lambda v, i: row_cb(v, i)) if row_cb else None):
+                self._arm()
+                yield t
+        except Exception as e:
+            self.fail(e)
+            raise
+
+    def think_budget(self, budget):
+        return None
+
+    def encode(self, messages, enable_thinking, tools=None, template_kwargs=None, images=None, embed=True):
+        from tsugumi.inkling.chat import effort_value, encode
+        if any(isinstance(m.get("content"), list) and any(isinstance(p, dict) and p.get("type") in
+               ("image", "image_url", "input_image") for p in m["content"]) for m in messages):
+            raise ValueError("image input is not supported for Inkling yet")
+        effort = effort_value((template_kwargs or {}).get("reasoning_effort"))
+        return encode(self.tok, messages, effort, tools)
+
+    def chat_events(self, ids, max_new, sampler, stop, rows=False):
+        """(field, value): reasoning_content / content text, tool_call dicts, logprobs rows (content tokens), then
+        ("done", info). stop: a StopMatcher for the content."""
+        p = self.parser()
+        stats = {}
+        t0 = time.perf_counter()
+        t_first, n, eos, stopped = None, 0, False, False
+        pending = []
+        rowq = []
+        self._arm()
+        toks = self._tokens(ids, max_new, stats, sampler, None, (lambda v, i: rowq.append((v, i))) if rows else None)
+        try:
+            for t in toks:
+                row = rowq.pop(0) if rows else None
+                if t_first is None:
+                    t_first = time.perf_counter()
+                n += 1
+                if self.active is not None:
+                    self.active["generated"] = n
+                if t in self.gen.eos:
+                    eos = True
+                    continue
+                in_content = p.mode == "content" and t not in p.special
+                for field, v in p.feed(t):
+                    if field == "content":
+                        v = stop.feed(v)
+                        if v:
+                            yield field, v
+                    else:
+                        yield field, v
+                if rows and in_content and not stop.hit:
+                    pending.append((t,) + row)
+                    yield "logprobs", pending
+                    pending = []
+                if stop.hit or self.stopping:
+                    stopped = True
+                    break
+        finally:
+            toks.close()
+            self._disarm()
+        for field, v in p.finish():
+            if field == "content":
+                v = stop.feed(v)
+            if v:
+                yield field, v
+        tail = stop.finish()
+        if tail:
+            yield "content", tail
+        dt = time.perf_counter() - (t_first or t0)
+        yield "done", dict(prompt_tokens=len(ids), completion_tokens=n, reused=stats.get("reused", 0),
+                           reuse=stats.get("reuse"), switched=False, prefilled=stats.get("prefilled", 0),
+                           t_prefill=stats.get("t_prefill", 0.0),
+                           prefill_tps=stats.get("prefilled", 0) / stats["t_prefill"] if stats.get("t_prefill") else 0.0,
+                           ttft=(t_first or t0) - t0, decode_tps=n / dt if dt > 0 else 0.0, tokens_per_step=1.0,
+                           ngram_steps=0, steps=stats.get("steps", 0),
+                           finish="stop" if eos or stopped else "length", total=time.perf_counter() - t0)
+
+
 def byte_decoder():
     """Inverse of the GPT-2 byte-level BPE alphabet (piece character -> byte)."""
     bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
@@ -609,8 +744,12 @@ def make_app(backend, api_keys=(), board=None):
 
     @app.get("/v1/models")
     def models():
-        meta = dict(weights="bfp4", kv_cache=env("KV_DTYPE", "bfp8"), max_seq=backend.max_seq,
-                    model_dir=MODEL_DIR, engine="tsugumi (Tenstorrent P100A)")
+        if getattr(backend, "kind", "") == "inkling":
+            meta = dict(weights=f"experts {backend.eng.experts}, other bfp8", kv_cache="bfp8",
+                        max_seq=backend.max_seq, model_dir=MODEL_DIR, engine="tsugumi (Inkling 2, Tenstorrent Blackhole)")
+        else:
+            meta = dict(weights="bfp4", kv_cache=env("KV_DTYPE", "bfp8"), max_seq=backend.max_seq,
+                        model_dir=MODEL_DIR, engine="tsugumi (Tenstorrent P100A)")
         return {"object": "list", "data": [{"id": n, "object": "model", "created": started, "owned_by": "tsugumi",
                                             "meta": meta} for n in MODEL_NAMES]}
 
@@ -746,11 +885,130 @@ def make_app(backend, api_keys=(), board=None):
         v = body.get(key)
         return max(0, min(int(v or 0), limit))
 
+    async def chat_inkling(req, body):
+        """Inkling 2: reasoning_effort (OpenAI-style, or chat_template_kwargs.reasoning_effort; enable_thinking false
+        -> "none"); the reply's messages are split by their content tokens (tsugumi/inkling/chat.py)."""
+        from tsugumi.inkling.chat import effort_value, encode
+        model_name = body.get("model") if body.get("model") in MODEL_NAMES else MODEL_NAMES[0]
+        kw = dict(body.get("chat_template_kwargs") or {})
+        effort = body.get("reasoning_effort", kw.get("reasoning_effort"))
+        if effort is None and kw.get("enable_thinking") is False:
+            effort = "none"
+        if effort is None:
+            effort = INKLING_EFFORT[0]
+        try:
+            effort = effort_value(effort)
+        except (TypeError, ValueError) as e:
+            return bad_request(str(e))
+        tools = body.get("tools") or None
+        if (body.get("tool_choice") or "auto") == "none":
+            tools = None
+        try:
+            msgs = body.get("messages", [])
+            if any(isinstance(m.get("content"), list) and any(isinstance(p, dict) and p.get("type") in
+                   ("image", "image_url", "input_image") for p in m["content"]) for m in msgs):
+                raise ValueError("image input is not supported for Inkling yet")
+            ids = await run_in_threadpool(encode, backend.tok, msgs, effort, tools)
+        except Exception as e:
+            return bad_request(f"chat template: {e}")
+        rid = "chatcmpl-" + uuid.uuid4().hex[:24]
+        tag = rid[-6:]
+        params = {"_pre": [f"effort {effort if effort is not None else 'default'}"],
+                  "_post": [f"tools {len(tools)}"] if tools else [], "_mode": "inkling"}
+        max_new, make_sampler, stops, _, err = common(body, ids, tag, params, 4096)
+        if err is not None:
+            return err
+        want_lp = bool(body.get("logprobs"))
+        ntop = top_n(body, "top_logprobs")
+        created = int(time.time())
+
+        def events():
+            for field, v in backend.chat_events(ids, max_new, make_sampler(), StopMatcher(stops), rows=want_lp):
+                if field == "logprobs":
+                    yield field, logprob_entries(v, ntop)
+                else:
+                    yield field, v
+
+        def chunk(delta, finish=None, usage=None, timings=None, logprobs=None):
+            d = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+            if logprobs is not None:
+                d["choices"][0]["logprobs"] = {"content": logprobs}
+            if usage:
+                d["usage"] = usage
+            if timings:
+                d["timings"] = timings
+            return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
+
+        if body.get("stream"):
+            def gen():
+                if backend.dead:
+                    yield error_event()
+                    return
+                yield chunk({"role": "assistant"})
+                info, ncalls = None, 0
+                try:
+                    for field, v in events():
+                        if field == "done":
+                            info = v
+                        elif field == "tool_call":
+                            yield chunk({"tool_calls": [dict(index=ncalls, **v)]})
+                            ncalls += 1
+                        elif field == "logprobs":
+                            yield chunk({}, logprobs=v)
+                        else:
+                            yield chunk({field: v})
+                except Exception:
+                    yield error_event()
+                    return
+                yield chunk({}, finish="tool_calls" if ncalls else info["finish"], usage=usage(info), timings=info)
+                yield "data: [DONE]\n\n"
+                log_done(tag, info, ncalls)
+
+            return streaming(req, tag, len(ids), gen)
+
+        def run():
+            if backend.dead:
+                return None
+            parts = {"content": "", "reasoning_content": ""}
+            calls, lps, info = [], [], None
+            try:
+                for field, v in events():
+                    if field == "done":
+                        info = v
+                    elif field == "tool_call":
+                        calls.append(v)
+                    elif field == "logprobs":
+                        lps += v
+                    else:
+                        parts[field] += v
+            except Exception:
+                return None
+            return parts, calls, lps, info
+
+        res, err = await blocking(req, tag, len(ids), run)
+        if err is not None:
+            return err
+        parts, calls, lps, info = res
+        log_done(tag, info, len(calls))
+        msg = {"role": "assistant", "content": parts["content"] if parts["content"] or not calls else None}
+        if parts["reasoning_content"]:
+            msg["reasoning_content"] = parts["reasoning_content"]
+        if calls:
+            msg["tool_calls"] = calls
+        choice = {"index": 0, "message": msg, "finish_reason": "tool_calls" if calls else info["finish"]}
+        if want_lp:
+            choice["logprobs"] = {"content": lps}
+        return {"id": rid, "object": "chat.completion", "created": created, "model": model_name,
+                "choices": [choice], "usage": usage(info), "timings": info}
+
     @app.post("/v1/chat/completions")
     async def chat(req: Request):
         if backend.dead:
             return unavailable()
         body = await req.json()
+        if getattr(backend, "kind", "") == "inkling":
+            return await chat_inkling(req, body)
         # one model: any requested name is accepted; an alias is echoed back, anything else gets the first name
         model_name = body.get("model") if body.get("model") in MODEL_NAMES else MODEL_NAMES[0]
         kw = dict(body.get("chat_template_kwargs") or {})
@@ -1044,7 +1302,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8010)
-    ap.add_argument("--max-seq", type=int, default=262144)  # the model limit; bfp8 KV (9 GiB) leaves ~1.8 GiB free
+    # Qwen: 262144 (the model limit; bfp8 KV 9 GiB leaves ~1.8 GiB free). Inkling: 32768 (its full-attention layers
+    # read the whole max_seq KV every step, so a larger value slows every token)
+    ap.add_argument("--max-seq", type=int, default=None)
     ap.add_argument("--served-model-name", default=env("SERVED_MODEL_NAME", ""),
                     help="name(s) in the API, comma separated (default: the model directory name, e.g. Qwen3.8-27B)")
     ap.add_argument("--sampling-defaults", choices=("model", "greedy"), default=env("SAMPLING_DEFAULTS", "model"),
@@ -1052,6 +1312,9 @@ def main():
                          "non-thinking 0.7/0.8/20 + presence_penalty 1.5); greedy = greedy decoding (before 2026-11)")
     ap.add_argument("--thinking-budget", type=int, default=int(env("THINKING_BUDGET", "-1")),
                     help="default cap on thinking tokens when a request sets none (-1: no cap)")
+    ap.add_argument("--reasoning-effort", default=env("REASONING_EFFORT", ""),
+                    help="Inkling: default reasoning_effort when a request sets none (none/minimal/low/medium/high/"
+                         "xhigh or 0-0.99; default: the template's 0.9)")
     ap.add_argument("--api-key", default=env("API_KEY", ""),
                     help="require Authorization: Bearer <key>; several keys comma separated (env TSUGUMI_API_KEY)")
     ap.add_argument("--api-key-file", default=env("API_KEY_FILE", ""),
@@ -1063,14 +1326,21 @@ def main():
 
     THINK_BUDGET[0] = a.thinking_budget if a.thinking_budget >= 0 else None
     SAMPLING_DEFAULTS[0] = a.sampling_defaults
+    inkling = model_type(MODEL_DIR).startswith("inkling")
+    if a.max_seq is None:
+        a.max_seq = 32768 if inkling else 262144
+    if a.reasoning_effort:
+        from tsugumi.inkling.chat import effort_value
+        e = a.reasoning_effort
+        INKLING_EFFORT[0] = effort_value(float(e) if e.replace(".", "", 1).isdigit() else e)
 
     names = [n.strip() for n in a.served_model_name.split(",") if n.strip()]
     if names:
         MODEL_NAMES[:] = names
 
-    log_settings(a)
+    log_settings(a, inkling)
     t0 = time.time()
-    backend = Backend(a.max_seq)
+    backend = InklingBackend(a.max_seq) if inkling else Backend(a.max_seq)
     board = BoardMonitor().start()  # after the device is up (not during its init); tt-smi works alongside the engine
     log.info(f"ready in {time.time() - t0:.0f}s: http://{a.host}:{a.port}/ (web UI), /v1/chat/completions")
     if a.host not in ("127.0.0.1", "localhost", "::1") and not api_keys:
@@ -1096,18 +1366,32 @@ def main():
     log.info("bye")
 
 
-def log_settings(a):
+def log_settings(a, inkling=False):
     """The settings in effect (TSUGUMI_* / TSUMI_* / QE_* environment, flags), one line each."""
     g = lambda k, d: env(k, d)
+    if inkling:
+        items = [
+            ("model", f"{MODEL_DIR} (Inkling 2)"), ("served as", ", ".join(MODEL_NAMES)), ("weights cache", CACHE),
+            ("listen", f"{a.host}:{a.port}"), ("auth", a.auth), ("max_seq", f"{a.max_seq} tokens"),
+            ("experts", g("INKLING_EXPERTS", "bfp4")),
+            ("effort", a.reasoning_effort or "template default (0.9)"),
+            ("hang detection", f"device timeout {os.environ.get('TT_METAL_OPERATION_TIMEOUT_SECONDS')}s, "
+                               f"backstop {g('HANG_BACKSTOP', '300')}s"),
+        ]
+        log.info("settings:")
+        for k, v in items:
+            log.info(f"  {k:15s} {v}")
+        return
     ngram = "off" if g("NGRAM", "3") == "0" else f"when >= {g('NGRAM_MIN', '6')} tokens repeat"
     items = [
         ("model", MODEL_DIR), ("served as", ", ".join(MODEL_NAMES)), ("weights cache", CACHE),
         ("listen", f"{a.host}:{a.port}"), ("auth", a.auth),
         ("max_seq", f"{a.max_seq} tokens"),
         ("sampling", "greedy unless temperature > 0" if a.sampling_defaults == "greedy" else
-                     "no temperature: " + "; ".join(f"{m} t={p['temperature']} top_p={p['top_p']} top_k={p['top_k']}"
-                                                     + (f" pp={p['presence_penalty']}" if p['presence_penalty'] else "")
-                                                     for m, p in PRESETS.items() if m != "completion")),
+                     "no temperature: " + "; ".join(
+                         f"{m} t={p['temperature']} top_p={p.get('top_p', 1.0)} top_k={p.get('top_k', 0)}"
+                         + (f" pp={p['presence_penalty']}" if p.get('presence_penalty') else "")
+                         for m, p in PRESETS.items() if m != "completion" and (m == "inkling") == inkling)),
         ("thinking", "no default budget" if a.thinking_budget < 0 else f"default budget {a.thinking_budget} tokens"),
         ("KV cache", g("KV_DTYPE", "bfp8")),
         ("prefill", f"large T {g('LARGE_T', '2048')} (on={g('LARGE_PREFILL', '1')}), SDPA {g('PREFILL_SDPA', 'hifi2')}"),

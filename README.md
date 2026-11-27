@@ -27,7 +27,7 @@ HTTP経由でOpenAI 互換サーバーとして使うことができます。
 
 Wormhole世代のアクセラレータには対応していません。
 
-この推論エンジンが対応するモデルは、今のところ**Qwen 3.8 27Bのみです。** 他のモデルについては、アップデートで対応予定です。
+この推論エンジンが対応するモデルは、今のところ**Qwen 3.8 27B** と **Inkling 2 Mini** (下の「Inkling 2 Mini」) です。
 
 ## 必要なもの
 
@@ -107,6 +107,7 @@ export TSUGUMI_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(
   少し高めに出ます (64 の外は差し込んだトークンだけで -9999)。chat では本文のトークンだけです (思考は含まない)。
 - サンプリング: リクエストに `temperature` がないときは、Qwen3.8 のモデルカードの推奨値を thinking のオン / オフで使い分けます。
   thinking オフは temperature 0.7 / top_p 0.8 / top_k 20 / `presence_penalty` 1.5 (繰り返しの抑制)、オンは 1.0 / 0.95 / 20 です。
+  Inkling 2 Mini では、モデルの `generation_config.json` の推奨どおり temperature 1.0 (top_p / top_k の指定なし) です。
   リクエストで指定した項目はそちらが優先されます。`temperature` を指定したときは指定どおりで、0 なら貪欲法です。
   以前のように「`temperature` がなければ貪欲法」にするには `--sampling-defaults greedy` (`TSUGUMI_SAMPLING_DEFAULTS`)。
   `top_p`、`top_k` (64 まで)、`min_p`、`seed` と、`presence_penalty`・`frequency_penalty` (-2〜2、生成したトークンが対象。貪欲法でも有効)
@@ -156,7 +157,10 @@ TSUGUMI_BATCH=8 ./run_server.sh --port 8010 --max-seq 32768
   `decode_tps` (最初のトークン以降の速度) の平均なので、両者の比は並列数と一致しません。
   別の実行 (`TSUGUMI_BATCH=4`、`--max-tokens 256`) では 1 / 2 / 4 並列で合計 35.5 / 58.6 / 85.2 tok/s (4 並列で 2.4 倍)。
   ステップの時間 (`scripts/test_batch.py`、エンジン直接、256 トークン) は 1 レーン 65ms、2 レーン 71ms、4 レーン 84ms。
-- 出力は 1 リクエストずつ処理したときと同じです (貪欲法で 4 並列の出力がトークン単位で一致することを確認。`scripts/test_batch.py`)。
+- 出力は 1 リクエストずつの処理と数値誤差の範囲で同じですが、ビット単位の一致は保証しません。GQA アテンションの分割数がレーン数で
+  変わる (1 レーン 27、2 レーン 13、4 レーン 6、8 レーン 3) ため、文脈が分割数 × 64 位置を超えると softmax の部分和をまとめる順序が
+  変わり、貪欲法でも数百トークン先で言い回しが分かれることがあります。`scripts/test_batch.py` (256 トークン) では 4 レーンの 4 本が
+  1 本ずつの出力とトークン単位で一致、8 レーンでは 8 本とも 165〜253 トークン目から分かれました。
   サンプリング (seed)・思考の上限・logprobs・停止文字列・`/v1/completions`・途中切断はバッチのモードで動作を確認しました。
   ツール呼び出しは応答テキストの解析なので変わらないはずですが、バッチのモードでは未確認です。
 - 新しいリクエストのプロンプトは従来どおり 1 本ずつ prefill し、その間も 0.15 秒ごと (`TSUGUMI_PREFILL_SLICE`) に他のレーンの
@@ -193,6 +197,58 @@ TSUGUMIサーバーが起動時に読み取る環境変数
 | `TSUGUMI_IMAGE_FETCH=0` | http(s) の画像 URL を取りに行かないようにする (data: URL だけ受け付ける) |
 
 デバッグ用の環境変数については、[debugging.md](./debugging.md)に記載しています。
+
+## Inkling 2 Mini
+
+[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (26.4B の MoE、128 エキスパート中 8、
+中央の 12 層を 3 回まわすループ型で 1 トークンあたり 48 層ぶん) にも対応しています。`TSUGUMI_MODEL_DIR` の `config.json` の
+`model_type` が `inkling2_loop` なら、サーバーは自動で Inkling 用のエンジン (`tsugumi/inkling/`) を使います。
+
+```bash
+hf download thinkingmachines/Inkling-2-Mini --local-dir ~/models/Inkling-2-Mini   # 公式の NVFP4 / MXFP8 チェックポイント (約 20GB)
+export TSUGUMI_MODEL_DIR=~/models/Inkling-2-Mini
+export TSUGUMI_CACHE_DIR=/path/to/tsugumi_cache/inkling   # 変換済み重み (初回に作られる、bfp8 で約 28GB、数分)
+./run_server.sh --port 8010                                # 既定の --max-seq は 32768
+```
+
+- 重み: エキスパートは公式の NVFP4 (層 0-19) / MXFP8 (層 20-23) を復号して **bfp4** に変換します (MXFP8 の層は bfp8。
+  `TSUGUMI_INKLING_EXPERTS`: `bfp4` (既定) / `bfp8` / `mixed` (ループの層 6-17 と MXFP8 の層を bfp8、残りを bfp4) / `auto`
+  (DRAM が 30 GiB 以上なら bfp8、それ以下なら mixed))。NVFP4 を bfp4 に詰め直すと重みの誤差が約 11% 増えますが (bfp8 なら
+  0.7%)、teacher forcing での top-1 は bfp8 と 95.9% 一致 (外れる位置の多くは上位 2 候補がほぼ同点) で、デコードが約 10%、
+  prefill が約 3% 速くなります。注意の重みと lm_head は bfp8、KV は bfp8。
+- 速度 (P150A、`--max-seq 32768`、計測は各 1〜数回): デコード **約 27 tok/s** (1 ステップ約 31ms。文脈 30k でも
+  ほぼ同じ)、prefill **約 630〜800 tok/s** (512 トークンずつ。4k で 5.1 秒、30k で 48 秒)、短いプロンプトの応答開始
+  約 0.6 秒 (`TSUGUMI_INKLING_PREFILL_T=128` なら長い prefill 約 450 tok/s、短いプロンプト約 0.4 秒)。
+  prefill の MoE は各エキスパートに振られたトークンだけを詰めて計算します (512 行は `ink_moex_*`: トークンの X 行を
+  MoE コア群の L1 に分散した X から集めてタイル化、gate_up / act / down をその行だけ、0/1 配置タイルと packer の
+  L1 累積で元の行へ足し戻し。36 コアの 2 グループが交互にエキスパートを担当し、次のバッチの gate_up を
+  前のバッチの down より先に流してバリア待ちを隠します)。注意のマスク (窓内の相対バイアス、窓外 0 / -1e9、sink 列) は選択だけのカーネル
+  (`ink_mask.cpp`) で層ごとに作り、ttnn の SDPA に渡します。K / V はキャッシュのタイル単位で全コアに分けて書きます
+  (`kv_write_rows.cpp`)。
+  prefill の全注意層は文脈の長さに応じたバケット (4k / 8k / 16k / 全体、`TSUGUMI_INKLING_PREFILL_BUCKETS`)
+  のトレースで、使っている範囲のキャッシュだけを相手にします。
+  小さな op は自作カーネル (`kernels/ink_*.cpp`) にまとめています: 注意、q/r/k/v の前処理 (ヘッドごとに 16 コア)、
+  ルーター (ロジットとルーティングを 1 プログラム)、メッセージゲート (1 プログラム)、conv + 残差、
+  attention residual + RMS norm (ループのメッセージ計算も)、MoE (デコード・prefill とも 1 プログラム、`ink_moe_*` /
+  `ink_moep_*`)。複数コアの途中結果は、プログラム内のバリアのあと各コアの CB から NoC で直接読み合います。
+  エキスパートの重みは読み込み時にデバイス上で DRAM バンクごとに連続する並びへ詰め直します
+  (`TSUGUMI_INKLING_MOE_KERNEL=0` で従来の sparse_matmul)。メッセージの通る層では q / k / v の入力を
+  1 タイルの行 0 / 1 / 2 に詰め、RMS norm と線形層を 1 回にまとめます。
+- 正しさ: CPU の fp32 参照実装 (`tsugumi/inkling/ref.py`、transformers 5.24 の `modeling_inkling2_loop.py` から書き起こし) と比べ、
+  最後の位置の上位 64 ロジットの相関 0.999 (27 トークン) / 0.99 (1,335 トークン)、貪欲法の生成は参照とほぼ一致 (teacher forcing で 23〜24/24。外れるのは参照の上位 2 候補の差が 0.2 未満の位置)。
+  `scripts/inkling_check.py` で確認できます。
+- 思考の強さ: リクエストの `reasoning_effort` (`none` / `minimal` / `low` / `medium` / `high` / `xhigh`、または 0〜0.99) か
+  `chat_template_kwargs.reasoning_effort`。`chat_template_kwargs.enable_thinking: false` は `none` として扱います。
+  どれもないときはサーバーの `--reasoning-effort` (`TSUGUMI_REASONING_EFFORT`)、それもなければテンプレートの既定 (0.9)。
+  `none` でもモデルは短く考えてから答えます。思考は `reasoning_content` に分けて返します。
+- 応答はモデルの特殊トークン (`<|content_thinking|>`、`<|content_text|>`、`<|content_invoke_tool_json|>`) で
+  reasoning_content / content / tool_calls に分けます (`tsugumi/inkling/chat.py`)。ツール呼び出し (並列も)、ストリーミング、
+  `logprobs`、停止文字列、`/v1/completions` に対応。
+- 会話の続き: 前回のプロンプトの末尾の状態 (スライディング層のリング KV と畳み込みの履歴) をデバイス上に 1 つ保存し、
+  次のリクエストのプロンプトがそれで始まれば差分だけ prefill します (返答の思考を含めずに送り返されても効く)。
+  `reasoning_effort` を変えると先頭のシステムメッセージが変わるので再利用されません。
+- 未対応: 画像入力、`thinking_budget`、`TSUGUMI_BATCH` (同時処理)、付属の MTP (`mtp.safetensors`) による投機的デコード。
+- 全注意層は毎ステップ `--max-seq` ぶんの KV とマスクを読むので、`--max-seq` を大きくすると短い会話でも遅くなります。
 
 ## 仕組み
 
@@ -260,6 +316,7 @@ TSUGUMIサーバーが起動時に読み取る環境変数
 | `tsugumi/board.py` | ボードの温度・電力・ファン (`tt-smi -s` を定期的に読む、`/health` の `board`) |
 | `tsugumi/prefill.py`、`tsugumi/conv_kernel.py`、`tsugumi/page_copy.py` | 大きい T の prefill、因果 conv カーネル、ページコピー |
 | `kernels/*.cpp` | 自作カーネル (generic_op で起動) |
+| `tsugumi/inkling/` | Inkling 2 Mini: 設定 (`config.py`)、チェックポイントの読み込みと NVFP4 / MXFP8 の復号 (`weights.py`、`convert.py`)、CPU 参照実装 (`ref.py`)、デコード (`engine.py`)、512 トークンずつの prefill (`prefill.py`)、生成ループと会話の再利用 (`generator.py`)、チャット形式 (`chat.py`) |
 | `server.py` | OpenAI 互換サーバー |
 | `run_server.sh` | サーバーの起動とハング後の自動復帰 (デバイスのリセット → 再起動) |
 | `debugging.md` | デバッグのためのヒント、および環境変数 |

@@ -100,6 +100,9 @@ def main():
             if o != r:
                 print("   single :", repr(tok.decode(r[max(0, m - 5):m + 15])))
                 print("   batched:", repr(tok.decode(o[max(0, m - 5):m + 15])))
+        if env("CHECK_ONLY", "0") == "1":
+            sched.stop()
+            return
         # ---- conversation reuse after a batched turn ----
         x2 = ids[0] + outs[0] + tok.encode("<|im_end|>\n<|im_start|>user\n続けて<|im_end|>\n<|im_start|>assistant\n",
                                            add_special_tokens=False)

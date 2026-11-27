@@ -1,9 +1,11 @@
 // Fused GDN (post-conv) — compute. Per value head h, T tokens (rows of every tile = tokens):
 //   Kn = K * rsqrt(rowsum(K^2) + eps)                      (l2 norm; q needs none: the output norm removes it)
 //   KT = transpose(Kn)
-//   for t: S *= exp(g_t); D = ((V - Kn@S) * B) * E_t; S += KT@D; O += (Q@S) * E_t
+//   for t: D = ((V - g_t * (Kn@S)) * B) * E_t; S = g_t * S + KT@D (one pass over S; snapshot packed from it);
+//          O += (Q@S) * E_t                                (g_t = exp(g) of token t: one scalar per head)
 //   OUT = O * rsqrt(rowmean(O^2) + eps) * w * silu(Z)       (gated RMSNorm, bf16 out)
-// CT: 0 T, 1 HPC, 2 SEG (rows per lane: each lane of SEG rows starts from its own state, read from c_SIN)
+// CT: 0 T, 1 HPC, 2 SEG (rows per lane: each lane of SEG rows starts from its own state, read from c_SIN),
+//     3 TG (rows of this core: lanes r0/SEG ..); RT: 0 r0
 
 #include <stdint.h>
 #include "api/compute/compute_kernel_api.h"
@@ -68,9 +70,11 @@ void kernel_main() {
     constexpr uint32_t T = get_compile_time_arg_val(0);
     constexpr uint32_t HPC = get_compile_time_arg_val(1);
     constexpr uint32_t SEG = get_compile_time_arg_val(2);
+    constexpr uint32_t TG = get_compile_time_arg_val(3);
+    const uint32_t r0 = get_arg_val<uint32_t>(0);
 
     compute_kernel_hw_startup(c_K, c_SIN, c_D);
-    cb_wait_front(c_C, C_E + T);
+    cb_wait_front(c_C, C_E + TG);  // E tiles of this core's rows only (index tl)
 
     for (uint32_t hh = 0; hh < HPC; ++hh) {
         uint32_t s_cur = c_S0, s_nxt = c_S1;
@@ -112,38 +116,22 @@ void kernel_main() {
         cb_pop_front(c_Q, 4);
         cb_wait_front(c_Qn, 4);
 
-        cb_wait_front(c_G, T);
+        cb_wait_front(c_G, TG);
         cb_wait_front(c_B, 1);
         cb_wait_front(c_V, 4);
 
-        for (uint32_t t = 0; t < T; ++t) {
-            // 1. decay (a lane's first token reads the lane's initial state from c_SIN; s_cur is c_S0 then, empty)
+        for (uint32_t tl = 0; tl < TG; ++tl) {
+            const uint32_t t = r0 + tl;  // row (E_t constant, lane boundaries); tl: index of this core's rows
+            // a lane's first token reads the lane's initial state from c_SIN (c_S0 / c_S1 are empty then)
             const bool first = (t % SEG) == 0;
-            const uint32_t s_src = first ? c_SIN : s_cur;
             if (first) {
+                s_cur = c_SIN;
+                s_nxt = c_S0;
                 cb_wait_front(c_SIN, 16);
             }
-            for (uint32_t idx = 0; idx < 16; ++idx) {
-                tile_regs_acquire();
-                reconfig_data_format_srca(s_src);
-                copy_init(s_src);
-                copy_tile(s_src, idx, 0);
-                reconfig_data_format_srca(c_G);
-                copy_init(c_G);
-                copy_tile(c_G, t, 1);
-                mul_binary_tile_init();
-                mul_binary_tile(0, 1, 0);
-                pack_one(s_nxt);
-            }
-            cb_pop_front(s_src, 16);
-            {
-                uint32_t tmp = s_cur;
-                s_cur = s_nxt;
-                s_nxt = tmp;
-            }
-            cb_wait_front(s_cur, 16);
+            const bool snap = SNAP_ALL || t % SEG == SEG - 1;
 
-            // 2. D
+            // 1. D = ((V - g * (Kn @ S)) * B) * E_t        (Kn @ (g S) = g (Kn @ S): g is one scalar per head)
             for (uint32_t j = 0; j < 4; ++j) {
                 tile_regs_acquire();
                 reconfig_data_format(s_cur, c_Kn);
@@ -151,6 +139,11 @@ void kernel_main() {
                 for (uint32_t i = 0; i < 4; ++i) {
                     matmul_tiles(c_Kn, s_cur, i, i * 4 + j, 0);
                 }
+                reconfig_data_format_srca(c_G);
+                copy_init(c_G);
+                copy_tile(c_G, tl, 1);
+                mul_binary_tile_init();
+                mul_binary_tile(0, 1, 0);
                 reconfig_data_format_srca(c_V);
                 sub_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCB>(c_V);
                 sub_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCB>(c_V, j, 0);
@@ -159,45 +152,50 @@ void kernel_main() {
                 mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(c_B, 0, 0);
                 reconfig_data_format_srcb(c_C);
                 mul_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(c_C);
-                mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(c_C, C_E + t, 0);
+                mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(c_C, C_E + tl, 0);
                 pack_one(c_D);
             }
             cb_wait_front(c_D, 4);
 
-            // 3. S += KT @ D
+            // 2. S_new = g * S + KT @ D in one pass over the 16 state tiles; the snapshot after token t is packed
+            //    from the same registers (all tokens for speculative verify; the lane's last one for prefill)
             for (uint32_t i = 0; i < 4; ++i) {
                 for (uint32_t j = 0; j < 4; ++j) {
                     tile_regs_acquire();
                     reconfig_data_format_srca(s_cur);
-                copy_init(s_cur);
+                    copy_init(s_cur);
                     copy_tile(s_cur, i * 4 + j, 0);
+                    reconfig_data_format_srca(c_G);
+                    copy_init(c_G);
+                    copy_tile(c_G, tl, 1);
+                    mul_binary_tile_init();
+                    mul_binary_tile(0, 1, 0);
                     reconfig_data_format(c_D, c_KT);
-                matmul_init(c_KT, c_D);
+                    matmul_init(c_KT, c_D);
                     matmul_tiles(c_KT, c_D, i, j, 0);
-                    pack_one(s_nxt);
+                    tile_regs_commit();
+                    tile_regs_wait();
+                    cb_reserve_back(s_nxt, 1);
+                    pack_reconfig_data_format(s_nxt);
+                    pack_tile(0, s_nxt);
+                    cb_push_back(s_nxt, 1);
+                    if (snap) {
+                        cb_reserve_back(c_Sout, 1);
+                        pack_reconfig_data_format(c_Sout);
+                        pack_tile(0, c_Sout);
+                        cb_push_back(c_Sout, 1);
+                    }
+                    tile_regs_release();
                 }
             }
             cb_pop_front(s_cur, 16);
             cb_pop_front(c_D, 4);
-            {
-                uint32_t tmp = s_cur;
-                s_cur = s_nxt;
-                s_nxt = tmp;
-            }
+            s_cur = s_nxt;
+            s_nxt = (s_nxt == c_S0) ? c_S1 : c_S0;
             cb_wait_front(s_cur, 16);
 
-            // snapshot after token t (all tokens for speculative verify; only the last one for prefill)
-            if (SNAP_ALL || t % SEG == SEG - 1)
-            for (uint32_t idx = 0; idx < 16; ++idx) {
-                tile_regs_acquire();
-                reconfig_data_format_srca(s_cur);
-                copy_init(s_cur);
-                copy_tile(s_cur, idx, 0);
-                pack_one(c_Sout);
-            }
-
             // 4. O += (Q @ S) * E_t
-            if (t > 0) {
+            if (tl > 0) {
                 cb_wait_front(o_cur, 4);
             }
             for (uint32_t j = 0; j < 4; ++j) {
@@ -209,15 +207,15 @@ void kernel_main() {
                 }
                 reconfig_data_format_srcb(c_C);
                 mul_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(c_C);
-                mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(c_C, C_E + t, 0);
-                if (t > 0) {
+                mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(c_C, C_E + tl, 0);
+                if (tl > 0) {
                     reconfig_data_format_srcb(o_cur);
                 add_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(o_cur);
                     add_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(o_cur, j, 0);
                 }
                 pack_one(o_nxt);
             }
-            if (t > 0) {
+            if (tl > 0) {
                 cb_pop_front(o_cur, 4);
             }
             {
@@ -225,7 +223,7 @@ void kernel_main() {
                 o_cur = o_nxt;
                 o_nxt = tmp;
             }
-            if (t % SEG == SEG - 1) {  // end of the lane (s_cur is c_S0 after every token)
+            if (t % SEG == SEG - 1) {  // end of the lane: free its state (s_cur alternates c_S0 / c_S1 per token)
                 cb_pop_front(s_cur, 16);
             }
         }
@@ -282,10 +280,10 @@ void kernel_main() {
         cb_pop_front(c_Z, 4);
         cb_pop_front(c_KT, 4);
         cb_pop_front(c_Kn, 4);
-        cb_pop_front(c_G, T);
+        cb_pop_front(c_G, TG);
         cb_pop_front(c_B, 1);
         cb_pop_front(c_V, 4);
         cb_pop_front(c_Qn, 4);
     }
-    cb_pop_front(c_C, C_E + T);
+    cb_pop_front(c_C, C_E + TG);
 }

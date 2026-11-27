@@ -97,3 +97,14 @@
 結果と経緯は `../../doc/11-b1-qwen38-27b-engine.md` にあります。
 
 - `translate_md.py`: translate a Markdown article (en -> ja) block by block with the PLaMo 3 Translate server (port 8000); keeps code, comments, placeholders; `--bilingual` keeps the English as comments.
+
+## Inkling 2 Mini
+
+`TSUGUMI_INKLING_DIR` (既定 `~/models/Inkling-2-Mini`) と `TSUGUMI_INKLING_CACHE` (既定 `../tsugumi-cache/inkling`) を読みます。
+
+| スクリプト | 内容 |
+|---|---|
+| `inkling_check.py [--prompt TEXT] [--chat] [--layers] [--traced] [--prefill] [--gen N] [--repeat N]` | デバイスのエンジンを CPU の fp32 参照実装 (`tsugumi/inkling/ref.py`) と比較。最後の位置の上位ロジット、`--layers` で層の適用 48 回ぶんの中間値 (q / k / v / attention / MoE の出力)、`--gen N` で貪欲法の N トークンを参照と照合 (teacher forcing、不一致の位置は参照の上位 2 候補の差も表示)。`--prefill` はプロンプトを 32 トークンずつの prefill で流す |
+| `inkling_multiturn.py [--untraced]` | 3 ターンの会話を生成ループ (スナップショットからの再利用) で、サーバーと同じトレースの構成で流す (ハングしないことの確認) |
+| `inkling_bench_parts.py` | 1 ステップの部品 (MoE、attention、畳み込み、注意残差、メッセージゲート、線形層) を別々のトレースで計測。同じ op の繰り返しは次のプログラムの起動が重ならないぶん実際より高く出るので、削減効果はステップ全体での差し替えで確かめる |
+| `inkling_profile.py` | 1 ステップの op ごとのデバイス時間 (Tracy を有効にした tt-metal のビルドが必要) |

@@ -43,3 +43,32 @@ class KVWriteKernel:
                                    source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH, core_ranges=self.cores,
                                    compile_time_args=ct, runtime_args=rt, config=ttnn.ReaderConfigDescriptor())
         ttnn.generic_op(ins, ttnn.ProgramDescriptor(kernels=[kd], cbs=self.cbs))
+
+
+class KVWriteRows:
+    """Prefill (kernels/kv_write_rows.cpp): T token rows of K and V -> a non-paged cache [1, NKV, S, HD], one
+    read-modify-write per destination tile, the tiles spread over every core. Sources head-major [1, NKV, T, HD]."""
+
+    def __init__(self, dev, T, NKV, HD, S, kv_dtype=ttnn.bfloat8_b):
+        self.dev, self.T, self.NKV, self.HDT, self.S = dev, T, NKV, HD // 32, S
+        self.bfp8 = int(kv_dtype == ttnn.bfloat8_b)
+        g = dev.compute_with_storage_grid_size()
+        self.coords = [(x, y) for y in range(g.y) for x in range(g.x)]
+        self.cores = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(g.x - 1, g.y - 1))})
+        self.posb = ((T * 4 + 31) // 32) * 32
+        gb = ((4 * (T + 2) + 31) // 32) * 32
+        raw = lambda i, size: ttnn.CBDescriptor(total_size=size, core_ranges=self.cores, format_descriptors=[
+            ttnn.CBFormatDescriptor(buffer_index=i, data_format=ttnn.bfloat16, page_size=size)])
+        self.cbs = [raw(0, self.posb), raw(1, 2 * 2048), raw(2, 2048), raw(3, gb)]
+
+    def __call__(self, ksrc, vsrc, kc, vc, pos, dbg=0):
+        ins = [ksrc, vsrc, kc, vc, pos]
+        ct = [self.T, self.NKV, self.HDT, self.S, self.posb, self.bfp8]
+        for t in ins:
+            ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
+        addrs = [t.buffer_address() for t in ins]
+        rt = [(xy, addrs + [i, len(self.coords), dbg]) for i, xy in enumerate(self.coords)]
+        kd = ttnn.KernelDescriptor(kernel_source=os.path.join(KDIR, "kv_write_rows.cpp"),
+                                   source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH, core_ranges=self.cores,
+                                   compile_time_args=ct, runtime_args=rt, config=ttnn.ReaderConfigDescriptor())
+        ttnn.generic_op(ins, ttnn.ProgramDescriptor(kernels=[kd], cbs=self.cbs))

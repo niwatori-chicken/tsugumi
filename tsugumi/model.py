@@ -368,12 +368,22 @@ class Qwen35Engine:
             self.lm_chunks.append((lo, hi, DecodeLinear(dev, w, prec["lm_head"], cache_file=cf, shape=(self.H, hi - lo),
                                                         name="lm_head")))
         del lm
+        self.full_logits = env("FULL_LOGITS", "0") == "1"  # see _logits_topk
+        self._chunk_w = self.lm_chunks[0][1] - self.lm_chunks[0][0]
+        assert self.full_logits or all(lo == j * self._chunk_w and hi - lo == self._chunk_w
+                                       for j, (lo, hi, _) in enumerate(self.lm_chunks)) or len(self.lm_chunks) == 1
         self.embed = sd[LM_PREFIX + "embed_tokens.weight"].to(torch.bfloat16)  # host-side lookup
         self.n_embed = self.embed.shape[0]
         self.images = None  # tsugumi.vision.ImageTokens: embeddings of virtual image token ids (>= n_embed)
         self.mrope = []  # M-RoPE spans of the images in the current sequence (ImageTokens.layout)
         self.progress = None  # called after each large-prefill chunk (the server re-arms its hang backstop)
         log(f"model loaded in {time.time() - t0:.0f}s")
+        # after the weight conversion (which wants every core): the per-step host work (embedding rows, RoPE, small
+        # input tensors) is tiny, and with torch's default one thread per core its parallel regions wait for
+        # threads the busy-polling tt-metal threads keep off the CPU (3-5 ms per embedding lookup instead of 0.1 ms)
+        nt = int(env("TORCH_THREADS", "4"))
+        if nt > 0:
+            torch.set_num_threads(nt)
 
         # per-step device inputs (fixed addresses for trace)
         self.x_in = ttnn.from_torch(torch.zeros(1, 1, 32, self.H), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
@@ -676,15 +686,37 @@ class Qwen35Engine:
         return outs
 
     def _logits_topk(self, outs):
-        """Main-model rows -> (logits, (values, indices)) of the TOPK largest logits per row (all 32 rows; ~1.2 ms,
-        +0.8 ms over the argmax path). Greedy takes index 0; sampling works on the top-k on the host."""
-        logits = self._concat_chunks(outs)
-        v, i = ttnn.topk(logits, TOPK, dim=-1, largest=True, sorted=True, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        return logits, (v, i)
+        """Main-model rows -> (logits, (values, indices)) of the TOPK largest logits per row (all 32 rows). Greedy
+        takes the maximum; sampling works on the top-k on the host.
+        Default: two stages. The lm_head chunks (equal widths) are stacked on dim 1 and the top-k runs per chunk
+        (0.60 ms instead of 1.26 ms for concat + top-k over the full vocabulary on a P150A); topk_to_host merges the
+        chunks' TOPK candidates. `logits` is then the stacked [1, chunks, 32, V/chunks] tensor. With
+        TSUGUMI_FULL_LOGITS=1 (evaluation scripts that read the logits): one top-k over the concatenated logits."""
+        D = ttnn.DRAM_MEMORY_CONFIG
+        widths = {o.shape[-1] for o in outs}
+        if self.full_logits or len(outs) == 1 or len(widths) != 1:
+            logits = self._concat_chunks(outs)
+            v, i = ttnn.topk(logits, TOPK, dim=-1, largest=True, sorted=True, memory_config=D)
+            return logits, (v, i)
+        st = ttnn.concat(outs, dim=1, memory_config=D)
+        for o in outs:
+            ttnn.deallocate(o)
+        v, i = ttnn.topk(st, TOPK, dim=-1, largest=True, sorted=True, memory_config=D)
+        return st, (v, i)
 
     def topk_to_host(self, tk, rows):
         v, i = tk
-        return (ttnn.to_torch(v).reshape(-1, TOPK)[:rows].float(), ttnn.to_torch(i).reshape(-1, TOPK)[:rows].long())
+        C = v.shape[1]
+        if C == 1:
+            return (ttnn.to_torch(v).reshape(-1, TOPK)[:rows].float(),
+                    ttnn.to_torch(i).reshape(-1, TOPK)[:rows].long())
+        # per-chunk candidates [C, 32, TOPK] -> [rows, C*TOPK] with vocabulary ids -> the TOPK largest, sorted
+        W = self._chunk_w
+        vv = ttnn.to_torch(v).float().reshape(C, -1, TOPK)[:, :rows].permute(1, 0, 2).reshape(rows, C * TOPK)
+        ii = ttnn.to_torch(i).long().reshape(C, -1, TOPK)[:, :rows]
+        ii = (ii + torch.arange(C).view(C, 1, 1) * W).permute(1, 0, 2).reshape(rows, C * TOPK)
+        fv, fj = torch.topk(vv, TOPK, dim=-1)
+        return fv, torch.gather(ii, 1, fj)
 
     @staticmethod
     def _greedy(v, i):

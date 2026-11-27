@@ -11,6 +11,7 @@ import torch
 import ttnn
 
 TILE = 32
+ROWS_LINEAR = os.environ.get("TSUGUMI_ROWS_LINEAR", "1") == "1"  # M > 128: 2D matmul (see DecodeLinear)
 
 
 def _in0_grid(k_tiles, max_cores=64, cores=None):
@@ -50,6 +51,18 @@ def load_or_convert(dev, w, dtype, mem, cache_file=None, pad_n=None):
     return ttnn.to_device(t, dev, memory_config=mem)
 
 
+# (DRAM banks, K) -> settings measured best on that board (scripts/mm_sweep.py); the rest use the defaults below,
+# chosen on a P100A (7 banks). P150A (8 banks), K=6144 (GDN out / attention o projections): 59.1 -> 44.5 us
+# (58% -> 78% of the DRAM roofline); workers stay 2, so the cached (padded) weights are unchanged.
+TUNED = {
+    (8, 6144): dict(in0_block_w=6, in0_cores=32),
+    # Inkling 2 Mini on P150A (scratchpad sweep, bfp8, 3 workers per bank): hidden 2304 -> qkv / lm_head chunks,
+    # 3072 -> o.  57 us / 153 us / 24 us vs ~75 / ~200 / ~35 us with the generic choice
+    (8, 2304): dict(in0_block_w=3, in0_cores=24),
+    (8, 3072): dict(in0_block_w=6, in0_cores=16),
+}
+
+
 class DecodeLinear:
     """y = x @ W for decode (M <= 32 rows). W given as torch [K, N] (ttnn orientation)."""
 
@@ -58,6 +71,9 @@ class DecodeLinear:
         K, N = w_kn.shape if w_kn is not None else shape
         self.K, self.N, self.name = K, N, name
         banks = dev.dram_grid_size().x
+        tuned = TUNED.get((banks, K), {}) if workers is None and in0_block_w is None and in0_cores is None else {}
+        in0_block_w = tuned.get("in0_block_w", in0_block_w)
+        in0_cores = tuned.get("in0_cores", in0_cores)
         if workers is None:
             workers = 3 if K <= 5120 else 2  # measured best on P100 (scripts/mmbench.py)
         n_tiles = math.ceil(N / TILE)
@@ -93,14 +109,29 @@ class DecodeLinear:
         if fidelity is None:
             fidelity = ttnn.MathFidelity.LoFi if dtype == ttnn.bfloat4_b else ttnn.MathFidelity.HiFi2
         self.ck = compute_cfg(fidelity)
+        self.ck_rows = compute_cfg(fidelity, fp32_acc=True)
 
     def __call__(self, x, out_mem=ttnn.L1_MEMORY_CONFIG, dtype=ttnn.bfloat16):
-        """x: [1,1,32,K] tile layout, any memory config. Returns [1,1,32,Np] in out_mem."""
-        xs = x if x.memory_config() == self.xmem else ttnn.to_memory_config(x, self.xmem)
+        """x: [1,1,M,K] tile layout, any memory config. Returns [1,1,M,Np] in out_mem. M = 32; a multiple of 32 runs
+        as 32-row pieces (the DRAM-sharded matmul takes one tile row) concatenated in out_mem."""
+        m = x.shape[-2]
+        if m > 4 * TILE and ROWS_LINEAR:  # many rows: one 2D matmul on an interleaved copy of the weight
+            assert out_mem is not None
+            w = ttnn.to_memory_config(self.w, ttnn.DRAM_MEMORY_CONFIG)
+            y = ttnn.linear(x, w, memory_config=out_mem, compute_kernel_config=self.ck_rows, dtype=dtype)
+            ttnn.deallocate(w)
+            return y
+        if m > TILE:
+            assert m % TILE == 0 and out_mem is not None
+            parts = [self(ttnn.slice(x, (0, 0, r, 0), (1, 1, r + TILE, self.K), memory_config=ttnn.L1_MEMORY_CONFIG),
+                          out_mem, dtype) for r in range(0, m, TILE)]
+            return ttnn.concat(parts, dim=-2, memory_config=out_mem)
+        xmem, pc = self.xmem, self.pc
+        xs = x if x.memory_config() == xmem else ttnn.to_memory_config(x, xmem)
         y = ttnn.linear(
             xs,
             self.w,
-            program_config=self.pc,
+            program_config=pc,
             compute_kernel_config=self.ck,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             dtype=dtype,
