@@ -11,7 +11,7 @@ from .prefill import T as _PT
 
 # shorter prompt remainders go one token per decode step (a 32-row prefill step costs ~5 decode steps, a 64-row
 # one ~9)
-PREFILL_MIN = {32: 6, 64: 10, 128: 12, 256: 16, 512: 24}[_PT]  # a step ~ this many decode steps
+PREFILL_MIN = {32: 6, 64: 10, 128: 12, 256: 16, 512: 24, 1024: 32}[_PT]  # a step ~ this many decode steps
 
 
 def _greedy(vals, ids):

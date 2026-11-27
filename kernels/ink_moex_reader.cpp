@@ -106,7 +106,7 @@ void kernel_main() {
     // small tables in L1 (the RISC-V stack is small)
     volatile tt_l1_ptr uint16_t* cnt = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(ctmp.get_write_ptr() + 5 * PMAX);
     volatile tt_l1_ptr uint16_t* pos = cnt + E;
-    volatile tt_l1_ptr uint8_t* ee = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(cnt + 2 * E);
+    volatile tt_l1_ptr uint8_t* ee = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(cnt + 2 * E);  // <= 512 entries
     for (uint32_t e = 0; e < E; ++e) cnt[e] = 0;
     uint32_t np = 0;
     cidx.reserve_back(2);

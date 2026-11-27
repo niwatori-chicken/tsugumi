@@ -30,7 +30,7 @@ U, UWP = ttnn.UnaryOpType, ttnn.UnaryWithParam
 # per-step cost of most prefill ops grows much less than the rows (max_seq 32768, 4k prompt: 770 tok/s at 512, ~380
 # at 128); a short remainder costs one full step (27 tokens: 0.57 s at 512, ~0.4 s at 128)
 T = int(env("INKLING_PREFILL_T", "512"))
-assert T in (32, 64, 128, 256, 512)
+assert T in (32, 64, 128, 256, 512, 1024)
 # the full layers' attention runs on blocks of TS query rows (the [rows, context] scores of 512 rows would not fit)
 TS = min(T, 128)
 KZ = 128  # zero K / V rows after a full layer's bucket (sink column + padding: S a multiple of the SDPA key chunk)
@@ -331,8 +331,9 @@ class PrefillMixin:
             xr = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT, memory_config=DRAM)
             # two groups of 36 cores, every other expert entry each (partial sums added); settings measured best
             # at 512 rows (4.1 ms vs 5.5 ms for one group without the pipelining; fits the L1 left by the decode buffers)
-            d["moek"].prefill_moex(xr, ids, wk, d["Mgu"], d["Mdn"], self.p_moe_out, nb=6, sblk=4, dblk=1,
-                                   out2=self.p_moe_out2)
+            # HiFi2 even for bfp4 weights: LoFi truncates the activations of the scatter matmul (5% vs 1.3% error)
+            d["moek"].prefill_moex(xr, ids, wk, d["Mgu"], d["Mdn"], self.p_moe_out, nb=6, sblk=4 if T <= 512 else 2,
+                                   dblk=1, out2=self.p_moe_out2, fid=ttnn.MathFidelity.HiFi2)
             return ttnn.add(self.p_moe_out, self.p_moe_out2, memory_config=PL)
         vals, _ = ttnn.topk(sb, c.top_k, dim=-1, largest=True, sorted=True, memory_config=PL)
         kth = ttnn.slice(vals, (0, 0, 0, c.top_k - 1), (1, 1, T, c.top_k), memory_config=PL)

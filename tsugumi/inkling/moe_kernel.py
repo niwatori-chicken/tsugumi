@@ -87,6 +87,13 @@ class InkMoE:
         W = lambda x, y: dev.worker_core_from_logical_core(ttnn.CoreCoord(x, y))
         self.noc = [W(x, y) for x, y in self.coords]
 
+    def _ccfg(self, fid):
+        if fid is None:
+            return self.ccfg
+        c = ttnn.ComputeConfigDescriptor()
+        c.math_fidelity, c.fp32_dest_acc_en, c.math_approx_mode = fid, True, False
+        return c
+
     def _layout(self, T):
         grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(7, 0))})
         mem = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.DRAM,
@@ -227,7 +234,7 @@ class InkMoE:
         return out
 
     def prefill_moex(self, xr, ids, wk, gu, dn, out, dbg=0, nps=8, dblk=1, nb=None, sblk=2, out2=None, prof=None,
-                     ring=None):
+                     ring=None, fid=None):
         """Long chunks (kernels/ink_moex_*): only the routed (token, expert) pairs. xr: row-major bf16 [1,1,T,H] in
         DRAM (the tokens' rows are read per expert); ids / wk: the top-k expert ids (uint16 / uint32) and routing
         weights (bf16, 0 = skip) as [1,1,T,8] tiles; out [1,1,T,H] bf16 tiles. T = 32 MT, MT <= 16."""
@@ -236,7 +243,7 @@ class InkMoE:
         cores = _cores([xy for g in groups for xy in g])
         T = xr.shape[-2]
         MT = T // 32
-        assert T == 32 * MT and MT <= 16 and xr.layout == ttnn.ROW_MAJOR_LAYOUT
+        assert T == 32 * MT and MT <= 32 and xr.layout == ttnn.ROW_MAJOR_LAYOUT
         CTM = min(MT, 2)
         bf, f32 = ttnn.bfloat16, ttnn.float32
         NB, ring = nb or self.NB, ring or self.ring
@@ -249,10 +256,10 @@ class InkMoE:
                raw(5, ((T + 35) // 36) * 4608),
                ttnn.CBDescriptor(total_size=8192, core_ranges=cores, format_descriptors=[
                    ttnn.CBFormatDescriptor(buffer_index=6, data_format=bf, page_size=4096)]),
-               _cbd(cores, 8, CTM, bf), _cbd(cores, 9, CTM, bf), _cbd(cores, 10, 1, bf), _cbd(cores, 12, 1, bf),
+               _cbd(cores, 8, CTM, bf), _cbd(cores, 9, CTM, bf), _cbd(cores, 10, 1, bf), raw(12, 4096),
                _cbd(cores, 13, 4 * NB * CTM, bf), _cbd(cores, 14, 2 * CTM, bf), _cbd(cores, 15, 2 * MT, f32),
                _cbd(cores, 16, 4, bf), raw(17, 1024 + 4 * PMAX), _cbd(cores, 18, 4 * CTM, bf),
-               raw(19, ((5 * PMAX + 768 + 31) // 32) * 32), raw(20, ((nps * 65 + 31) // 32) * 32), raw(21, 128)]
+               raw(19, ((5 * PMAX + 1024 + 31) // 32) * 32), raw(20, ((nps * 65 + 31) // 32) * 32), raw(21, 128)]
         Kd = lambda src, ct, rt, cfg: ttnn.KernelDescriptor(
             kernel_source=os.path.join(KDIR, src), source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores, compile_time_args=ct, runtime_args=rt, config=cfg)
@@ -277,7 +284,7 @@ class InkMoE:
             Kd("ink_moex_reader.cpp", r_ct, r_rt, ttnn.ReaderConfigDescriptor()),
             Kd("ink_moex_writer.cpp", [nps] + ttnn.TensorAccessorArgs(out).get_compile_time_args(), w_rt,
                ttnn.WriterConfigDescriptor()),
-            Kd("ink_moex_compute.cpp", [], c_rt, self.ccfg),
+            Kd("ink_moex_compute.cpp", [], c_rt, self._ccfg(fid)),
         ], semaphores=sems, cbs=cbs)
         ttnn.generic_op([xr, ids, wk, gu, dn, out] + ([out2] if out2 is not None else []), prog)
         return out
