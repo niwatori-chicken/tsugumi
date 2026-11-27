@@ -321,6 +321,8 @@ class LargePrefill:
         return out
 
     def _mlp(self, mlp, h):
+        if hasattr(mlp, "prefill"):  # MoE (tsugumi/moe.py)
+            return mlp.prefill(h, self)
         g = self._mm(h, mlp.w1, n=False)
         u = self._mm(h, mlp.w3, n=False)
         a = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=DRAM)
