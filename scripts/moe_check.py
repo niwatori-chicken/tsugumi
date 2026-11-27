@@ -14,7 +14,7 @@ import torch
 import ttnn
 from tsugumi.model import Precision, Qwen35Engine
 
-args = [a for a in sys.argv[1:] if not a.startswith("--")]
+args = [a for i, a in enumerate(sys.argv[1:]) if not a.startswith("--") and not sys.argv[i].startswith("--")]
 MODEL = args[0] if args else "/mnt/HDD/Qwen36_35BA3B"
 CACHE = "/mnt/HDD/models/qe_cache/" + os.path.basename(MODEL.rstrip("/"))
 opt = lambda k, d: sys.argv[sys.argv.index(k) + 1] if k in sys.argv else d
